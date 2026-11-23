@@ -89,6 +89,9 @@
   </header>
 
   <section id="haErrorBox" class="panel" style="display:none;border-color:var(--danger);color:#fecaca;font-size:13px;"></section>
+  <section id="dryRunBanner" class="panel" style="display:none;border-color:var(--warn);color:#fef08a;font-size:13px;">
+    ⚠ 현재 <b>시험 운전(Dry-Run) 모드</b>가 켜져 있어 실제 보일러로 명령을 보내지 않습니다. 실제 난방을 가동하려면 우측 상단의 <b>시험 운전(Dry-Run): ON</b> 버튼을 눌러 <b>LIVE</b>로 전환하세요.
+  </section>
 
   <!-- One-Touch Presets -->
   <section class="preset-bar">
@@ -268,6 +271,7 @@ async function refresh() {
   const dryBtn = document.getElementById("dryRunBtn");
   dryBtn.textContent = currentSettings.dryRun ? "시험 운전(Dry-Run): ON" : "실제 보일러 제어: LIVE";
   dryBtn.className = currentSettings.dryRun ? "" : "heat";
+  document.getElementById("dryRunBanner").style.display = currentSettings.dryRun ? "block" : "none";
 
   renderRooms(status.rooms, status.liveByRoom || {}, status.latestByRoom || {});
   renderKpis(status.kpis, status.boilerStats);
@@ -303,6 +307,9 @@ function renderRooms(rooms, liveByRoom, latestByRoom) {
     const badgeClass = lat.commandAction === "HEAT" ? "heat" : (lat.safetyReason === "P000_OVERHEAT_CUTOFF" ? "danger" : "ok");
     const humWarn = rm.roomTempEntity.toLowerCase().includes("humidity")
       ? `<div style="font-size:11px;color:var(--warn);margin-top:3px;">⚠ 습도(_humidity) 센서입니다. 온도 센서로 변경하세요.</div>` : "";
+    const climInfo = live.climateState != null
+      ? `<div style="font-size:11px;color:var(--accent);margin-top:3px;">조절기 현재: ${live.climateState} · 설정 ${live.climateSetpoint ?? "--"}°C</div>`
+      : `<div style="font-size:11px;color:var(--danger);margin-top:3px;">조절기 상태 미수신 (엔티티 ID 확인 필요)</div>`;
 
     return `
       <div class="card">
@@ -310,6 +317,7 @@ function renderRooms(rooms, liveByRoom, latestByRoom) {
           <div class="card-head-left">
             <div class="room-name">${rm.roomName}</div>
             <div class="entity-sub">${rm.roomTempEntity} · ${rm.climateEntity}</div>
+            ${climInfo}
             ${humWarn}
           </div>
           <div class="card-head-right">

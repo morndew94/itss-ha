@@ -146,11 +146,22 @@ class HomeAssistantClient:
     async def call_service(self, domain: str, service: str, data: dict[str, Any]) -> None:
         """Invoke a Home Assistant service (e.g., climate.set_temperature, notify.*)."""
         if not self.is_configured:
+            self.last_error = f"HA not configured (no token) when calling {domain}.{service}"
             return
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                f"{self.base_url}/services/{domain}/{service}",
-                headers=self._headers(),
-                json=data,
-            )
-            resp.raise_for_status()
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{self.base_url}/services/{domain}/{service}",
+                    headers=self._headers(),
+                    json=data,
+                )
+                if resp.status_code >= 400:
+                    self.last_error = f"HA service {domain}.{service} failed (HTTP {resp.status_code}): {resp.text[:200]}"
+                    _LOGGER.error("%s", self.last_error)
+                resp.raise_for_status()
+                self.last_error = None
+        except Exception as err:  # noqa: BLE001
+            if not self.last_error:
+                self.last_error = f"HA service {domain}.{service} error: {err}"
+            _LOGGER.error("%s", self.last_error)
+            raise

@@ -415,7 +415,11 @@ class ItssEngine:
         return results
 
     async def _dispatch(self, climate_entity: str, record: CycleRecord) -> None:
-        """Issue climate command to HA Supervisor API (ON=24C, OFF=15C) and re-read."""
+        """Issue climate command to HA Supervisor API (ON=24C, OFF=15C) and re-read.
+
+        Uses RS485/Kocom-safe sequencing: only calls set_hvac_mode when needed,
+        pauses briefly before set_temperature, and records exact errors.
+        """
         record.control_issued_at = now_kst_iso()
         if self.settings["dryRun"] or not self.ha.is_configured:
             record.control_confirmed_at = now_kst_iso()
@@ -424,7 +428,15 @@ class ItssEngine:
 
         try:
             if record.command_action == "HEAT":
-                await self.ha.call_service("climate", "set_hvac_mode", {"entity_id": climate_entity, "hvac_mode": "heat"})
+                if record.device_mode_event != "heat":
+                    try:
+                        await self.ha.call_service(
+                            "climate", "set_hvac_mode", {"entity_id": climate_entity, "hvac_mode": "heat"}
+                        )
+                        await asyncio.sleep(0.8)  # Prevent RS485 wallpad command collision
+                    except Exception:  # noqa: BLE001
+                        # Still attempt set_temperature even if set_hvac_mode is unsupported
+                        pass
                 await self.ha.call_service(
                     "climate", "set_temperature", {"entity_id": climate_entity, "temperature": record.command_setpoint}
                 )
@@ -441,7 +453,8 @@ class ItssEngine:
                 record.device_mode_event = recheck.get("state")
                 act = (recheck.get("attributes") or {}).get("hvac_action")
                 record.combustion_confirmed = (act == "heating") if act is not None else None
-        except Exception:  # noqa: BLE001
+        except Exception as err:  # noqa: BLE001
+            self.ha.last_error = f"Climate dispatch failed ({climate_entity}): {err}"
             record.execution_status = "FAILED"
             record.observed_at = now_kst_iso()
 
@@ -554,7 +567,7 @@ def create_app(
         return engine.db.upsert_room(req.model_dump())
 
     @app.patch("/api/v1/rooms/{room_name}")
-    def patch_room(room_name: str, req: RoomPatchRequest) -> dict[str, Any]:
+    async def patch_room(room_name: str, req: RoomPatchRequest) -> dict[str, Any]:
         updated = engine.db.update_room_control(
             room_name,
             target_temp=req.targetTemp,
@@ -564,6 +577,9 @@ def create_app(
         )
         if not updated:
             raise HTTPException(status_code=404, detail="Room not found")
+        # Trigger immediate control cycle when user switches manual mode or target temp
+        if req.controlMode is not None or req.manualAction is not None:
+            await engine.run_control_cycle()
         return updated
 
     @app.delete("/api/v1/rooms/{room_name}")
@@ -580,8 +596,10 @@ def create_app(
         return engine.settings
 
     @app.post("/api/v1/preset")
-    def set_preset(req: PresetRequest) -> dict[str, Any]:
-        return engine.apply_preset(req.preset)
+    async def set_preset(req: PresetRequest) -> dict[str, Any]:
+        res = engine.apply_preset(req.preset)
+        await engine.run_control_cycle()
+        return res
 
     @app.get("/api/v1/schedules")
     def get_schedules() -> list[dict[str, Any]]:
