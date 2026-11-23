@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "I.T.S.S. Room Setup",
+        "description": "Map room sensors and climate entity for 0.3C thermal control.",
+        "data": {
+          "room_name": "Room Name",
+          "room_temp_entity": "Room Temperature Sensor (0.1C)",
+          "floor_temp_entity": "Floor Temperature Sensor (0.1C)",
+          "climate_entity": "Thermostat Climate Entity",
+          "humidity_entity": "Humidity Sensor (Optional)",
+          "outdoor_temp_entity": "Outdoor Temperature Sensor (Optional)",
+          "target_temp": "Target Temperature (C)",
+          "predictor_model": "P200 Thermal Predictor Model",
+          "scada_url": "I.T.S.S. SCADA Add-on URL",
+          "update_interval_sec": "Control Interval (seconds)"
+        }
+      }
+    }
+  }
+}
+

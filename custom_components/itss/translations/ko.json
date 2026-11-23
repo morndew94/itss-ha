@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "I.T.S.S. 방별 제어 설정",
+        "description": "0.3°C 정밀 제어를 위해 방의 실내온도, 바닥온도, 온도조절기 엔티티를 매핑하세요.",
+        "data": {
+          "room_name": "방 이름",
+          "room_temp_entity": "실내 온도 센서 (0.1°C)",
+          "floor_temp_entity": "바닥 온도 센서 (0.1°C)",
+          "climate_entity": "온도조절기(Climate) 엔티티",
+          "humidity_entity": "습도 센서 (선택)",
+          "outdoor_temp_entity": "외기 온도 센서 (선택)",
+          "target_temp": "목표 온도 (°C)",
+          "predictor_model": "P200 예측 모델 (선형 v1.2 / 적응형 RC)",
+          "scada_url": "I.T.S.S. SCADA 애드온 주소",
+          "update_interval_sec": "제어 주기 (초)"
+        }
+      }
+    }
+  }
+}
+

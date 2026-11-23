@@ -1,0 +1,22 @@
+name: "I.T.S.S. SCADA Server"
+version: "1.0.0"
+slug: "itss_scada"
+description: "Intelligent Thermal SCADA System: cycle audit DB, KST monitoring API, and adaptive RC parameter optimizer."
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: services
+boot: auto
+init: false
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: "I.T.S.S. SCADA REST API & Monitoring Endpoint"
+options:
+  db_path: "/data/itss_scada.db"
+  log_level: "info"
+schema:
+  db_path: str
+  log_level: list(debug|info|warning|error)
+

@@ -1,0 +1,15 @@
+{
+  "domain": "itss",
+  "name": "I.T.S.S. (Intelligent Thermal SCADA System)",
+  "codeowners": [
+    "@morndew94"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/morndew94/itss-ha",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/morndew94/itss-ha/issues",
+  "requirements": [
+    "aiohttp>=3.9.0"
+  ],
+  "version": "1.0.0"
+}
