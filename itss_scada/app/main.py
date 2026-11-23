@@ -194,7 +194,6 @@ class ItssEngine:
         self.notifier = notifier or PushNotifier(
             ha_client=self.ha,
             notify_service=str(opts.get("notify_service", "")),
-            telegram_bot_token=str(opts.get("telegram_bot_token", "")),
             telegram_chat_id=str(opts.get("telegram_chat_id", "")),
         )
         self.sentinel = SentinelProtocol()

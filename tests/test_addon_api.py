@@ -46,13 +46,10 @@ class FakeHAClient:
 
 def test_addon_v2_full_workflow(tmp_path: Path):
     fake_ha = FakeHAClient()
-    tg_sent: list[dict] = []
     notifier = PushNotifier(
         ha_client=fake_ha,
         notify_service="mobile_app_phone",
-        telegram_bot_token="bot-token",
         telegram_chat_id="12345",
-        telegram_post=lambda _u, p: tg_sent.append(p),
     )
     app = create_app(db_path=str(tmp_path / "addon.db"), ha_client=fake_ha, notifier=notifier)
 
@@ -101,4 +98,5 @@ def test_addon_v2_full_workflow(tmp_path: Path):
         n_res = client.post("/api/v1/notify/test").json()
         assert n_res["ha_notify"] == "sent"
         assert n_res["telegram"] == "sent"
-        assert len(tg_sent) == 1
+        tg_calls = [d for dom, svc, d in fake_ha.calls if dom == "telegram_bot" and svc == "send_message"]
+        assert len(tg_calls) == 1 and tg_calls[0]["target"] == 12345

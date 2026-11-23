@@ -1,5 +1,5 @@
 name: "I.T.S.S. Thermal SCADA"
-version: "2.0.0"
+version: "2.0.1"
 slug: "itss_scada"
 description: "0.3C Ondol precision heating SCADA add-on with Ingress Web UI, 24h chart, presets, P400 scheduler, 1-click RC fitting, boiler cost stats, and HA/Telegram alerts."
 url: "https://github.com/morndew94/itss-ha"
@@ -31,7 +31,6 @@ options:
   gas_krw_per_hour: 1200
   ha_token: ""
   notify_service: ""
-  telegram_bot_token: ""
   telegram_chat_id: ""
   gemini_api_key: ""
   weather_location: "서울"
@@ -48,7 +47,6 @@ schema:
   gas_krw_per_hour: int(100,10000)
   ha_token: password?
   notify_service: str?
-  telegram_bot_token: password?
   telegram_chat_id: str?
   gemini_api_key: password?
   weather_location: str?
