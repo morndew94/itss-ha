@@ -13,8 +13,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install test dependencies
-        run: pip install pytest
-      - name: Run unit tests
+      - name: Install dependencies
+        run: pip install -r itss_scada/requirements.txt pytest
+      - name: Run unit and API tests
         run: pytest -v
-

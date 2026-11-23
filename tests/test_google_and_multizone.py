@@ -6,28 +6,25 @@ import base64
 from datetime import datetime
 from pathlib import Path
 
-from custom_components.itss.const import KST
-from custom_components.itss.integrations.google_alerts import (
+from itss_scada.app.const import KST
+from itss_scada.app.integrations.google_alerts import (
     GeminiTTSAlert,
     format_cycle_for_sheets,
 )
-from custom_components.itss.integrations.google_calendar import GoogleCalendarAdvisor
-from custom_components.itss.integrations.google_gemini_advisor import (
+from itss_scada.app.integrations.google_calendar import GoogleCalendarAdvisor
+from itss_scada.app.integrations.google_gemini_advisor import (
     GeminiThermalAdvisor,
     compute_daily_kpis,
 )
-from custom_components.itss.integrations.google_weather import GoogleWeatherClient
-from custom_components.itss.protocols.multi_zone import MultiZoneController, ZoneReading
+from itss_scada.app.integrations.google_weather import GoogleWeatherClient
+from itss_scada.app.protocols.multi_zone import MultiZoneController, ZoneReading
 
 
 def test_multizone_hybrid_synchronized_start_and_early_cutoff():
     ctrl = MultiZoneController(strategy="hybrid")
     zones = [
-        # Living room (master with real floor sensor) triggers heating
         ZoneReading("living", room_temp=22.8, target_temp=23.0, is_heating=False, has_floor_sensor=True),
-        # Bedroom 1 is slightly below target -> joins co-heating batch
         ZoneReading("bed1", room_temp=22.92, target_temp=23.0, is_heating=False, floor_offset_from_master_c=0.4),
-        # Bedroom 2 is already warm -> stays OFF (early cutoff)
         ZoneReading("bed2", room_temp=23.2, target_temp=23.0, is_heating=True, floor_offset_from_master_c=0.2),
     ]
     plan = ctrl.evaluate(zones, master_floor_temp=25.5)
@@ -68,13 +65,12 @@ def test_google_weather_client_caching_and_fallback():
 
     client = GoogleWeatherClient("dummy-key", "서울", cache_ttl_sec=1800, http_post=fake_post)
     w1 = client.get_weather(now_epoch=1000.0)
-    w2 = client.get_weather(now_epoch=1500.0)  # should hit cache
+    w2 = client.get_weather(now_epoch=1500.0)
     assert w1.outdoor_temp_c == -2.5
     assert w1.wind_speed_ms == 6.5
     assert w2.source == "GEMINI_SEARCH_GROUNDING"
     assert calls == 1
 
-    # Fail-safe fallback when API fails
     def failing_post(_url: str, _payload: dict) -> dict:
         raise RuntimeError("network down")
 
@@ -127,7 +123,6 @@ def test_gemini_daily_advisor_and_alerts(tmp_path: Path):
     assert res["status"] == "OK"
     assert "오버슈트" in res["report"]
 
-    # TTS alert generation for critical P000 event
     fake_wav = base64.b64encode(b"RIFF....WAVE").decode("utf-8")
     tts = GeminiTTSAlert(
         "dummy-key",
@@ -141,4 +136,3 @@ def test_gemini_daily_advisor_and_alerts(tmp_path: Path):
 
     row = format_cycle_for_sheets(cycles[0])
     assert row[0] == "c1" and row[1] == "living"
-

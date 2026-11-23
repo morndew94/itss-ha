@@ -1,26 +1,26 @@
-"""Unit tests for ITSS P000-P400 protocols, KST schema, and SCADA DB/RC optimizer."""
+"""Unit tests for ITSS P000-P400 protocols, KST schema, and SQLite/RC optimizer."""
 
 from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
 
-from custom_components.itss.const import KST
-from custom_components.itss.models.schema import CycleRecord, SensorSnapshot, ThermalInput
-from custom_components.itss.protocols.p000_sentinel import SentinelProtocol
-from custom_components.itss.protocols.p100_core import (
+from itss_scada.app.const import KST
+from itss_scada.app.models.schema import CycleRecord, SensorSnapshot, ThermalInput
+from itss_scada.app.protocols.p000_sentinel import SentinelProtocol
+from itss_scada.app.protocols.p100_core import (
     compute_opposing_interval,
     round_thermostat_setpoint,
 )
-from custom_components.itss.protocols.p200_therm import (
+from itss_scada.app.protocols.p200_therm import (
     AdaptiveRCModel,
     LinearExtrapolationV12,
     ResidualHeatStats,
 )
-from custom_components.itss.protocols.p300_atmos import AtmosProtocol
-from custom_components.itss.protocols.p400_circadia import CircadiaProtocol
-from custom_components.itss.protocols.rc_optimizer import RCObservation, fit_rc_parameters
-from custom_components.itss.storage.db import ScadaDatabase
+from itss_scada.app.protocols.p300_atmos import AtmosProtocol
+from itss_scada.app.protocols.p400_circadia import CircadiaProtocol
+from itss_scada.app.protocols.rc_optimizer import RCObservation, fit_rc_parameters
+from itss_scada.app.storage.db import ScadaDatabase
 
 
 def test_p000_overheat_cutoff():
@@ -96,9 +96,7 @@ def test_scada_db_and_rc_optimizer(tmp_path: Path):
     assert len(rows) == 1
     assert rows[0]["cycleId"] == "20261120-1800-living"
 
-    # Verify insufficient sample guard in RC optimizer
     short_result = fit_rc_parameters(
         [RCObservation(300.0, 25.0, 22.8, 3.0, True, 25.3, 22.9)]
     )
     assert short_result["status"] == "INSUFFICIENT_SAMPLES"
-

@@ -1,22 +1,22 @@
-# I.T.S.S. (Intelligent Thermal SCADA System) for Home Assistant
+# I.T.S.S. Thermal SCADA (Home Assistant Add-on)
 
-Home Assistant 환경에서 바닥 난방의 **0.3°C 정밀 제어(목표 온도 ±0.15°C)**, **5계층 프로토콜 기반 안전·제어·예측 분리**, **적응형 RC 열역학 모델 전환**, **정밀 시각 이력 DB 저장**을 **단일 커스텀 통합구성요소(Custom Integration)**로 제공하는 프로젝트입니다.
-
-별도의 애드온(Docker 컨테이너)을 설치하거나 관리할 필요 없이, **HACS에서 통합구성요소 하나만 설치**하면 실시간 제어 루프, 로컬 SQLite 이력 DB, RC 파라미터 피팅까지 한 번에 동작합니다.
+Home Assistant **전용 애드온(Add-on + Ingress 웹 UI)**으로 바닥 난방의 **0.3°C 정밀 제어(목표 온도 ±0.15°C)**, **방별 설정온도 제어**, **수동/자동 운전 전환**, **단일 바닥 센서 기반 하이브리드 다중 방 제어**, **KST 정밀 시각 이력 DB**, **Google API 보조 연동**을 제공하는 SCADA 시스템입니다.
 
 ---
 
-## 1. 아키텍처 개요 (ITSS Architecture v1.0)
+## 1. 주요 기능
 
-I.T.S.S.는 통합구성요소 내부에서 책임 경계를 명확히 하기 위해 **5대 프로토콜 계층**으로 모듈화되어 있습니다.
-
-| 프로토콜 | 명칭 | 모듈 경로 | 주요 책임 |
-| :--- | :--- | :--- | :--- |
-| **`ITSS-P000`** | **SENTINEL** | `protocols/p000_sentinel.py` | 센서 신뢰도 검증, 과열 차단(실내 >= 27°C / 바닥 >= 29°C), 일반 OFF(바닥 >= 28°C), 환기 급락 보호, 채터링(최소 가동/휴지 시간) 방지, 수동 조작 우선 |
-| **`ITSS-P100`** | **CORE** | `protocols/p100_core.py` | 센서 계측(0.1°C), 온도조절기 0.5°C 단위 반올림 보정, 명령 전송 및 상태 재조회 확인, KST 정밀 시각 스키마 기록 및 로컬 SQLite DB 저장 |
-| **`ITSS-P200`** | **THERM** | `protocols/p200_therm.py`, `protocols/rc_optimizer.py` | 예측 ON/OFF 제어. 기존 `v1.2` 선형외삽(`F30`, `Room30`)과 적응형 RC 열역학 모델(`C_f`, `C_r`, `R_fr`, `R_ra`)을 동일 인터페이스로 전환 및 파라미터 피팅 |
-| **`ITSS-P300`** | **ATMOS** | `protocols/p300_atmos.py` | 외기온도·강수·풍속·일사량 기반 열손실 보정 (기상 미연동 시 시간대별 열손실 프로파일로 폴백) |
-| **`ITSS-P400`** | **CIRCADIA** | `protocols/p400_circadia.py` | 수면·기상·생활패턴 및 방별/개인별 온열 쾌적성 목표 온도 보정 |
+- **HA 사이드바 내장 웹 UI (Ingress 지원)**: 별도 포트 개방 없이 Home Assistant 좌측 사이드바에서 실시간 SCADA 대시보드 접속
+- **방별 목표 온도 설정 (`0.1°C` 단위)**: 거실/안방/작은방 등 방마다 독립적인 설정온도 조절 및 즉시 SQLite 저장
+- **수동 운전 모드 (`AUTO` / `수동 ON` / `수동 OFF`)**: `P000 SENTINEL` 수동 조작 우선 규칙 준수 (단, 실내 27°C / 바닥 29°C 이상 극한 과열 차단은 항상 작동)
+- **단일 바닥 온도 센서 + 방별 개별 밸브 하이브리드 제어**:
+  - 동시 기동(Co-heating Batch)으로 보일러 단펄스 방지 + 목표 도달 방 개별 선차단으로 오버슈트 방지
+  - 마스터 방(`MEASURED`)과 슬레이브 방(`ESTIMATED` + 오프셋) 구분 기록
+- **Google API 보조 연동 (Fail-safe 폴백)**:
+  - `P300 ATMOS`: Gemini 검색 그라운딩 외기/풍속 보정
+  - `P400 CIRCADIA`: Google Calendar 외출/귀가 예열 보정
+  - `P200 THERM`: 24시간 0.3°C 달성률 KPI + Gemini 일일 진단 리포트
+  - `알림`: 긴급 과열/센서 이상 시 Gemini TTS 음성 경고 생성 및 Google Sheets 행 내보내기
 
 ---
 
@@ -24,65 +24,44 @@ I.T.S.S.는 통합구성요소 내부에서 책임 경계를 명확히 하기 �
 
 ```text
 itss-ha/
-├── hacs.json                          # HACS 통합구성요소 메타데이터
-├── custom_components/
-│   └── itss/                          # Home Assistant 단일 커스텀 통합구성요소
-│       ├── manifest.json
-│       ├── __init__.py
-│       ├── const.py
-│       ├── config_flow.py             # UI 기반 방별 엔티티 매핑
-│       ├── coordinator.py             # P000~P400 주기 제어 및 로컬 DB 저장
-│       ├── sensor.py                  # HA 진단/예측 센서 노출
-│       ├── strings.json
-│       ├── translations/
-│       │   ├── ko.json
-│       │   └── en.json
-│       ├── models/
-│       │   └── schema.py              # KST 정밀 시각 및 회차/제어 이력 표준 스키마
-│       ├── storage/
-│       │   └── db.py                  # 로컬 SQLite 회차 이력 DB (config/itss_scada.db)
-│       ├── integrations/              # 선택형 Google API 보조 연동 (Fail-safe 폴백)
-│       │   ├── google_weather.py      # P300 Gemini 검색 그라운딩 외기/풍속 조회
-│       │   ├── google_calendar.py     # P400 구글 캘린더 외출/귀가 예열 보정
-│       │   ├── google_gemini_advisor.py # P200 일일 KPI 및 Gemini 진단 리포트
-│       │   └── google_alerts.py       # P000 긴급 TTS 음성 경고 & Sheets 행 변환
-│       └── protocols/
-│           ├── p000_sentinel.py       # 안전 인터락 및 과열/채터링 보호
-│           ├── p100_core.py           # 0.5°C 반올림 처리 및 상반 명령 간격 계산
-│           ├── p200_therm.py          # v1.2 선형외삽 & 적응형 RC 예측 모델 인터페이스
-│           ├── rc_optimizer.py        # 2-노드 RC 파라미터 피팅 엔진
-│           ├── multi_zone.py          # 단일 바닥센서 다중 방 제어 (hybrid / simultaneous)
-│           ├── p300_atmos.py          # 외기/시간대별 열손실 보정
-│           └── p400_circadia.py       # 생활패턴 쾌적성 보정
-├── docs/
-│   └── ARCHITECTURE.md                # 상세 프로토콜 및 타임스탬프 규격서
-├── tests/
-│   └── test_protocols.py              # P000~P400, DB, RC 피팅 단위 테스트
-└── .github/
-    └── workflows/
-        └── validate.yml               # GitHub Actions 자동 테스트 워크플로
+├── repository.yaml                    # Home Assistant Add-on Store 저장소 정의
+├── itss_scada/                        # Home Assistant 단일 애드온
+│   ├── config.yaml                    # ingress: true, homeassistant_api: true
+│   ├── Dockerfile
+│   ├── run.sh
+│   ├── requirements.txt
+│   ├── DOCS.md
+│   └── app/
+│       ├── main.py                    # FastAPI SCADA 서버, 백그라운드 제어 루프, REST API
+│       ├── ha_client.py               # HA Supervisor API 클라이언트 (상태 조회/제어/재조회)
+│       ├── static/
+│       │   └── index.html             # SCADA 대시보드 웹 UI
+│       ├── storage/db.py              # SQLite (방 설정 + KST 회차 이력)
+│       ├── models/schema.py           # KST 8종 정밀 시각 스키마
+│       ├── protocols/                 # P000~P400, 다중 방 하이브리드, RC 피팅 엔진
+│       └── integrations/              # Google Weather, Calendar, Gemini Advisor, TTS/Sheets
+├── docs/ARCHITECTURE.md
+├── tests/                             # 프로토콜, Google API, FastAPI 애드온 통합 테스트
+└── .github/workflows/validate.yml
 ```
 
 ---
 
-## 3. 설치 방법 (HACS)
+## 3. 설치 방법 (Home Assistant Add-on Store)
 
-1. Home Assistant의 **HACS** > **통합구성요소** > 우측 상단 메뉴 > **사용자 지정 저장소(Custom repositories)**를 엽니다.
-2. 저장소 URL(`https://github.com/morndew94/itss-ha`)을 입력하고 카테고리를 **Integration**으로 선택해 추가합니다.
-3. **I.T.S.S. (Intelligent Thermal SCADA System)**를 다운로드한 뒤 Home Assistant를 재시작합니다.
-4. **설정** > **기기 및 서비스** > **통합구성요소 추가**에서 `I.T.S.S.`를 검색하여 방별 엔티티(실내온도, 바닥온도, 온도조절기 등)를 매핑합니다.
+1. Home Assistant의 **설정 > 애드온 > 애드온 스토어 > 우측 상단 메뉴 > 저장소(Repositories)**를 엽니다.
+2. `https://github.com/morndew94/itss-ha` 를 추가합니다.
+3. **I.T.S.S. Thermal SCADA** 애드온을 설치하고 **사이드바에 표시(Show in sidebar)**를 켠 뒤 시작합니다.
+4. 좌측 사이드바의 **I.T.S.S. SCADA** 메뉴에서 방별 엔티티 매핑, 목표 온도, 수동/자동 모드, 시험 운전(Dry-Run) 여부를 제어합니다.
 
 ---
 
-## 4. 로컬 개발 및 단위 테스트
+## 4. 로컬 실행 및 테스트
 
 ```bash
-pip install pytest
+pip install -r itss_scada/requirements.txt pytest
 pytest -v
+
+# 로컬에서 웹 UI 미리보기 실행 (http://127.0.0.1:8099)
+uvicorn itss_scada.app.main:app --reload --port 8099
 ```
-
----
-
-## 5. 라이선스
-
-MIT License (자세한 내용은 [LICENSE](LICENSE) 참조)

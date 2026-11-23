@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>I.T.S.S. Thermal SCADA</title>
+  <style>
+    :root {
+      --bg: #0f172a; --panel: #1e293b; --card: #162033; --border: #334155;
+      --text: #f1f5f9; --muted: #94a3b8; --accent: #38bdf8;
+      --heat: #f97316; --ok: #22c55e; --warn: #eab308; --danger: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic", sans-serif;
+           background: var(--bg); color: var(--text); padding: 20px; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+             gap: 12px; padding: 16px 20px; background: var(--panel); border: 1px solid var(--border);
+             border-radius: 12px; margin-bottom: 20px; }
+    .title h1 { margin: 0; font-size: 20px; color: var(--accent); }
+    .title p { margin: 4px 0 0; font-size: 12px; color: var(--muted); }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    button, select, input { background: #0b1220; color: var(--text); border: 1px solid var(--border);
+                            border-radius: 8px; padding: 7px 12px; font-size: 13px; }
+    button { cursor: pointer; font-weight: 600; transition: 0.15s; }
+    button:hover { border-color: var(--accent); }
+    button.primary { background: #0284c7; border-color: #0284c7; }
+    button.heat { background: var(--heat); border-color: var(--heat); color: #fff; }
+    button.off { background: #334155; border-color: #475569; }
+    button.active { outline: 2px solid var(--accent); }
+    .badge { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+    .badge.ok { background: rgba(34,197,94,.2); color: var(--ok); }
+    .badge.warn { background: rgba(234,179,8,.2); color: var(--warn); }
+    .badge.heat { background: rgba(249,115,22,.2); color: var(--heat); }
+    .badge.danger { background: rgba(239,68,68,.2); color: var(--danger); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 16px; margin-bottom: 20px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+    .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .room-name { font-size: 17px; font-weight: 700; }
+    .temps { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+    .metric { background: #0b1220; padding: 10px; border-radius: 8px; }
+    .metric label { display: block; font-size: 11px; color: var(--muted); }
+    .metric .val { font-size: 22px; font-weight: 700; margin-top: 2px; }
+    .setpoint-row { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+                    background: #0b1220; padding: 10px; border-radius: 8px; margin-bottom: 10px; }
+    .setpoint-controls { display: flex; align-items: center; gap: 6px; }
+    .setpoint-val { font-size: 18px; font-weight: 700; min-width: 58px; text-align: center; color: var(--accent); }
+    .mode-row { display: flex; gap: 6px; margin-top: 8px; }
+    .mode-row button { flex: 1; padding: 8px 6px; font-size: 12px; }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 20px; }
+    .panel h2 { margin: 0 0 12px; font-size: 15px; color: var(--accent); display: flex; justify-content: space-between; align-items: center; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 600; }
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; align-items: end; }
+    .form-grid label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+    .form-grid input { width: 100%; }
+    #reportBox { white-space: pre-wrap; background: #0b1220; padding: 12px; border-radius: 8px;
+                 font-size: 13px; line-height: 1.5; color: #e2e8f0; display: none; margin-top: 10px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="title">
+      <h1>I.T.S.S. Thermal SCADA Dashboard</h1>
+      <p id="subInfo">로딩 중...</p>
+    </div>
+    <div class="toolbar">
+      <select id="strategySel" onchange="updateSettings()">
+        <option value="hybrid">하이브리드 제어 (권장)</option>
+        <option value="simultaneous">동시 제어</option>
+      </select>
+      <select id="modelSel" onchange="updateSettings()">
+        <option value="linear_v12">P200 선형외삽 v1.2</option>
+        <option value="adaptive_rc">P200 적응형 RC 모델</option>
+      </select>
+      <button id="dryRunBtn" onclick="toggleDryRun()">시험 운전: ON</button>
+      <button class="primary" onclick="runNow()">지금 1회 제어 실행</button>
+    </div>
+  </header>
+
+  <section id="roomGrid" class="grid"></section>
+
+  <section class="panel">
+    <h2>
+      <span>방 추가 / 엔티티 매핑</span>
+    </h2>
+    <div class="form-grid">
+      <div><label>방 이름</label><input id="newRoomName" placeholder="예: 작은방" /></div>
+      <div><label>실내 온도 센서 엔티티</label><input id="newRoomTemp" placeholder="sensor.room2_temp" /></div>
+      <div><label>온도조절기(Climate) 엔티티</label><input id="newClimate" placeholder="climate.room2" /></div>
+      <div><label>목표 온도 (°C)</label><input id="newTarget" type="number" step="0.1" value="23.0" /></div>
+      <div><label>마스터 바닥 오프셋 (°C)</label><input id="newOffset" type="number" step="0.1" value="0.0" /></div>
+      <div><button class="primary" style="width:100%" onclick="addRoom()">+ 방 등록</button></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>
+      <span>일일 0.3°C 제어 KPI &amp; Gemini 진단</span>
+      <button onclick="requestReport()">Gemini 진단 리포트 생성</button>
+    </h2>
+    <div class="kpi-grid" id="kpiGrid"></div>
+    <div id="reportBox"></div>
+  </section>
+
+  <section class="panel">
+    <h2><span>최근 KST 회차 이력 (Audit Log)</span></h2>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>실행 시각(KST)</th><th>방</th><th>실내</th><th>바닥(출처)</th><th>목표</th>
+            <th>모드/안전</th><th>명령</th><th>설정온도</th><th>연소확인</th>
+          </tr>
+        </thead>
+        <tbody id="cycleBody"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script>
+let currentSettings = {};
+
+async function api(path, options = {}) {
+  const res = await fetch(`./api/v1${path}`, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function refresh() {
+  const [status, cycles] = await Promise.all([api("/status"), api("/cycles?limit=30")]);
+  currentSettings = status.settings;
+
+  document.getElementById("subInfo").textContent =
+    `KST ${status.timeKst} · HA 연결: ${status.haConnected ? "정상" : "로컬/테스트 모드"} · 바닥 마스터 센서: ${currentSettings.masterFloorEntity}`;
+  document.getElementById("strategySel").value = currentSettings.zoneStrategy;
+  document.getElementById("modelSel").value = currentSettings.predictorModel;
+
+  const dryBtn = document.getElementById("dryRunBtn");
+  dryBtn.textContent = currentSettings.dryRun ? "시험 운전(Dry-Run): ON" : "실제 보일러 제어: LIVE";
+  dryBtn.className = currentSettings.dryRun ? "" : "heat";
+
+  renderRooms(status.rooms, status.latestByRoom);
+  renderKpis(status.kpis);
+  renderCycles(cycles.items);
+}
+
+function renderRooms(rooms, latestByRoom) {
+  const grid = document.getElementById("roomGrid");
+  grid.innerHTML = rooms.map(rm => {
+    const lat = latestByRoom[rm.roomName] || {};
+    const rt = lat.roomTemp != null ? `${lat.roomTemp.toFixed(1)}°C` : "--";
+    const ft = lat.floorTemp != null ? `${lat.floorTemp.toFixed(1)}°C` : "--";
+    const fSrc = rm.hasFloorSensor ? "실측" : `추정(${rm.floorOffsetC >= 0 ? "+" : ""}${rm.floorOffsetC})`;
+    const isAuto = rm.controlMode === "AUTO";
+    const isManHeat = !isAuto && rm.manualAction === "HEAT";
+    const isManOff = !isAuto && rm.manualAction === "OFF";
+    const badgeClass = lat.commandAction === "HEAT" ? "heat" : (lat.safetyReason === "P000_OVERHEAT_CUTOFF" ? "danger" : "ok");
+
+    return `
+      <div class="card">
+        <div class="card-head">
+          <div class="room-name">${rm.roomName}</div>
+          <div>
+            <span class="badge ${badgeClass}">${lat.commandAction || "대기"}</span>
+            <span class="badge ${isAuto ? "ok" : "warn"}">${isAuto ? "AUTO" : "수동"}</span>
+          </div>
+        </div>
+        <div class="temps">
+          <div class="metric"><label>실내 온도 (0.1°C)</label><div class="val">${rt}</div></div>
+          <div class="metric"><label>바닥 온도 (${fSrc})</label><div class="val">${ft}</div></div>
+        </div>
+        <div class="setpoint-row">
+          <span style="font-size:12px;color:var(--muted);">목표 온도</span>
+          <div class="setpoint-controls">
+            <button onclick="changeTarget('${rm.roomName}', ${(rm.targetTemp - 0.1).toFixed(1)})">-0.1</button>
+            <span class="setpoint-val">${rm.targetTemp.toFixed(1)}°C</span>
+            <button onclick="changeTarget('${rm.roomName}', ${(rm.targetTemp + 0.1).toFixed(1)})">+0.1</button>
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">운전 모드 (P000 수동 우선 적용)</div>
+        <div class="mode-row">
+          <button class="${isAuto ? "primary active" : ""}" onclick="setMode('${rm.roomName}', 'AUTO', 'HOLD')">자동(AUTO)</button>
+          <button class="${isManHeat ? "heat active" : ""}" onclick="setMode('${rm.roomName}', 'MANUAL', 'HEAT')">수동 ON</button>
+          <button class="${isManOff ? "off active" : ""}" onclick="setMode('${rm.roomName}', 'MANUAL', 'OFF')">수동 OFF</button>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+function renderKpis(k) {
+  document.getElementById("kpiGrid").innerHTML = `
+    <div class="metric"><label>총 회차 수</label><div class="val">${k.totalCycles ?? 0}</div></div>
+    <div class="metric"><label>0.3°C 밴드 달성률</label><div class="val">${k.bandCompliancePct != null ? k.bandCompliancePct + "%" : "--"}</div></div>
+    <div class="metric"><label>최대 오버슈트</label><div class="val">${k.maxOvershootC != null ? k.maxOvershootC + "°C" : "--"}</div></div>
+    <div class="metric"><label>P000 안전 개입</label><div class="val">${k.safetyInterventions ?? 0}회</div></div>
+    <div class="metric"><label>시각 누락률</label><div class="val">${k.nullTimestampRatePct != null ? k.nullTimestampRatePct + "%" : "--"}</div></div>
+  `;
+}
+
+function renderCycles(items) {
+  document.getElementById("cycleBody").innerHTML = items.map(c => `
+    <tr>
+      <td>${c.executionStartedAt || "-"}</td>
+      <td>${c.roomName}</td>
+      <td>${c.roomTemp ?? "-"}</td>
+      <td>${c.floorTemp ?? "-"} (${c.floorSensorSource || "-"})</td>
+      <td>${c.targetTemp ?? "-"}</td>
+      <td>${c.safetyReason || "-"}</td>
+      <td>${c.commandAction || "-"}</td>
+      <td>${c.commandSetpoint ?? "-"}</td>
+      <td>${c.combustionConfirmed === true ? "연소중" : (c.combustionConfirmed === false ? "정지" : "미확인")}</td>
+    </tr>`).join("");
+}
+
+async function changeTarget(roomName, newTemp) {
+  await api(`/rooms/${encodeURIComponent(roomName)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ targetTemp: Number(newTemp) }),
+  });
+  await refresh();
+}
+
+async function setMode(roomName, controlMode, manualAction) {
+  await api(`/rooms/${encodeURIComponent(roomName)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ controlMode, manualAction }),
+  });
+  await refresh();
+}
+
+async function toggleDryRun() {
+  await api("/settings", {
+    method: "PATCH",
+    body: JSON.stringify({ dryRun: !currentSettings.dryRun }),
+  });
+  await refresh();
+}
+
+async function updateSettings() {
+  await api("/settings", {
+    method: "PATCH",
+    body: JSON.stringify({
+      zoneStrategy: document.getElementById("strategySel").value,
+      predictorModel: document.getElementById("modelSel").value,
+    }),
+  });
+  await refresh();
+}
+
+async function runNow() {
+  await api("/control/run-now", { method: "POST" });
+  await refresh();
+}
+
+async function addRoom() {
+  const roomName = document.getElementById("newRoomName").value.trim();
+  const roomTempEntity = document.getElementById("newRoomTemp").value.trim();
+  const climateEntity = document.getElementById("newClimate").value.trim();
+  if (!roomName || !roomTempEntity || !climateEntity) return alert("방 이름과 엔티티 ID를 모두 입력하세요.");
+  await api("/rooms", {
+    method: "POST",
+    body: JSON.stringify({
+      roomName,
+      roomTempEntity,
+      climateEntity,
+      hasFloorSensor: false,
+      targetTemp: Number(document.getElementById("newTarget").value),
+      floorOffsetC: Number(document.getElementById("newOffset").value),
+    }),
+  });
+  document.getElementById("newRoomName").value = "";
+  await refresh();
+}
+
+async function requestReport() {
+  const box = document.getElementById("reportBox");
+  box.style.display = "block";
+  box.textContent = "Gemini 일일 진단 리포트 생성 중...";
+  const res = await api("/report/daily", { method: "POST" });
+  box.textContent = res.report || `상태: ${res.status} (Gemini API 키가 설정되지 않았거나 이력이 부족합니다.)`;
+}
+
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

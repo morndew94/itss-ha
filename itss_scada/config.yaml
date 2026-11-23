@@ -1,0 +1,41 @@
+name: "I.T.S.S. Thermal SCADA"
+version: "1.1.0"
+slug: "itss_scada"
+description: "0.3C Ondol precision heating SCADA add-on with Ingress Web UI, per-room target temp, manual override, hybrid multi-zone control, and Google API integrations."
+url: "https://github.com/morndew94/itss-ha"
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: services
+boot: auto
+init: false
+homeassistant_api: true
+ingress: true
+ingress_port: 8099
+panel_icon: "mdi:thermometer-lines"
+panel_title: "I.T.S.S. SCADA"
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: "I.T.S.S. SCADA Web UI & REST API"
+options:
+  db_path: "/data/itss_scada.db"
+  update_interval_sec: 300
+  zone_strategy: "hybrid"
+  predictor_model: "linear_v12"
+  dry_run: true
+  master_floor_entity: "sensor.living_floor_temperature"
+  gemini_api_key: ""
+  weather_location: "서울"
+  log_level: "info"
+schema:
+  db_path: str
+  update_interval_sec: int(30,3600)
+  zone_strategy: list(hybrid|simultaneous)
+  predictor_model: list(linear_v12|adaptive_rc)
+  dry_run: bool
+  master_floor_entity: str
+  gemini_api_key: password?
+  weather_location: str?
+  log_level: list(debug|info|warning|error)
