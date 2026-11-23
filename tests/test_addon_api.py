@@ -39,23 +39,40 @@ def test_addon_web_ui_room_target_and_manual_mode(tmp_path: Path):
     app = create_app(db_path=str(tmp_path / "addon.db"), ha_client=fake_ha)
 
     with TestClient(app) as client:
-        # 1. Web UI HTML served at root
+        # 1. Starts empty (no hardcoded sample rooms) and serves Web UI
         r_html = client.get("/")
         assert r_html.status_code == 200
         assert "I.T.S.S. Thermal SCADA Dashboard" in r_html.text
+        assert client.get("/api/v1/rooms").json() == []
 
-        # 2. Update target temperature for living room
+        # 2. Register rooms via API
+        assert client.post("/api/v1/rooms", json={
+            "roomName": "거실",
+            "roomTempEntity": "sensor.living_temperature",
+            "climateEntity": "climate.living_thermostat",
+            "hasFloorSensor": True,
+            "targetTemp": 23.0,
+        }).status_code == 200
+        assert client.post("/api/v1/rooms", json={
+            "roomName": "안방",
+            "roomTempEntity": "sensor.master_bedroom_temperature",
+            "climateEntity": "climate.master_bedroom_thermostat",
+            "hasFloorSensor": False,
+            "targetTemp": 22.5,
+        }).status_code == 200
+
+        # 3. Update target temperature for living room
         r_patch = client.patch("/api/v1/rooms/거실", json={"targetTemp": 23.4})
         assert r_patch.status_code == 200
         assert r_patch.json()["targetTemp"] == 23.4
 
-        # 3. Switch master bedroom to MANUAL HEAT override
+        # 4. Switch master bedroom to MANUAL HEAT override
         r_man = client.patch("/api/v1/rooms/안방", json={"controlMode": "MANUAL", "manualAction": "HEAT"})
         assert r_man.status_code == 200
         assert r_man.json()["controlMode"] == "MANUAL"
         assert r_man.json()["manualAction"] == "HEAT"
 
-        # 4. Run control cycle and verify MANUAL override takes effect
+        # 5. Run control cycle and verify MANUAL override takes effect
         r_run = client.post("/api/v1/control/run-now")
         assert r_run.status_code == 200
         records = {rec["roomName"]: rec for rec in r_run.json()["records"]}
@@ -64,3 +81,10 @@ def test_addon_web_ui_room_target_and_manual_mode(tmp_path: Path):
         assert records["안방"]["safetyReason"] == "P000_MANUAL_OVERRIDE"
         assert records["안방"]["commandAction"] == "HEAT"
         assert records["안방"]["floorSensorSource"] == "ESTIMATED"
+
+        # 6. Delete a room and verify it stays deleted
+        r_del = client.delete("/api/v1/rooms/안방")
+        assert r_del.status_code == 200
+        remaining = [r["roomName"] for r in client.get("/api/v1/rooms").json()]
+        assert remaining == ["거실"]
+

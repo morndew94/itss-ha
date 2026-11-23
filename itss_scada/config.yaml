@@ -1,5 +1,5 @@
 name: "I.T.S.S. Thermal SCADA"
-version: "1.1.0"
+version: "1.1.1"
 slug: "itss_scada"
 description: "0.3C Ondol precision heating SCADA add-on with Ingress Web UI, per-room target temp, manual override, hybrid multi-zone control, and Google API integrations."
 url: "https://github.com/morndew94/itss-ha"
@@ -39,3 +39,4 @@ schema:
   gemini_api_key: password?
   weather_location: str?
   log_level: list(debug|info|warning|error)
+

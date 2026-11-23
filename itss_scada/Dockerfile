@@ -13,3 +13,4 @@ RUN chmod a+x /app/run.sh
 EXPOSE 8099
 
 CMD ["/app/run.sh"]
+

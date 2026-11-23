@@ -93,6 +93,7 @@
       <div><label>온도조절기(Climate) 엔티티</label><input id="newClimate" placeholder="climate.room2" /></div>
       <div><label>목표 온도 (°C)</label><input id="newTarget" type="number" step="0.1" value="23.0" /></div>
       <div><label>마스터 바닥 오프셋 (°C)</label><input id="newOffset" type="number" step="0.1" value="0.0" /></div>
+      <div><label>바닥 센서 설치 방 여부</label><select id="newHasFloor"><option value="false">없음 (추정)</option><option value="true">있음 (마스터)</option></select></div>
       <div><button class="primary" style="width:100%" onclick="addRoom()">+ 방 등록</button></div>
     </div>
   </section>
@@ -154,6 +155,12 @@ async function refresh() {
 
 function renderRooms(rooms, latestByRoom) {
   const grid = document.getElementById("roomGrid");
+  if (!rooms.length) {
+    grid.innerHTML = `<div class="card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:28px;">
+      등록된 방이 없습니다. 아래 <b>방 추가 / 엔티티 매핑</b>에서 실제 Home Assistant 엔티티로 방을 등록해 주세요.
+    </div>`;
+    return;
+  }
   grid.innerHTML = rooms.map(rm => {
     const lat = latestByRoom[rm.roomName] || {};
     const rt = lat.roomTemp != null ? `${lat.roomTemp.toFixed(1)}°C` : "--";
@@ -167,10 +174,14 @@ function renderRooms(rooms, latestByRoom) {
     return `
       <div class="card">
         <div class="card-head">
-          <div class="room-name">${rm.roomName}</div>
           <div>
+            <div class="room-name">${rm.roomName}</div>
+            <div style="font-size:11px;color:var(--muted);margin-top:2px;">${rm.roomTempEntity} · ${rm.climateEntity}</div>
+          </div>
+          <div style="display:flex;gap:4px;align-items:center;">
             <span class="badge ${badgeClass}">${lat.commandAction || "대기"}</span>
             <span class="badge ${isAuto ? "ok" : "warn"}">${isAuto ? "AUTO" : "수동"}</span>
+            <button style="padding:3px 8px;font-size:11px;color:var(--danger);border-color:rgba(239,68,68,.4);" onclick="deleteRoom('${rm.roomName}')">삭제</button>
           </div>
         </div>
         <div class="temps">
@@ -260,6 +271,12 @@ async function runNow() {
   await refresh();
 }
 
+async function deleteRoom(roomName) {
+  if (!confirm(`'${roomName}' 방 설정을 삭제할까요?`)) return;
+  await api(`/rooms/${encodeURIComponent(roomName)}`, { method: "DELETE" });
+  await refresh();
+}
+
 async function addRoom() {
   const roomName = document.getElementById("newRoomName").value.trim();
   const roomTempEntity = document.getElementById("newRoomTemp").value.trim();
@@ -271,7 +288,7 @@ async function addRoom() {
       roomName,
       roomTempEntity,
       climateEntity,
-      hasFloorSensor: false,
+      hasFloorSensor: document.getElementById("newHasFloor").value === "true",
       targetTemp: Number(document.getElementById("newTarget").value),
       floorOffsetC: Number(document.getElementById("newOffset").value),
     }),
@@ -293,3 +310,4 @@ setInterval(refresh, 15000);
 </script>
 </body>
 </html>
+

@@ -105,29 +105,6 @@ class ItssEngine:
         self.atmos = AtmosProtocol()
         self.circadia = CircadiaProtocol()
 
-        # Seed default rooms if DB is completely empty so the Web UI is immediately usable
-        if not self.db.list_rooms():
-            self.db.upsert_room({
-                "roomName": "거실",
-                "roomTempEntity": "sensor.living_temperature",
-                "climateEntity": "climate.living_thermostat",
-                "hasFloorSensor": True,
-                "floorOffsetC": 0.0,
-                "targetTemp": 23.0,
-                "controlMode": "AUTO",
-                "manualAction": "HOLD",
-            })
-            self.db.upsert_room({
-                "roomName": "안방",
-                "roomTempEntity": "sensor.master_bedroom_temperature",
-                "climateEntity": "climate.master_bedroom_thermostat",
-                "hasFloorSensor": False,
-                "floorOffsetC": 0.0,
-                "targetTemp": 22.5,
-                "controlMode": "AUTO",
-                "manualAction": "HOLD",
-            })
-
     async def run_control_cycle(self) -> list[dict[str, Any]]:
         """Execute one coordinated multi-zone cycle across all registered rooms."""
         now = datetime.now(tz=KST)
@@ -436,3 +413,4 @@ def create_app(db_path: str | None = None, ha_client: HomeAssistantClient | None
 
 
 app = create_app()
+

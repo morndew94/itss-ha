@@ -74,3 +74,4 @@ class HomeAssistantClient:
                 json=data,
             )
             resp.raise_for_status()
+
