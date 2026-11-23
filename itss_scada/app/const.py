@@ -50,7 +50,7 @@ DEFAULT_GENERAL_OFF_FLOOR_C = 28.0
 DEFAULT_VENTILATION_DROP_RATE = -0.15  # degC per minute
 DEFAULT_MIN_ON_SEC = 600   # 10 minutes anti-chattering
 DEFAULT_MIN_OFF_SEC = 600  # 10 minutes anti-chattering
-DEFAULT_MAX_SENSOR_AGE_SEC = 1800  # 30 minutes staleness threshold
+DEFAULT_MAX_SENSOR_AGE_SEC = 7200  # 2 hours staleness threshold for Zigbee sensors
 
 # ITSS-P100 CORE thermostat step
 THERMOSTAT_SETPOINT_STEP = 0.5

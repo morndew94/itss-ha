@@ -103,9 +103,10 @@
       <button id="pre_PREHEAT" onclick="applyPreset('PREHEAT')">귀가 예열 (+0.2°C)</button>
       <button id="pre_ALL_OFF" class="off" onclick="applyPreset('ALL_OFF')">전체 OFF</button>
     </div>
-    <div style="display:flex;gap:8px;align-items:center;">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
       <button onclick="runAutoCalibrate()">1-클릭 RC 피팅 &amp; 바닥 오프셋 보정</button>
       <button onclick="sendTestNotify()">모바일 알림 테스트</button>
+      <button onclick="runDiagnose()">HA 연동 진단</button>
     </div>
   </section>
 
@@ -343,6 +344,10 @@ function renderRooms(rooms, liveByRoom, latestByRoom) {
           <button class="${isManHeat ? "heat active" : ""}" onclick="setMode('${rm.roomName}', 'MANUAL', 'HEAT')">수동 ON</button>
           <button class="${isManOff ? "off active" : ""}" onclick="setMode('${rm.roomName}', 'MANUAL', 'OFF')">수동 OFF</button>
         </div>
+        <div class="mode-row" style="margin-top:6px;">
+          <button style="font-size:11px;" onclick="testClimate('${rm.roomName}', 'HEAT')">직접 테스트 ON(${currentSettings.heatOnSetpoint}°C)</button>
+          <button style="font-size:11px;" onclick="testClimate('${rm.roomName}', 'OFF')">직접 테스트 OFF(${currentSettings.heatOffSetpoint}°C)</button>
+        </div>
       </div>`;
   }).join("");
 }
@@ -473,7 +478,23 @@ async function runAutoCalibrate() {
 
 async function sendTestNotify() {
   const res = await api("/notify/test", { method: "POST" });
-  showMsg(`모바일 푸시 알림 테스트 결과: ${JSON.stringify(res)}`);
+  showMsg(`모바일 푸시 알림 테스트 결과:\n${JSON.stringify(res, null, 2)}`);
+}
+
+async function runDiagnose() {
+  showMsg("HA 엔티티 및 서비스 진단 중...");
+  const res = await api("/ha/diagnose");
+  showMsg(`HA 연동 진단 결과:\n${JSON.stringify(res, null, 2)}`);
+}
+
+async function testClimate(roomName, action) {
+  showMsg(`${roomName} 조절기 직접 제어 테스트(${action}) 전송 중...`);
+  const res = await api(`/rooms/${encodeURIComponent(roomName)}/test-climate`, {
+    method: "POST",
+    body: JSON.stringify({ action }),
+  });
+  showMsg(`조절기 직접 테스트 결과 (${roomName}):\n${JSON.stringify(res, null, 2)}`);
+  await refresh();
 }
 
 async function changeTarget(roomName, newTemp) {

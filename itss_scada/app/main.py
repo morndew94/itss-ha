@@ -100,6 +100,10 @@ class SchedulesUpdateRequest(BaseModel):
     slots: list[ScheduleSlot]
 
 
+class TestClimateRequest(BaseModel):
+    action: str = Field(..., pattern="^(HEAT|OFF)$")
+
+
 class RCFitRequest(BaseModel):
     observations: list[dict[str, Any]]
 
@@ -333,12 +337,16 @@ class ItssEngine:
             cycle_id = f"{now.strftime('%Y%m%d-%H%M%S')}-{r_name}"
 
             has_floor = rm["hasFloorSensor"]
-            eff_floor = (
-                round(master_floor + (0.0 if has_floor else rm["floorOffsetC"]), 1)
-                if master_floor is not None
-                else None
-            )
-            floor_src = "MEASURED" if has_floor else "ESTIMATED"
+            if master_floor is not None:
+                eff_floor = round(master_floor + (0.0 if has_floor else rm["floorOffsetC"]), 1)
+                floor_src = "MEASURED" if has_floor else "ESTIMATED"
+            elif not self.settings["masterFloorEntity"].strip():
+                # Allow room-only operation when master floor sensor is not yet assigned
+                eff_floor = 24.0
+                floor_src = "UNCONFIGURED"
+            else:
+                eff_floor = None
+                floor_src = "MISSING"
 
             is_manual = rm["controlMode"] == "MANUAL"
             snapshot = SensorSnapshot(
@@ -441,9 +449,16 @@ class ItssEngine:
                     "climate", "set_temperature", {"entity_id": climate_entity, "temperature": record.command_setpoint}
                 )
             elif record.command_action == "OFF":
-                await self.ha.call_service(
-                    "climate", "set_temperature", {"entity_id": climate_entity, "temperature": record.command_setpoint}
-                )
+                try:
+                    await self.ha.call_service(
+                        "climate", "set_temperature", {"entity_id": climate_entity, "temperature": record.command_setpoint}
+                    )
+                except Exception:  # noqa: BLE001
+                    # Some wallpads reject set_temperature while already in 'off' mode; try turning off explicitly
+                    if record.device_mode_event != "off":
+                        await self.ha.call_service(
+                            "climate", "set_hvac_mode", {"entity_id": climate_entity, "hvac_mode": "off"}
+                        )
             record.control_confirmed_at = now_kst_iso()
 
             await asyncio.sleep(DEFAULT_RECHECK_DELAY_SEC)
@@ -557,6 +572,90 @@ def create_app(
     @app.get("/api/v1/ha/entities")
     async def list_ha_entities() -> dict[str, Any]:
         return await engine.ha.list_entities()
+
+    @app.get("/api/v1/ha/diagnose")
+    async def diagnose_ha() -> dict[str, Any]:
+        """Return live diagnostic dump of rooms, climate attributes, and HA services."""
+        rooms = engine.db.list_rooms()
+        room_diags = []
+        for rm in rooms:
+            r_raw = await engine.ha.get_state(rm["roomTempEntity"])
+            c_raw = await engine.ha.get_state(rm["climateEntity"])
+            room_diags.append({
+                "roomName": rm["roomName"],
+                "controlMode": rm["controlMode"],
+                "roomTempEntity": rm["roomTempEntity"],
+                "roomTempState": r_raw.get("state") if r_raw else None,
+                "climateEntity": rm["climateEntity"],
+                "climateState": c_raw.get("state") if c_raw else None,
+                "climateAttrs": (c_raw.get("attributes") or {}) if c_raw else None,
+            })
+        mf_raw = await engine.ha.get_state(engine.settings["masterFloorEntity"])
+        services = await engine.ha.list_services() if hasattr(engine.ha, "list_services") else {}
+        return {
+            "haConnected": engine.ha.is_configured,
+            "tokenSource": getattr(engine.ha, "token_source", "mock"),
+            "dryRun": engine.settings["dryRun"],
+            "heatOnSetpoint": engine.settings["heatOnSetpoint"],
+            "heatOffSetpoint": engine.settings["heatOffSetpoint"],
+            "masterFloorEntity": engine.settings["masterFloorEntity"],
+            "masterFloorState": mf_raw.get("state") if mf_raw else None,
+            "lastError": getattr(engine.ha, "last_error", None),
+            "rooms": room_diags,
+            "availableServices": services,
+            "notifyConfig": {
+                "notifyService": engine.notifier.notify_service,
+                "telegramChatId": engine.notifier.telegram_chat_id,
+            },
+        }
+
+    @app.post("/api/v1/rooms/{room_name}/test-climate")
+    async def test_room_climate(room_name: str, req: TestClimateRequest) -> dict[str, Any]:
+        """Directly dispatch a live HEAT(24C)/OFF(15C) test to one room's climate entity."""
+        rm = engine.db.get_room(room_name)
+        if not rm:
+            raise HTTPException(status_code=404, detail="Room not found")
+        cid = rm["climateEntity"]
+        setpoint = (
+            float(engine.settings["heatOnSetpoint"])
+            if req.action == "HEAT"
+            else float(engine.settings["heatOffSetpoint"])
+        )
+        before = await engine.ha.get_state(cid)
+        steps: list[dict[str, Any]] = []
+
+        if req.action == "HEAT":
+            try:
+                await engine.ha.call_service("climate", "set_hvac_mode", {"entity_id": cid, "hvac_mode": "heat"})
+                steps.append({"call": "climate.set_hvac_mode(heat)", "status": "ok"})
+                await asyncio.sleep(0.8)
+            except Exception as err:  # noqa: BLE001
+                steps.append({"call": "climate.set_hvac_mode(heat)", "status": f"error:{err}"})
+
+        try:
+            await engine.ha.call_service("climate", "set_temperature", {"entity_id": cid, "temperature": setpoint})
+            steps.append({"call": f"climate.set_temperature({setpoint})", "status": "ok"})
+        except Exception as err:  # noqa: BLE001
+            steps.append({"call": f"climate.set_temperature({setpoint})", "status": f"error:{err}"})
+
+        await asyncio.sleep(DEFAULT_RECHECK_DELAY_SEC)
+        after = await engine.ha.get_state(cid)
+        return {
+            "roomName": room_name,
+            "climateEntity": cid,
+            "action": req.action,
+            "targetSetpoint": setpoint,
+            "before": {
+                "state": before.get("state") if before else None,
+                "temperature": (before.get("attributes") or {}).get("temperature") if before else None,
+            },
+            "steps": steps,
+            "after": {
+                "state": after.get("state") if after else None,
+                "temperature": (after.get("attributes") or {}).get("temperature") if after else None,
+                "hvac_action": (after.get("attributes") or {}).get("hvac_action") if after else None,
+            },
+        }
 
     @app.get("/api/v1/rooms")
     def list_rooms() -> list[dict[str, Any]]:

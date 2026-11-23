@@ -52,7 +52,18 @@ class HomeAssistantClient:
     ) -> None:
         self.base_url = (base_url or os.environ.get("HA_BASE_URL") or "http://supervisor/core/api").rstrip("/")
         self.token, self.token_source = _discover_token(token)
-        self.last_error: str | None = None
+        # Keep service errors separate so successful GET /states never wipes them
+        self.last_state_error: str | None = None
+        self.last_service_error: str | None = None
+
+    @property
+    def last_error(self) -> str | None:
+        """Return latest service error first, otherwise state error."""
+        return self.last_service_error or self.last_state_error
+
+    @last_error.setter
+    def last_error(self, value: str | None) -> None:
+        self.last_service_error = value
 
     @property
     def is_configured(self) -> bool:
@@ -73,14 +84,15 @@ class HomeAssistantClient:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{self.base_url}/states/{entity_id}", headers=self._headers())
                 if resp.status_code == 404:
-                    self.last_error = f"Entity not found (404): {entity_id}"
+                    self.last_state_error = f"Entity not found (404): {entity_id}"
                     return None
-                resp.raise_for_status()
-                self.last_error = None
+                if resp.status_code >= 400:
+                    self.last_state_error = f"GET /states/{entity_id} HTTP {resp.status_code}: {resp.text[:200]}"
+                    return None
                 return resp.json()
         except Exception as err:  # noqa: BLE001
-            self.last_error = f"HA API error ({entity_id}): {err}"
-            _LOGGER.warning("%s", self.last_error)
+            self.last_state_error = f"HA API error ({entity_id}): {err}"
+            _LOGGER.warning("%s", self.last_state_error)
             return None
 
     async def get_numeric_state(self, entity_id: str) -> tuple[float | None, str | None, float | None]:
@@ -103,21 +115,22 @@ class HomeAssistantClient:
         return val, updated_iso, age_sec
 
     async def list_entities(self) -> dict[str, list[dict[str, Any]]]:
-        """Return temperature sensors, all sensors, and climate entities from HA."""
+        """Return temperature sensors, all sensors, climate, and notify entities from HA."""
         if not self.is_configured:
-            return {"tempSensors": [], "sensors": [], "climates": []}
+            return {"tempSensors": [], "sensors": [], "climates": [], "notifies": []}
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{self.base_url}/states", headers=self._headers())
                 resp.raise_for_status()
                 items = resp.json()
         except Exception as err:  # noqa: BLE001
-            self.last_error = f"HA states list error: {err}"
-            return {"tempSensors": [], "sensors": [], "climates": []}
+            self.last_state_error = f"HA states list error: {err}"
+            return {"tempSensors": [], "sensors": [], "climates": [], "notifies": []}
 
         temp_sensors: list[dict[str, Any]] = []
         sensors: list[dict[str, Any]] = []
         climates: list[dict[str, Any]] = []
+        notifies: list[dict[str, Any]] = []
         for it in items:
             eid = str(it.get("entity_id", ""))
             attrs = it.get("attributes") or {}
@@ -136,18 +149,49 @@ class HomeAssistantClient:
                     if "humidity" not in eid.lower():
                         temp_sensors.append(entry)
             elif eid.startswith("climate."):
+                entry["hvacModes"] = attrs.get("hvac_modes", [])
+                entry["temperature"] = attrs.get("temperature")
+                entry["currentTemperature"] = attrs.get("current_temperature")
                 climates.append(entry)
+            elif eid.startswith("notify."):
+                notifies.append(entry)
 
         temp_sensors.sort(key=lambda x: x["entityId"])
         sensors.sort(key=lambda x: x["entityId"])
         climates.sort(key=lambda x: x["entityId"])
-        return {"tempSensors": temp_sensors, "sensors": sensors, "climates": climates}
+        notifies.sort(key=lambda x: x["entityId"])
+        return {
+            "tempSensors": temp_sensors,
+            "sensors": sensors,
+            "climates": climates,
+            "notifies": notifies,
+        }
 
-    async def call_service(self, domain: str, service: str, data: dict[str, Any]) -> None:
-        """Invoke a Home Assistant service (e.g., climate.set_temperature, notify.*)."""
+    async def list_services(self, domains: tuple[str, ...] = ("climate", "notify", "telegram_bot")) -> dict[str, list[str]]:
+        """Query HA /api/services and return available service names for target domains."""
         if not self.is_configured:
-            self.last_error = f"HA not configured (no token) when calling {domain}.{service}"
-            return
+            return {}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{self.base_url}/services", headers=self._headers())
+                resp.raise_for_status()
+                items = resp.json()
+        except Exception as err:  # noqa: BLE001
+            self.last_state_error = f"HA services list error: {err}"
+            return {}
+
+        out: dict[str, list[str]] = {}
+        for item in items:
+            dom = item.get("domain")
+            if dom in domains:
+                out[dom] = sorted(list((item.get("services") or {}).keys()))
+        return out
+
+    async def call_service(self, domain: str, service: str, data: dict[str, Any]) -> Any:
+        """Invoke a Home Assistant service and raise detailed HTTP body on failure."""
+        if not self.is_configured:
+            self.last_service_error = f"HA not configured (no token) when calling {domain}.{service}"
+            raise RuntimeError(self.last_service_error)
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.post(
@@ -156,12 +200,16 @@ class HomeAssistantClient:
                     json=data,
                 )
                 if resp.status_code >= 400:
-                    self.last_error = f"HA service {domain}.{service} failed (HTTP {resp.status_code}): {resp.text[:200]}"
-                    _LOGGER.error("%s", self.last_error)
-                resp.raise_for_status()
-                self.last_error = None
-        except Exception as err:  # noqa: BLE001
-            if not self.last_error:
-                self.last_error = f"HA service {domain}.{service} error: {err}"
-            _LOGGER.error("%s", self.last_error)
+                    detail = f"HTTP {resp.status_code} ({domain}.{service}): {resp.text[:300]}"
+                    self.last_service_error = detail
+                    _LOGGER.error("%s", detail)
+                    raise RuntimeError(detail)
+                self.last_service_error = None
+                return resp.json() if resp.text else []
+        except RuntimeError:
             raise
+        except Exception as err:  # noqa: BLE001
+            detail = f"{domain}.{service} error: {err}"
+            self.last_service_error = detail
+            _LOGGER.error("%s", detail)
+            raise RuntimeError(detail) from err

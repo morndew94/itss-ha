@@ -96,7 +96,15 @@ def test_addon_v2_full_workflow(tmp_path: Path):
         assert client.post("/api/v1/preset", json={"preset": "AWAY"}).json()["offsetC"] == -2.0
         assert "rcFit" in client.post("/api/v1/calibrate/auto").json()
         n_res = client.post("/api/v1/notify/test").json()
-        assert n_res["ha_notify"] == "sent"
-        assert n_res["telegram"] == "sent"
+        assert n_res["ha_notify"].startswith("sent_via_service:")
+        assert n_res["telegram"] == "sent_to:12345"
         tg_calls = [d for dom, svc, d in fake_ha.calls if dom == "telegram_bot" and svc == "send_message"]
         assert len(tg_calls) == 1 and tg_calls[0]["target"] == 12345
+
+        # 6. Diagnose & direct climate test endpoints
+        diag = client.get("/api/v1/ha/diagnose").json()
+        assert diag["haConnected"] is True
+        assert len(diag["rooms"]) == 2
+        t_res = client.post("/api/v1/rooms/거실/test-climate", json={"action": "HEAT"}).json()
+        assert t_res["targetSetpoint"] == 24.0
+        assert any(s["call"] == "climate.set_temperature(24.0)" and s["status"] == "ok" for s in t_res["steps"])
