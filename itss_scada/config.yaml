@@ -1,7 +1,7 @@
 name: "I.T.S.S. Thermal SCADA"
-version: "1.2.0"
+version: "2.0.0"
 slug: "itss_scada"
-description: "0.3C Ondol precision heating SCADA add-on with Ingress Web UI, per-room target temp, manual override, hybrid multi-zone control, and Google API integrations."
+description: "0.3C Ondol precision heating SCADA add-on with Ingress Web UI, 24h chart, presets, P400 scheduler, 1-click RC fitting, boiler cost stats, and HA/Telegram alerts."
 url: "https://github.com/morndew94/itss-ha"
 arch:
   - amd64
@@ -27,7 +27,12 @@ options:
   dry_run: true
   heat_on_setpoint: 24.0
   heat_off_setpoint: 15.0
-  master_floor_entity: "sensor.living_floor_temperature"
+  master_floor_entity: ""
+  gas_krw_per_hour: 1200
+  ha_token: ""
+  notify_service: ""
+  telegram_bot_token: ""
+  telegram_chat_id: ""
   gemini_api_key: ""
   weather_location: "서울"
   log_level: "info"
@@ -39,8 +44,12 @@ schema:
   dry_run: bool
   heat_on_setpoint: float(15,30)
   heat_off_setpoint: float(5,25)
-  master_floor_entity: str
+  master_floor_entity: str?
+  gas_krw_per_hour: int(100,10000)
+  ha_token: password?
+  notify_service: str?
+  telegram_bot_token: password?
+  telegram_chat_id: str?
   gemini_api_key: password?
   weather_location: str?
   log_level: list(debug|info|warning|error)
-

@@ -13,9 +13,37 @@ from .const import KST
 
 _LOGGER = logging.getLogger(__name__)
 
+_S6_TOKEN_PATHS = (
+    "/run/s6/container_environment/SUPERVISOR_TOKEN",
+    "/run/s6/container_environment/HASSIO_TOKEN",
+)
+
+
+def _discover_token(explicit_token: str | None = None) -> tuple[str, str]:
+    """Locate HA API token from explicit config, env vars, or S6 container env files."""
+    if explicit_token and explicit_token.strip():
+        return explicit_token.strip(), "config_option"
+
+    for env_key in ("SUPERVISOR_TOKEN", "HASSIO_TOKEN", "HA_TOKEN"):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return val, f"env:{env_key}"
+
+    for path in _S6_TOKEN_PATHS:
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    val = f.read().strip()
+                if val:
+                    return val, f"file:{path}"
+            except OSError:
+                pass
+
+    return "", "none"
+
 
 class HomeAssistantClient:
-    """Reads entity states and calls climate services via HA Supervisor API."""
+    """Reads entity states and calls climate/notify services via HA Supervisor API."""
 
     def __init__(
         self,
@@ -23,7 +51,7 @@ class HomeAssistantClient:
         token: str | None = None,
     ) -> None:
         self.base_url = (base_url or os.environ.get("HA_BASE_URL") or "http://supervisor/core/api").rstrip("/")
-        self.token = token or os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HA_TOKEN") or ""
+        self.token, self.token_source = _discover_token(token)
         self.last_error: str | None = None
 
     @property
@@ -75,9 +103,9 @@ class HomeAssistantClient:
         return val, updated_iso, age_sec
 
     async def list_entities(self) -> dict[str, list[dict[str, Any]]]:
-        """Return sensor and climate entities from Home Assistant for UI selection."""
+        """Return temperature sensors, all sensors, and climate entities from HA."""
         if not self.is_configured:
-            return {"sensors": [], "climates": []}
+            return {"tempSensors": [], "sensors": [], "climates": []}
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{self.base_url}/states", headers=self._headers())
@@ -85,31 +113,38 @@ class HomeAssistantClient:
                 items = resp.json()
         except Exception as err:  # noqa: BLE001
             self.last_error = f"HA states list error: {err}"
-            return {"sensors": [], "climates": []}
+            return {"tempSensors": [], "sensors": [], "climates": []}
 
+        temp_sensors: list[dict[str, Any]] = []
         sensors: list[dict[str, Any]] = []
         climates: list[dict[str, Any]] = []
         for it in items:
             eid = str(it.get("entity_id", ""))
             attrs = it.get("attributes") or {}
+            unit = str(attrs.get("unit_of_measurement", ""))
+            dev_cls = str(attrs.get("device_class", ""))
             entry = {
                 "entityId": eid,
                 "name": attrs.get("friendly_name", eid),
                 "state": it.get("state"),
-                "unit": attrs.get("unit_of_measurement", ""),
-                "deviceClass": attrs.get("device_class", ""),
+                "unit": unit,
+                "deviceClass": dev_cls,
             }
             if eid.startswith("sensor."):
                 sensors.append(entry)
+                if dev_cls == "temperature" or "°C" in unit or "temp" in eid.lower():
+                    if "humidity" not in eid.lower():
+                        temp_sensors.append(entry)
             elif eid.startswith("climate."):
                 climates.append(entry)
 
+        temp_sensors.sort(key=lambda x: x["entityId"])
         sensors.sort(key=lambda x: x["entityId"])
         climates.sort(key=lambda x: x["entityId"])
-        return {"sensors": sensors, "climates": climates}
+        return {"tempSensors": temp_sensors, "sensors": sensors, "climates": climates}
 
     async def call_service(self, domain: str, service: str, data: dict[str, Any]) -> None:
-        """Invoke a Home Assistant service (e.g., climate.set_temperature)."""
+        """Invoke a Home Assistant service (e.g., climate.set_temperature, notify.*)."""
         if not self.is_configured:
             return
         async with httpx.AsyncClient(timeout=15.0) as client:
