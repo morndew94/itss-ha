@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +27,7 @@ from .integrations.google_weather import GoogleWeatherClient
 from .integrations.notifications import PushNotifier
 from .models.schema import CycleRecord, SensorSnapshot, now_kst_iso
 from .protocols.multi_zone import MultiZoneController, ZoneReading
-from .protocols.p000_sentinel import SentinelProtocol
+from .protocols.p000_sentinel import SentinelConfig, SentinelProtocol
 from .protocols.p300_atmos import AtmosProtocol
 from .protocols.rc_optimizer import RCObservation, fit_rc_parameters
 from .storage.db import ScadaDatabase
@@ -78,8 +78,12 @@ class SettingsPatchRequest(BaseModel):
     zoneStrategy: str | None = Field(default=None, pattern="^(hybrid|simultaneous)$")
     predictorModel: str | None = Field(default=None, pattern="^(linear_v12|adaptive_rc)$")
     masterFloorEntity: str | None = None
+    outdoorTempEntity: str | None = None
     heatOnSetpoint: float | None = Field(default=None, ge=15.0, le=30.0)
     heatOffSetpoint: float | None = Field(default=None, ge=5.0, le=25.0)
+    floorOffLimitC: float | None = Field(default=None, ge=22.0, le=29.0)
+    maxRunCapMin: int | None = Field(default=None, ge=3, le=15)
+    cooldownMin: int | None = Field(default=None, ge=5, le=90)
     gasKrwPerHour: int | None = Field(default=None, ge=100, le=10000)
 
 
@@ -212,14 +216,19 @@ class ItssEngine:
             "dryRun": bool(saved_settings.get("dryRun", opts.get("dry_run", True))),
             "zoneStrategy": str(saved_settings.get("zoneStrategy", opts.get("zone_strategy", STRATEGY_HYBRID))),
             "predictorModel": str(saved_settings.get("predictorModel", opts.get("predictor_model", MODEL_LINEAR_V12))),
-            "updateIntervalSec": int(opts.get("update_interval_sec", 300)),
+            "updateIntervalSec": int(opts.get("update_interval_sec", 60)),
             "masterFloorEntity": str(saved_settings.get("masterFloorEntity", opts.get("master_floor_entity", ""))),
+            "outdoorTempEntity": str(saved_settings.get("outdoorTempEntity", opts.get("outdoor_temp_entity", ""))),
             "weatherLocation": str(opts.get("weather_location", "서울")),
             "heatOnSetpoint": float(saved_settings.get("heatOnSetpoint", opts.get("heat_on_setpoint", 24.0))),
             "heatOffSetpoint": float(saved_settings.get("heatOffSetpoint", opts.get("heat_off_setpoint", 15.0))),
+            "floorOffLimitC": float(saved_settings.get("floorOffLimitC", opts.get("floor_off_limit_c", 26.5))),
+            "maxRunCapMin": min(15, int(saved_settings.get("maxRunCapMin", opts.get("max_run_cap_min", 15)))),
+            "cooldownMin": int(saved_settings.get("cooldownMin", opts.get("cooldown_min", 20))),
             "gasKrwPerHour": int(saved_settings.get("gasKrwPerHour", opts.get("gas_krw_per_hour", 1200))),
         }
         self.active_preset: str = str(self.db.get_kv("active_preset", "AUTO_ALL"))
+        self.room_timers: dict[str, dict[str, str | None]] = self.db.get_kv("room_timers", {})
 
         gemini_key = str(opts.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
         self.weather_client = GoogleWeatherClient(gemini_key, self.settings["weatherLocation"]) if gemini_key else None
@@ -297,6 +306,44 @@ class ItssEngine:
 
         return {"rcFit": rc_result, "updatedFloorOffsets": offset_updates}
 
+    async def _read_outdoor_weather(self) -> tuple[float | None, float | None]:
+        """Read outdoor temp/wind from configured HA sensor/weather entity or Gemini grounding."""
+        ent = self.settings.get("outdoorTempEntity", "").strip()
+        if ent:
+            raw = await self.ha.get_state(ent)
+            if raw:
+                if ent.startswith("weather."):
+                    attrs = raw.get("attributes") or {}
+                    t = attrs.get("temperature")
+                    w = attrs.get("wind_speed")
+                    return (float(t) if t is not None else None), (float(w) if w is not None else None)
+                val, _, _ = await self.ha.get_numeric_state(ent)
+                if val is not None:
+                    return val, None
+        if self.weather_client is not None:
+            w = await asyncio.to_thread(self.weather_client.get_weather)
+            return w.outdoor_temp_c, w.wind_speed_ms
+        return None, None
+
+    def _timer_metrics(self, room_name: str, now: datetime) -> tuple[float, float]:
+        """Return (continuous_run_min, cooldown_remaining_min) for one room."""
+        tm = self.room_timers.get(room_name, {})
+        run_min = 0.0
+        cd_min = 0.0
+        started = tm.get("heatingStartedAt")
+        if started:
+            try:
+                run_min = max(0.0, (now - datetime.fromisoformat(started)).total_seconds() / 60.0)
+            except ValueError:
+                pass
+        cd_until = tm.get("cooldownUntil")
+        if cd_until:
+            try:
+                cd_min = max(0.0, (datetime.fromisoformat(cd_until) - now).total_seconds() / 60.0)
+            except ValueError:
+                pass
+        return round(run_min, 1), round(cd_min, 1)
+
     async def run_control_cycle(self) -> list[dict[str, Any]]:
         """Execute one coordinated multi-zone cycle across all registered rooms."""
         now = datetime.now(tz=KST)
@@ -306,12 +353,16 @@ class ItssEngine:
             return []
 
         master_floor, floor_ts, floor_age = await self.ha.get_numeric_state(self.settings["masterFloorEntity"])
-        outdoor_temp, wind_speed = None, None
-        if self.weather_client is not None:
-            w = await asyncio.to_thread(self.weather_client.get_weather)
-            outdoor_temp, wind_speed = w.outdoor_temp_c, w.wind_speed_ms
+        outdoor_temp, wind_speed = await self._read_outdoor_weather()
 
         atmos_offset = self.atmos.compute_offset(outdoor_temp=outdoor_temp, wind_speed_ms=wind_speed, now_kst=now)
+        max_run_min = self.atmos.compute_max_run_minutes(
+            outdoor_temp=outdoor_temp,
+            now_kst=now,
+            hard_cap_min=float(self.settings["maxRunCapMin"]),
+        )
+        floor_off_limit = float(self.settings["floorOffLimitC"])
+        sentinel = SentinelProtocol(SentinelConfig(general_off_floor_c=floor_off_limit))
         schedule_offset, _ = self.db.active_schedule_offset(now.hour)
         preset_offset = PRESET_OFFSETS.get(self.active_preset, 0.0)
 
@@ -326,6 +377,15 @@ class ItssEngine:
             combustion = detect_boiler_running(c_state)
             is_heating = bool(combustion) if combustion is not None else (hvac_mode == "heat")
 
+            # Track continuous heating duration per room based on real boiler state
+            tm = self.room_timers.setdefault(r_name, {"heatingStartedAt": None, "cooldownUntil": None})
+            if is_heating:
+                if not tm.get("heatingStartedAt"):
+                    tm["heatingStartedAt"] = now.isoformat(timespec="seconds")
+            else:
+                tm["heatingStartedAt"] = None
+            run_min, cd_min = self._timer_metrics(r_name, now)
+
             eff_target = round(rm["targetTemp"] + atmos_offset + schedule_offset + preset_offset, 2)
             telemetry[r_name] = {
                 "room": rm,
@@ -336,6 +396,8 @@ class ItssEngine:
                 "isHeating": is_heating,
                 "combustion": combustion,
                 "effTarget": eff_target,
+                "runMin": run_min,
+                "cdMin": cd_min,
             }
 
             if rm["controlMode"] == "AUTO" and r_temp is not None:
@@ -351,7 +413,10 @@ class ItssEngine:
                     )
                 )
 
-        mz_ctrl = MultiZoneController(strategy=self.settings["zoneStrategy"])
+        mz_ctrl = MultiZoneController(
+            strategy=self.settings["zoneStrategy"],
+            general_off_floor_c=floor_off_limit,
+        )
         mz_plan = mz_ctrl.evaluate(
             auto_zone_readings,
             master_floor_temp=master_floor if master_floor is not None else 24.0,
@@ -370,7 +435,6 @@ class ItssEngine:
                 eff_floor = round(master_floor + (0.0 if has_floor else rm["floorOffsetC"]), 1)
                 floor_src = "MEASURED" if has_floor else "ESTIMATED"
             elif not self.settings["masterFloorEntity"].strip():
-                # Allow room-only operation when master floor sensor is not yet assigned
                 eff_floor = 24.0
                 floor_src = "UNCONFIGURED"
             else:
@@ -412,10 +476,15 @@ class ItssEngine:
                 (t["roomTemp"] is not None and t["roomTemp"] >= 27.0)
                 or (eff_floor is not None and eff_floor >= 29.0)
             )
+            tm = self.room_timers.setdefault(r_name, {"heatingStartedAt": None, "cooldownUntil": None})
             if overheat:
                 record.safety_reason = "P000_OVERHEAT_CUTOFF"
                 record.command_action = "OFF"
                 record.execution_status = "SKIPPED_SAFETY"
+                tm["heatingStartedAt"] = None
+                tm["cooldownUntil"] = (
+                    now + timedelta(minutes=int(self.settings["cooldownMin"]))
+                ).isoformat(timespec="seconds")
                 await self.notifier.send(
                     "I.T.S.S. 과열 차단 경고",
                     f"{r_name} 과열 감지(실내 {t['roomTemp']}°C / 바닥 {eff_floor}°C)로 난방을 차단했습니다.",
@@ -425,16 +494,32 @@ class ItssEngine:
                 record.command_action = rm["manualAction"]
                 record.execution_status = "EXECUTED"
             else:
-                verdict = self.sentinel.evaluate(snapshot, is_heating=t["isHeating"])
+                verdict = sentinel.evaluate(
+                    snapshot,
+                    is_heating=t["isHeating"],
+                    continuous_run_min=t["runMin"],
+                    max_run_min=max_run_min,
+                    cooldown_remaining_min=t["cdMin"],
+                )
                 record.safety_reason = verdict.reason_code
                 if verdict.force_off:
                     record.command_action = "OFF"
                     record.execution_status = "SKIPPED_SAFETY"
+                    if verdict.reason_code in ("P000_MAX_RUN_CUTOFF", "P000_FLOOR_LIMIT_OFF"):
+                        tm["heatingStartedAt"] = None
+                        tm["cooldownUntil"] = (
+                            now + timedelta(minutes=int(self.settings["cooldownMin"]))
+                        ).isoformat(timespec="seconds")
                 elif verdict.hold_current_state or r_name not in mz_by_room:
                     record.command_action = "HOLD"
                     record.execution_status = "SKIPPED_SAFETY"
                 else:
                     record.command_action = mz_by_room[r_name].action
+
+            if record.command_action == "HEAT" and not tm.get("heatingStartedAt"):
+                tm["heatingStartedAt"] = now.isoformat(timespec="seconds")
+            elif record.command_action == "OFF":
+                tm["heatingStartedAt"] = None
 
             if record.command_action in ("HEAT", "OFF"):
                 record.command_setpoint = (
@@ -449,6 +534,7 @@ class ItssEngine:
             self.db.insert_cycle(payload)
             results.append(payload)
 
+        self.db.set_kv("room_timers", self.room_timers)
         return results
 
     async def _dispatch(self, climate_entity: str, record: CycleRecord) -> None:
@@ -555,7 +641,14 @@ def create_app(
             if c["roomName"] not in latest_by_room:
                 latest_by_room[c["roomName"]] = c
 
+        now_kst = datetime.now(tz=KST)
         master_floor, _, _ = await engine.ha.get_numeric_state(engine.settings["masterFloorEntity"])
+        outdoor_temp, _ = await engine._read_outdoor_weather()
+        active_max_run = engine.atmos.compute_max_run_minutes(
+            outdoor_temp=outdoor_temp,
+            now_kst=now_kst,
+            hard_cap_min=float(engine.settings["maxRunCapMin"]),
+        )
         live_by_room: dict[str, dict[str, Any]] = {}
         for rm in rooms:
             r_name = rm["roomName"]
@@ -568,6 +661,7 @@ def create_app(
             )
             c_attrs = (c_state.get("attributes") or {}) if c_state else {}
             boiler_running = detect_boiler_running(c_state)
+            run_min, cd_min = engine._timer_metrics(r_name, now_kst)
             live_by_room[r_name] = {
                 "roomTemp": r_temp,
                 "floorTemp": eff_floor,
@@ -575,10 +669,11 @@ def create_app(
                 "climateSetpoint": c_attrs.get("temperature"),
                 "climateCurrentTemp": c_attrs.get("current_temperature"),
                 "boilerRunning": boiler_running,
+                "runtimeMin": run_min,
+                "cooldownRemainMin": cd_min,
             }
 
-        now_hour = datetime.now(tz=KST).hour
-        sched_offset, sched_label = engine.db.active_schedule_offset(now_hour)
+        sched_offset, sched_label = engine.db.active_schedule_offset(now_kst.hour)
 
         return {
             "timeKst": now_kst_iso(),
@@ -586,6 +681,8 @@ def create_app(
             "tokenSource": getattr(engine.ha, "token_source", "mock"),
             "haLastError": getattr(engine.ha, "last_error", None),
             "masterFloorTemp": master_floor,
+            "outdoorTemp": outdoor_temp,
+            "activeMaxRunMin": active_max_run,
             "activePreset": engine.active_preset,
             "activeSchedule": {"label": sched_label, "offsetC": sched_offset},
             "settings": engine.settings,

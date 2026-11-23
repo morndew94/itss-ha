@@ -75,8 +75,46 @@ def test_p200_linear_v12_and_rc_shared_interface():
 
 def test_p300_and_p400_offsets():
     dawn_kst = datetime(2026, 11, 20, 3, 0, tzinfo=KST)
-    assert AtmosProtocol().compute_offset(outdoor_temp=None, now_kst=dawn_kst) == 0.05
+    atmos = AtmosProtocol()
+    assert atmos.compute_offset(outdoor_temp=None, now_kst=dawn_kst) == 0.05
     assert CircadiaProtocol().compute_offset(now_kst=dawn_kst) == -0.3
+
+    # Outdoor-adaptive single-run cap must never exceed 15 minutes
+    assert atmos.compute_max_run_minutes(outdoor_temp=-15.0) == 15.0
+    assert atmos.compute_max_run_minutes(outdoor_temp=-2.0) == 13.0
+    assert atmos.compute_max_run_minutes(outdoor_temp=3.0) == 11.0
+    assert atmos.compute_max_run_minutes(outdoor_temp=8.0) == 9.0
+    assert atmos.compute_max_run_minutes(outdoor_temp=15.0) == 7.0
+    assert atmos.compute_max_run_minutes(outdoor_temp=-20.0, hard_cap_min=25.0) == 15.0
+
+
+def test_p000_max_run_cap_and_floor_26p5():
+    from itss_scada.app.protocols.p000_sentinel import SentinelConfig
+
+    sentinel = SentinelProtocol(SentinelConfig(general_off_floor_c=26.5))
+    # Floor at 26.6C triggers floor limit OFF
+    v_floor = sentinel.evaluate(SensorSnapshot("living", 21.5, 26.6), is_heating=True)
+    assert v_floor.force_off is True
+    assert v_floor.reason_code == "P000_FLOOR_LIMIT_OFF"
+
+    # Continuous run reaching outdoor-adaptive cap triggers max-run cutoff
+    v_run = sentinel.evaluate(
+        SensorSnapshot("living", 21.5, 25.0),
+        is_heating=True,
+        continuous_run_min=11.0,
+        max_run_min=11.0,
+    )
+    assert v_run.force_off is True
+    assert v_run.reason_code == "P000_MAX_RUN_CUTOFF"
+
+    # Residual heat cooldown keeps boiler OFF
+    v_cd = sentinel.evaluate(
+        SensorSnapshot("living", 21.5, 25.0),
+        is_heating=False,
+        cooldown_remaining_min=14.0,
+    )
+    assert v_cd.force_off is True
+    assert v_cd.reason_code == "P000_RESIDUAL_COOLDOWN"
 
 
 def test_scada_db_and_rc_optimizer(tmp_path: Path):

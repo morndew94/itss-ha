@@ -91,10 +91,11 @@ def test_addon_v2_full_workflow(tmp_path: Path):
         assert records["거실"]["commandSetpoint"] == 24.0
         assert records["안방"]["commandSetpoint"] == 15.0
 
-        # 4. Boiler stats & P400 schedules
+        # 4. Boiler stats & P400 schedules (default updateIntervalSec = 60s -> 1.0 min per slot)
         status = client.get("/api/v1/status").json()
-        assert status["boilerStats"]["heatingMinutes"] == 5.0
-        assert status["boilerStats"]["estimatedGasKrw"] == 100
+        assert status["boilerStats"]["heatingMinutes"] == 1.0
+        assert status["boilerStats"]["estimatedGasKrw"] == 20
+        assert status["activeMaxRunMin"] <= 15.0
         scheds = client.get("/api/v1/schedules").json()
         assert len(scheds) == 4
 

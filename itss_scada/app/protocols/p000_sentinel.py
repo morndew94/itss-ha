@@ -42,6 +42,9 @@ class SentinelProtocol:
         is_heating: bool,
         v_room_per_min: float = 0.0,
         seconds_since_last_switch: float | None = None,
+        continuous_run_min: float | None = None,
+        max_run_min: float | None = None,
+        cooldown_remaining_min: float | None = None,
     ) -> SafetyVerdict:
         """Run prioritized safety checks.
 
@@ -49,9 +52,10 @@ class SentinelProtocol:
           1. Manual override priority
           2. Sensor validity and staleness
           3. Hard overheat cutoff (room >= 27C or floor >= 29C)
-          4. General floor upper limit (floor >= 28C)
-          5. Ventilation rapid-drop protection
-          6. Anti-chattering (minimum ON/OFF dwell time)
+          4. General floor upper limit (configurable, e.g. floor >= 26.5C)
+          5. Maximum single-run pulse duration cap (<= 15 min) & residual-heat cooldown
+          6. Ventilation rapid-drop protection
+          7. Anti-chattering (minimum ON/OFF dwell time)
         """
         # 1. Respect manual user intervention above automated control
         if snapshot.manual_override_active:
@@ -112,6 +116,34 @@ class SentinelProtocol:
                 hold_current_state=False,
                 reason_code="P000_FLOOR_LIMIT_OFF",
                 message=f"Floor temperature reached {snapshot.floor_temp:.1f}C general OFF limit.",
+            )
+
+        # 5a. Max single-run heating pulse cap (outdoor-adaptive, hard-capped <= 15 min)
+        if (
+            is_heating
+            and continuous_run_min is not None
+            and max_run_min is not None
+            and continuous_run_min >= max_run_min
+        ):
+            return SafetyVerdict(
+                allow_heating=False,
+                force_off=True,
+                hold_current_state=False,
+                reason_code="P000_MAX_RUN_CUTOFF",
+                message=(
+                    f"Single run reached {continuous_run_min:.1f}m >= {max_run_min:.1f}m cap; "
+                    "cutting off for residual heat soak."
+                ),
+            )
+
+        # 5b. Post-cutoff residual heat soak cooldown
+        if cooldown_remaining_min is not None and cooldown_remaining_min > 0:
+            return SafetyVerdict(
+                allow_heating=False,
+                force_off=True,
+                hold_current_state=False,
+                reason_code="P000_RESIDUAL_COOLDOWN",
+                message=f"Residual heat soak cooldown active ({cooldown_remaining_min:.1f}m remaining).",
             )
 
         # 5. Ventilation rapid temperature drop protection
