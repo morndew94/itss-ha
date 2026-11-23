@@ -13,6 +13,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from .const import (
     CONF_CLIMATE_ENTITY,
     CONF_FLOOR_TEMP_ENTITY,
+    CONF_GEMINI_API_KEY,
     CONF_HUMIDITY_ENTITY,
     CONF_OUTDOOR_TEMP_ENTITY,
     CONF_PREDICTOR_MODEL,
@@ -20,6 +21,7 @@ from .const import (
     CONF_ROOM_TEMP_ENTITY,
     CONF_TARGET_TEMP,
     CONF_UPDATE_INTERVAL_SEC,
+    CONF_WEATHER_LOCATION,
     DEFAULT_DB_FILENAME,
     DEFAULT_TARGET_TEMP,
     DEFAULT_UPDATE_INTERVAL_SEC,
@@ -27,6 +29,8 @@ from .const import (
     KST,
     MODEL_ADAPTIVE_RC,
 )
+from .integrations.google_alerts import GeminiTTSAlert
+from .integrations.google_weather import GoogleWeatherClient
 from .models.schema import CycleRecord, SensorSnapshot, ThermalInput, now_kst_iso
 from .protocols.p000_sentinel import SentinelProtocol
 from .protocols.p100_core import compute_opposing_interval, round_thermostat_setpoint
@@ -63,6 +67,13 @@ class ItssCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.db = ScadaDatabase(hass.config.path(DEFAULT_DB_FILENAME))
 
+        gemini_key = str(entry.data.get(CONF_GEMINI_API_KEY, "")).strip()
+        weather_loc = str(entry.data.get(CONF_WEATHER_LOCATION, "서울")).strip()
+        self.weather_client = (
+            GoogleWeatherClient(gemini_key, weather_loc) if gemini_key else None
+        )
+        self.tts_alert = GeminiTTSAlert(gemini_key) if gemini_key else None
+
         self._prev_room_temp: float | None = None
         self._prev_floor_temp: float | None = None
         self._prev_sample_time: datetime | None = None
@@ -95,6 +106,12 @@ class ItssCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         floor_temp, floor_ts, floor_age = self._read_float(self.entry.data.get(CONF_FLOOR_TEMP_ENTITY))
         humidity, _, _ = self._read_float(self.entry.data.get(CONF_HUMIDITY_ENTITY))
         outdoor_temp, _, _ = self._read_float(self.entry.data.get(CONF_OUTDOOR_TEMP_ENTITY))
+        wind_speed_ms: float | None = None
+        if outdoor_temp is None and self.weather_client is not None:
+            # Fail-safe P300 weather grounding when no local outdoor sensor is configured
+            weather = await self.hass.async_add_executor_job(self.weather_client.get_weather)
+            outdoor_temp = weather.outdoor_temp_c
+            wind_speed_ms = weather.wind_speed_ms
 
         climate_id = self.entry.data.get(CONF_CLIMATE_ENTITY)
         climate_state = self.hass.states.get(climate_id) if climate_id else None
@@ -163,11 +180,21 @@ class ItssCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if verdict.force_off:
             record.command_action = "OFF"
             record.execution_status = "SKIPPED_SAFETY"
+            if self.tts_alert is not None and verdict.reason_code in self.tts_alert.CRITICAL_REASONS:
+                wav_path = self.hass.config.path("www", f"itss_alert_{self.room_name}.wav")
+                await self.hass.async_add_executor_job(
+                    self.tts_alert.synthesize_alert_if_critical,
+                    verdict.reason_code,
+                    self.room_name,
+                    wav_path,
+                )
         elif verdict.hold_current_state or room_temp is None or floor_temp is None:
             record.command_action = "HOLD"
             record.execution_status = "SKIPPED_SAFETY"
         else:
-            atmos_offset = self.atmos.compute_offset(outdoor_temp=outdoor_temp, now_kst=now)
+            atmos_offset = self.atmos.compute_offset(
+                outdoor_temp=outdoor_temp, wind_speed_ms=wind_speed_ms, now_kst=now
+            )
             circadia_offset = self.circadia.compute_offset(now_kst=now)
             prediction = self.predictor.predict(
                 ThermalInput(

@@ -74,3 +74,4 @@ def fit_rc_parameters(observations: list[RCObservation]) -> dict[str, float | st
         "mse": round(best_loss, 6),
         **{k: round(v, 3) for k, v in best.items()},
     }
+

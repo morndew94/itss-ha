@@ -41,11 +41,17 @@ itss-ha/
 │       │   └── schema.py              # KST 정밀 시각 및 회차/제어 이력 표준 스키마
 │       ├── storage/
 │       │   └── db.py                  # 로컬 SQLite 회차 이력 DB (config/itss_scada.db)
+│       ├── integrations/              # 선택형 Google API 보조 연동 (Fail-safe 폴백)
+│       │   ├── google_weather.py      # P300 Gemini 검색 그라운딩 외기/풍속 조회
+│       │   ├── google_calendar.py     # P400 구글 캘린더 외출/귀가 예열 보정
+│       │   ├── google_gemini_advisor.py # P200 일일 KPI 및 Gemini 진단 리포트
+│       │   └── google_alerts.py       # P000 긴급 TTS 음성 경고 & Sheets 행 변환
 │       └── protocols/
 │           ├── p000_sentinel.py       # 안전 인터락 및 과열/채터링 보호
 │           ├── p100_core.py           # 0.5°C 반올림 처리 및 상반 명령 간격 계산
 │           ├── p200_therm.py          # v1.2 선형외삽 & 적응형 RC 예측 모델 인터페이스
 │           ├── rc_optimizer.py        # 2-노드 RC 파라미터 피팅 엔진
+│           ├── multi_zone.py          # 단일 바닥센서 다중 방 제어 (hybrid / simultaneous)
 │           ├── p300_atmos.py          # 외기/시간대별 열손실 보정
 │           └── p400_circadia.py       # 생활패턴 쾌적성 보정
 ├── docs/

@@ -11,6 +11,7 @@ from homeassistant.helpers import selector
 from .const import (
     CONF_CLIMATE_ENTITY,
     CONF_FLOOR_TEMP_ENTITY,
+    CONF_GEMINI_API_KEY,
     CONF_HUMIDITY_ENTITY,
     CONF_OUTDOOR_TEMP_ENTITY,
     CONF_PREDICTOR_MODEL,
@@ -18,11 +19,15 @@ from .const import (
     CONF_ROOM_TEMP_ENTITY,
     CONF_TARGET_TEMP,
     CONF_UPDATE_INTERVAL_SEC,
+    CONF_WEATHER_LOCATION,
+    CONF_ZONE_STRATEGY,
     DEFAULT_TARGET_TEMP,
     DEFAULT_UPDATE_INTERVAL_SEC,
     DOMAIN,
     MODEL_ADAPTIVE_RC,
     MODEL_LINEAR_V12,
+    STRATEGY_HYBRID,
+    STRATEGY_SIMULTANEOUS,
 )
 
 
@@ -61,6 +66,11 @@ class ItssConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_PREDICTOR_MODEL, default=MODEL_LINEAR_V12): selector.SelectSelector(
                     selector.SelectSelectorConfig(options=[MODEL_LINEAR_V12, MODEL_ADAPTIVE_RC])
                 ),
+                vol.Required(CONF_ZONE_STRATEGY, default=STRATEGY_HYBRID): selector.SelectSelector(
+                    selector.SelectSelectorConfig(options=[STRATEGY_HYBRID, STRATEGY_SIMULTANEOUS])
+                ),
+                vol.Optional(CONF_GEMINI_API_KEY, default=""): str,
+                vol.Optional(CONF_WEATHER_LOCATION, default="서울"): str,
                 vol.Optional(
                     CONF_UPDATE_INTERVAL_SEC, default=DEFAULT_UPDATE_INTERVAL_SEC
                 ): vol.Coerce(int),

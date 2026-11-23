@@ -19,6 +19,13 @@ CONF_OUTDOOR_TEMP_ENTITY = "outdoor_temp_entity"
 CONF_TARGET_TEMP = "target_temp"
 CONF_PREDICTOR_MODEL = "predictor_model"
 CONF_UPDATE_INTERVAL_SEC = "update_interval_sec"
+CONF_GEMINI_API_KEY = "gemini_api_key"
+CONF_WEATHER_LOCATION = "weather_location"
+CONF_ZONE_STRATEGY = "zone_strategy"
+
+# Multi-zone control strategies
+STRATEGY_HYBRID = "hybrid"
+STRATEGY_SIMULTANEOUS = "simultaneous"
 
 # Predictor model identifiers (ITSS-P200)
 MODEL_LINEAR_V12 = "linear_v12"

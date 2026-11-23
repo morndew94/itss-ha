@@ -13,6 +13,9 @@
           "outdoor_temp_entity": "외기 온도 센서 (선택)",
           "target_temp": "목표 온도 (°C)",
           "predictor_model": "P200 예측 모델 (선형 v1.2 / 적응형 RC)",
+          "zone_strategy": "다중 방 제어 방식 (hybrid 권장 / simultaneous 동시)",
+          "gemini_api_key": "Gemini API 키 (선택: 날씨 보정, 일일 리포트, TTS 경고)",
+          "weather_location": "기상 조회 지역명 (예: 서울)",
           "update_interval_sec": "제어 주기 (초)"
         }
       }

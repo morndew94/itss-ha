@@ -98,3 +98,4 @@ class ScadaDatabase:
                     (limit,),
                 ).fetchall()
         return [json.loads(r["payload_json"]) for r in rows]
+
