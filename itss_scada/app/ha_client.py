@@ -77,23 +77,35 @@ class HomeAssistantClient:
         }
 
     async def get_state(self, entity_id: str) -> dict[str, Any] | None:
-        """Fetch raw state dictionary for one Home Assistant entity."""
+        """Fetch raw state dictionary for one Home Assistant entity with 502/503/504 retry."""
         if not self.is_configured or not entity_id:
             return None
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(f"{self.base_url}/states/{entity_id}", headers=self._headers())
-                if resp.status_code == 404:
-                    self.last_state_error = f"Entity not found (404): {entity_id}"
-                    return None
-                if resp.status_code >= 400:
-                    self.last_state_error = f"GET /states/{entity_id} HTTP {resp.status_code}: {resp.text[:200]}"
-                    return None
-                return resp.json()
-        except Exception as err:  # noqa: BLE001
-            self.last_state_error = f"HA API error ({entity_id}): {err}"
-            _LOGGER.warning("%s", self.last_state_error)
-            return None
+        import asyncio
+
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(f"{self.base_url}/states/{entity_id}", headers=self._headers())
+                    if resp.status_code == 404:
+                        self.last_state_error = f"Entity not found (404): {entity_id}"
+                        return None
+                    if resp.status_code in (502, 503, 504) and attempt < 2:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                        continue
+                    if resp.status_code >= 400:
+                        self.last_state_error = f"GET /states/{entity_id} HTTP {resp.status_code}: {resp.text[:200]}"
+                        return None
+                    # Clear stale state error once HA responds cleanly
+                    self.last_state_error = None
+                    return resp.json()
+            except Exception as err:  # noqa: BLE001
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                self.last_state_error = f"HA API error ({entity_id}): {err}"
+                _LOGGER.warning("%s", self.last_state_error)
+                return None
+        return None
 
     async def get_numeric_state(self, entity_id: str) -> tuple[float | None, str | None, float | None]:
         """Return (value_0p1, last_updated_kst_iso, age_sec) for a numeric sensor."""

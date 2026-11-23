@@ -83,13 +83,19 @@ def test_addon_v2_full_workflow(tmp_path: Path):
             "targetTemp": 22.5,
         }).status_code == 200
 
-        # 3. Manual OFF on 안방, AUTO HEAT on 거실 -> ON=24C, OFF=15C
+        # 3. Manual OFF on 안방, AUTO HEAT on 거실 -> ON=24C, OFF=15C + P200 prediction + Telegram alerts
         client.patch("/api/v1/rooms/안방", json={"controlMode": "MANUAL", "manualAction": "OFF"})
         r_run = client.post("/api/v1/control/run-now")
         assert r_run.status_code == 200
         records = {rec["roomName"]: rec for rec in r_run.json()["records"]}
         assert records["거실"]["commandSetpoint"] == 24.0
+        assert records["거실"]["predictedRoom30m"] is not None
         assert records["안방"]["commandSetpoint"] == 15.0
+
+        # Verify automatic Korean Telegram notifications fired for ON/OFF state changes
+        auto_tg = [d["message"] for dom, svc, d in fake_ha.calls if dom == "telegram_bot" and svc == "send_message"]
+        assert any("보일러 켜짐" in m and "이유:" in m for m in auto_tg)
+        assert any("보일러 꺼짐" in m and "이유:" in m for m in auto_tg)
 
         # 4. Boiler stats & P400 schedules (default updateIntervalSec = 60s -> 1.0 min per slot)
         status = client.get("/api/v1/status").json()
@@ -106,7 +112,7 @@ def test_addon_v2_full_workflow(tmp_path: Path):
         assert n_res["ha_notify"].startswith("sent_via_service:")
         assert n_res["telegram"] == "sent_to:12345"
         tg_calls = [d for dom, svc, d in fake_ha.calls if dom == "telegram_bot" and svc == "send_message"]
-        assert len(tg_calls) == 1 and tg_calls[0]["target"] == 12345
+        assert len(tg_calls) >= 3 and tg_calls[-1]["target"] == 12345
 
         # 6. Diagnose & direct climate test endpoints
         diag = client.get("/api/v1/ha/diagnose").json()

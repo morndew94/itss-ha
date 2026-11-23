@@ -98,6 +98,7 @@
         <option value="linear_v12">P200 선형외삽 v1.2</option>
         <option value="adaptive_rc">P200 적응형 RC 모델</option>
       </select>
+      <button id="notifyToggleBtn" onclick="toggleNotifyEvents()">텔레그램 알림: ON</button>
       <button id="dryRunBtn" onclick="toggleDryRun()">시험 운전: ON</button>
       <button class="primary" onclick="runNow()">지금 1회 제어 실행</button>
     </div>
@@ -328,6 +329,10 @@ async function refresh() {
   dryBtn.className = currentSettings.dryRun ? "" : "heat";
   document.getElementById("dryRunBanner").style.display = currentSettings.dryRun ? "block" : "none";
 
+  const nBtn = document.getElementById("notifyToggleBtn");
+  nBtn.textContent = currentSettings.notifyEvents !== false ? "텔레그램 알림: ON" : "텔레그램 알림: OFF";
+  nBtn.className = currentSettings.notifyEvents !== false ? "primary" : "off";
+
   renderRooms(status.rooms, status.liveByRoom || {}, status.latestByRoom || {});
   renderKpis(status.kpis, status.boilerStats);
   renderSchedules(schedules);
@@ -401,7 +406,10 @@ function renderRooms(rooms, liveByRoom, latestByRoom) {
           ${boilerBadge}
           ${cmpText}
         </td>
-        <td><div class="temp-big">${rt}</div></td>
+        <td>
+          <div class="temp-big">${rt}</div>
+          <div style="font-size:11px;color:var(--muted);">30분 예측: ${lat.predictedRoom30m != null ? lat.predictedRoom30m + "°C" : "--"}</div>
+        </td>
         <td>
           <div class="temp-big">${ft}</div>
           <div style="font-size:11px;color:var(--muted);">${fSrc}</div>
@@ -583,6 +591,11 @@ async function changeTarget(roomName, newTemp) {
 
 async function setMode(roomName, controlMode, manualAction) {
   await api(`/rooms/${encodeURIComponent(roomName)}`, { method: "PATCH", body: JSON.stringify({ controlMode, manualAction }) });
+  await refresh();
+}
+
+async function toggleNotifyEvents() {
+  await api("/settings", { method: "PATCH", body: JSON.stringify({ notifyEvents: currentSettings.notifyEvents === false }) });
   await refresh();
 }
 

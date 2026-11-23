@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from .const import (
     DEFAULT_RECHECK_DELAY_SEC,
     KST,
+    MODEL_ADAPTIVE_RC,
     MODEL_LINEAR_V12,
     STRATEGY_HYBRID,
 )
@@ -25,9 +26,15 @@ from .integrations.google_alerts import GeminiTTSAlert
 from .integrations.google_gemini_advisor import GeminiThermalAdvisor, compute_daily_kpis
 from .integrations.google_weather import GoogleWeatherClient
 from .integrations.notifications import PushNotifier
-from .models.schema import CycleRecord, SensorSnapshot, now_kst_iso
+from .models.schema import CycleRecord, SensorSnapshot, ThermalInput, now_kst_iso
 from .protocols.multi_zone import MultiZoneController, ZoneReading
 from .protocols.p000_sentinel import SentinelConfig, SentinelProtocol
+from .protocols.p200_therm import (
+    AdaptiveRCModel,
+    LinearExtrapolationV12,
+    RCParameters,
+    ThermalPredictor,
+)
 from .protocols.p300_atmos import AtmosProtocol
 from .protocols.rc_optimizer import RCObservation, fit_rc_parameters
 from .storage.db import ScadaDatabase
@@ -40,6 +47,24 @@ PRESET_OFFSETS = {
     "SLEEP": -0.3,
     "PREHEAT": 0.2,
     "ALL_OFF": 0.0,
+}
+
+REASON_KO = {
+    "P000_OVERHEAT_CUTOFF": "긴급 과열 차단(실내 >= 27°C 또는 바닥 >= 29°C)",
+    "P000_FLOOR_LIMIT_OFF": "바닥 온도 상한 도달(잔열 과다 방지 차단)",
+    "P000_MAX_RUN_CUTOFF": "외기 연동 1회 최대 가동 시간 도달(잔열 휴지 진입)",
+    "P000_RESIDUAL_COOLDOWN": "차단 후 잔열 흡수 대기 중",
+    "P000_VENTILATION_PROTECT": "환기 급락 감지(난방 일시 중지)",
+    "P000_SENSOR_MISSING": "온도 센서 값 누락으로 안전 차단",
+    "P000_SENSOR_STALE": "온도 센서 장시간 미갱신으로 안전 차단",
+    "P000_ANTI_CHATTER": "최소 가동/휴지 시간 유지(채터링 방지)",
+    "P000_MANUAL_OVERRIDE": "사용자 수동 운전 조작",
+    "P200_PREDICTIVE_ON": "P200 예측 온도가 목표 하한 이하 하락 예상(예측 기동)",
+    "P200_PREDICTIVE_OFF": "P200 30분 예측/잔열이 목표 상한 도달 예상(예측 선차단)",
+    "HYBRID_COHEAT_BATCH": "타 방 보일러 가동 중 동시 난방 합류(단펄스 방지)",
+    "HYBRID_EARLY_CUTOFF": "목표 상한 도달(개별 선차단)",
+    "SIMULTANEOUS_WEIGHTED_DEMAND": "전체 방 가중평균 하한 도달(동시 기동)",
+    "SIMULTANEOUS_WEIGHTED_TARGET_REACHED": "전체 방 가중평균 상한 도달(동시 차단)",
 }
 
 
@@ -85,6 +110,7 @@ class SettingsPatchRequest(BaseModel):
     maxRunCapMin: int | None = Field(default=None, ge=3, le=15)
     cooldownMin: int | None = Field(default=None, ge=5, le=90)
     gasKrwPerHour: int | None = Field(default=None, ge=100, le=10000)
+    notifyEvents: bool | None = None
 
 
 class PresetRequest(BaseModel):
@@ -226,6 +252,7 @@ class ItssEngine:
             "maxRunCapMin": min(15, int(saved_settings.get("maxRunCapMin", opts.get("max_run_cap_min", 15)))),
             "cooldownMin": int(saved_settings.get("cooldownMin", opts.get("cooldown_min", 20))),
             "gasKrwPerHour": int(saved_settings.get("gasKrwPerHour", opts.get("gas_krw_per_hour", 1200))),
+            "notifyEvents": bool(saved_settings.get("notifyEvents", True)),
         }
         self.active_preset: str = str(self.db.get_kv("active_preset", "AUTO_ALL"))
         self.room_timers: dict[str, dict[str, str | None]] = self.db.get_kv("room_timers", {})
@@ -344,8 +371,85 @@ class ItssEngine:
                 pass
         return round(run_min, 1), round(cd_min, 1)
 
+    def _build_predictor(self) -> ThermalPredictor:
+        """Instantiate the configured P200 predictor (Linear v1.2 or Adaptive RC)."""
+        if self.settings.get("predictorModel") == MODEL_ADAPTIVE_RC:
+            fitted = self.db.get_kv("fitted_rc_params") or {}
+            if fitted.get("status") == "READY":
+                params = RCParameters(
+                    c_floor=float(fitted.get("c_floor", 1800.0)),
+                    c_room=float(fitted.get("c_room", 450.0)),
+                    r_floor_room=float(fitted.get("r_floor_room", 2.2)),
+                    r_room_ambient=float(fitted.get("r_room_ambient", 12.0)),
+                    q_heat_kw=float(fitted.get("q_heat_kw", 1.8)),
+                )
+                return AdaptiveRCModel(params=params)
+            return AdaptiveRCModel()
+        return LinearExtrapolationV12()
+
+    async def _notify_state_change(
+        self,
+        *,
+        room_name: str,
+        action: str,
+        reason_code: str,
+        room_temp: float | None,
+        floor_temp: float | None,
+        target_temp: float,
+        pred_room: float | None,
+        setpoint: float | None,
+        run_min: float,
+        max_run_min: float,
+    ) -> None:
+        """Send Telegram/HA push notification when boiler action or safety reason changes."""
+        if not self.settings.get("notifyEvents", True):
+            return
+        tm = self.room_timers.setdefault(room_name, {})
+        prev_action = tm.get("lastNotifiedAction")
+        prev_reason = tm.get("lastNotifiedReason")
+        is_critical = reason_code in (
+            "P000_OVERHEAT_CUTOFF",
+            "P000_FLOOR_LIMIT_OFF",
+            "P000_MAX_RUN_CUTOFF",
+            "P000_VENTILATION_PROTECT",
+            "P000_SENSOR_MISSING",
+            "P000_SENSOR_STALE",
+        )
+        # Notify only on ON/OFF transitions or new critical reason (prevents 1-min spam)
+        if action == prev_action and (not is_critical or reason_code == prev_reason):
+            return
+
+        tm["lastNotifiedAction"] = action
+        tm["lastNotifiedReason"] = reason_code
+        reason_ko = REASON_KO.get(reason_code, reason_code)
+        dry_tag = " [시험운전]" if self.settings.get("dryRun") else ""
+
+        if action == "HEAT":
+            title = f"🔥 I.T.S.S. 보일러 켜짐 ({room_name}){dry_tag}"
+            lines = [
+                f"이유: {reason_ko}",
+                f"실내: {room_temp}°C / 바닥: {floor_temp}°C / 목표: {target_temp}°C",
+            ]
+            if pred_room is not None:
+                lines.append(f"30분 예측 실내: {pred_room}°C")
+            lines.append(f"조절기 설정: {setpoint}°C · 이번 최대 가동: {max_run_min}분")
+        else:
+            title = f"❄️ I.T.S.S. 보일러 꺼짐 ({room_name}){dry_tag}"
+            lines = [
+                f"이유: {reason_ko}",
+                f"실내: {room_temp}°C / 바닥: {floor_temp}°C / 목표: {target_temp}°C",
+            ]
+            if pred_room is not None:
+                lines.append(f"30분 예측 실내: {pred_room}°C")
+            if run_min > 0:
+                lines.append(f"이번 가동 시간: {run_min}분 · 조절기 설정: {setpoint}°C")
+            else:
+                lines.append(f"조절기 설정: {setpoint}°C")
+
+        await self.notifier.send(title, "\n".join(lines))
+
     async def run_control_cycle(self) -> list[dict[str, Any]]:
-        """Execute one coordinated multi-zone cycle across all registered rooms."""
+        """Execute one coordinated P000-P400 + P200 predictive multi-zone cycle."""
         now = datetime.now(tz=KST)
         scheduled_at = now.isoformat(timespec="seconds")
         rooms = self.db.list_rooms()
@@ -363,11 +467,13 @@ class ItssEngine:
         )
         floor_off_limit = float(self.settings["floorOffLimitC"])
         sentinel = SentinelProtocol(SentinelConfig(general_off_floor_c=floor_off_limit))
+        predictor = self._build_predictor()
         schedule_offset, _ = self.db.active_schedule_offset(now.hour)
         preset_offset = PRESET_OFFSETS.get(self.active_preset, 0.0)
 
         telemetry: dict[str, dict[str, Any]] = {}
         auto_zone_readings: list[ZoneReading] = []
+        p200_by_room: dict[str, Any] = {}
 
         for rm in rooms:
             r_name = rm["roomName"]
@@ -377,8 +483,40 @@ class ItssEngine:
             combustion = detect_boiler_running(c_state)
             is_heating = bool(combustion) if combustion is not None else (hvac_mode == "heat")
 
-            # Track continuous heating duration per room based on real boiler state
+            has_floor = rm["hasFloorSensor"]
+            if master_floor is not None:
+                eff_floor = round(master_floor + (0.0 if has_floor else rm["floorOffsetC"]), 1)
+                floor_src = "MEASURED" if has_floor else "ESTIMATED"
+            elif not self.settings["masterFloorEntity"].strip():
+                eff_floor = 24.0
+                floor_src = "UNCONFIGURED"
+            else:
+                eff_floor = None
+                floor_src = "MISSING"
+
+            # Compute short-term temperature slopes (degC/min) for P200 prediction & P000 ventilation
             tm = self.room_timers.setdefault(r_name, {"heatingStartedAt": None, "cooldownUntil": None})
+            v_room, v_floor = 0.0, 0.0
+            prev_ts_str = tm.get("prevSampleAt")
+            prev_r = tm.get("prevRoomTemp")
+            prev_f = tm.get("prevFloorTemp")
+            if prev_ts_str and r_temp is not None and prev_r is not None:
+                try:
+                    dt_min = (now - datetime.fromisoformat(str(prev_ts_str))).total_seconds() / 60.0
+                    if 0.5 <= dt_min <= 60.0:
+                        v_room = (r_temp - float(prev_r)) / dt_min
+                        if eff_floor is not None and prev_f is not None:
+                            v_floor = (eff_floor - float(prev_f)) / dt_min
+                except (ValueError, TypeError):
+                    pass
+
+            if r_temp is not None:
+                tm["prevSampleAt"] = now.isoformat(timespec="seconds")
+                tm["prevRoomTemp"] = r_temp
+                if eff_floor is not None:
+                    tm["prevFloorTemp"] = eff_floor
+
+            # Track continuous heating duration per room based on real boiler state
             if is_heating:
                 if not tm.get("heatingStartedAt"):
                     tm["heatingStartedAt"] = now.isoformat(timespec="seconds")
@@ -387,11 +525,31 @@ class ItssEngine:
             run_min, cd_min = self._timer_metrics(r_name, now)
 
             eff_target = round(rm["targetTemp"] + atmos_offset + schedule_offset + preset_offset, 2)
+
+            # Run P200 predictive engine (Linear v1.2 or Adaptive RC) whenever temps are available
+            if r_temp is not None and eff_floor is not None:
+                p200_by_room[r_name] = predictor.predict(
+                    ThermalInput(
+                        room_temp=r_temp,
+                        floor_temp=eff_floor,
+                        target_temp=rm["targetTemp"],
+                        is_heating=is_heating,
+                        v_floor_per_min=v_floor,
+                        v_room_per_min=v_room,
+                        outdoor_temp=outdoor_temp,
+                        atmos_loss_offset_c=atmos_offset,
+                        circadia_target_offset_c=schedule_offset + preset_offset,
+                    )
+                )
+
             telemetry[r_name] = {
                 "room": rm,
                 "roomTemp": r_temp,
                 "roomTs": r_ts,
                 "roomAge": r_age,
+                "effFloor": eff_floor,
+                "floorSrc": floor_src,
+                "vRoom": v_room,
                 "hvacMode": hvac_mode,
                 "isHeating": is_heating,
                 "combustion": combustion,
@@ -423,23 +581,22 @@ class ItssEngine:
         )
         mz_by_room = {c.room_name: c for c in mz_plan.commands}
 
+        # Check if any AUTO room is requesting primary heat via P200 or MultiZone (for co-heating batch)
+        any_p200_heat = any(
+            (r_name in p200_by_room and p200_by_room[r_name].recommended_action == "HEAT")
+            for r_name in telemetry
+            if telemetry[r_name]["room"]["controlMode"] == "AUTO"
+        )
+
         results: list[dict[str, Any]] = []
         for rm in rooms:
             r_name = rm["roomName"]
             t = telemetry[r_name]
             exec_started = now_kst_iso()
             cycle_id = f"{now.strftime('%Y%m%d-%H%M%S')}-{r_name}"
-
-            has_floor = rm["hasFloorSensor"]
-            if master_floor is not None:
-                eff_floor = round(master_floor + (0.0 if has_floor else rm["floorOffsetC"]), 1)
-                floor_src = "MEASURED" if has_floor else "ESTIMATED"
-            elif not self.settings["masterFloorEntity"].strip():
-                eff_floor = 24.0
-                floor_src = "UNCONFIGURED"
-            else:
-                eff_floor = None
-                floor_src = "MISSING"
+            eff_floor = t["effFloor"]
+            floor_src = t["floorSrc"]
+            pred = p200_by_room.get(r_name)
 
             is_manual = rm["controlMode"] == "MANUAL"
             snapshot = SensorSnapshot(
@@ -467,7 +624,10 @@ class ItssEngine:
                 floor_temp=eff_floor,
                 floor_sensor_source=floor_src,
                 target_temp=rm["targetTemp"],
+                predicted_room_30m=pred.predicted_room_temp if pred else None,
+                predicted_floor_30m=pred.predicted_floor_temp if pred else None,
                 predictor_model="manual" if is_manual else self.settings["predictorModel"],
+                residual_learning_status=pred.residual_learning_status if pred else None,
                 device_mode_event=t["hvacMode"],
                 combustion_confirmed=t["combustion"],
             )
@@ -477,32 +637,34 @@ class ItssEngine:
                 or (eff_floor is not None and eff_floor >= 29.0)
             )
             tm = self.room_timers.setdefault(r_name, {"heatingStartedAt": None, "cooldownUntil": None})
+            decision_reason = "P000_OK"
+
             if overheat:
-                record.safety_reason = "P000_OVERHEAT_CUTOFF"
+                decision_reason = "P000_OVERHEAT_CUTOFF"
+                record.safety_reason = decision_reason
                 record.command_action = "OFF"
                 record.execution_status = "SKIPPED_SAFETY"
                 tm["heatingStartedAt"] = None
                 tm["cooldownUntil"] = (
                     now + timedelta(minutes=int(self.settings["cooldownMin"]))
                 ).isoformat(timespec="seconds")
-                await self.notifier.send(
-                    "I.T.S.S. 과열 차단 경고",
-                    f"{r_name} 과열 감지(실내 {t['roomTemp']}°C / 바닥 {eff_floor}°C)로 난방을 차단했습니다.",
-                )
             elif is_manual:
-                record.safety_reason = "P000_MANUAL_OVERRIDE"
+                decision_reason = "P000_MANUAL_OVERRIDE"
+                record.safety_reason = decision_reason
                 record.command_action = rm["manualAction"]
                 record.execution_status = "EXECUTED"
             else:
                 verdict = sentinel.evaluate(
                     snapshot,
                     is_heating=t["isHeating"],
+                    v_room_per_min=t["vRoom"],
                     continuous_run_min=t["runMin"],
                     max_run_min=max_run_min,
                     cooldown_remaining_min=t["cdMin"],
                 )
                 record.safety_reason = verdict.reason_code
                 if verdict.force_off:
+                    decision_reason = verdict.reason_code
                     record.command_action = "OFF"
                     record.execution_status = "SKIPPED_SAFETY"
                     if verdict.reason_code in ("P000_MAX_RUN_CUTOFF", "P000_FLOOR_LIMIT_OFF"):
@@ -511,11 +673,30 @@ class ItssEngine:
                             now + timedelta(minutes=int(self.settings["cooldownMin"]))
                         ).isoformat(timespec="seconds")
                 elif verdict.hold_current_state or r_name not in mz_by_room:
+                    decision_reason = verdict.reason_code
                     record.command_action = "HOLD"
                     record.execution_status = "SKIPPED_SAFETY"
+                elif self.settings["zoneStrategy"] == STRATEGY_HYBRID and pred is not None:
+                    # P200 Predictive Early-OFF prevents Ondol residual-heat overshoot
+                    if pred.recommended_action == "OFF":
+                        record.command_action = "OFF"
+                        decision_reason = "P200_PREDICTIVE_OFF"
+                    elif pred.recommended_action == "HEAT":
+                        record.command_action = "HEAT"
+                        decision_reason = "P200_PREDICTIVE_ON"
+                    elif any_p200_heat and mz_by_room[r_name].action == "HEAT":
+                        record.command_action = "HEAT"
+                        decision_reason = "HYBRID_COHEAT_BATCH"
+                    else:
+                        record.command_action = "OFF"
+                        decision_reason = mz_by_room[r_name].reason
+                    record.safety_reason = decision_reason
                 else:
                     record.command_action = mz_by_room[r_name].action
+                    decision_reason = mz_by_room[r_name].reason
+                    record.safety_reason = decision_reason
 
+            prev_run_min = t["runMin"]
             if record.command_action == "HEAT" and not tm.get("heatingStartedAt"):
                 tm["heatingStartedAt"] = now.isoformat(timespec="seconds")
             elif record.command_action == "OFF":
@@ -528,6 +709,18 @@ class ItssEngine:
                     else float(self.settings["heatOffSetpoint"])
                 )
                 await self._dispatch(rm["climateEntity"], record)
+                await self._notify_state_change(
+                    room_name=r_name,
+                    action=record.command_action,
+                    reason_code=decision_reason,
+                    room_temp=t["roomTemp"],
+                    floor_temp=eff_floor,
+                    target_temp=rm["targetTemp"],
+                    pred_room=record.predicted_room_30m,
+                    setpoint=record.command_setpoint,
+                    run_min=prev_run_min,
+                    max_run_min=max_run_min,
+                )
 
             record.saved_at = now_kst_iso()
             payload = record.to_payload()
@@ -827,6 +1020,11 @@ def create_app(
     @app.post("/api/v1/preset")
     async def set_preset(req: PresetRequest) -> dict[str, Any]:
         res = engine.apply_preset(req.preset)
+        if engine.settings.get("notifyEvents", True):
+            await engine.notifier.send(
+                "🎛 I.T.S.S. 프리셋 변경",
+                f"프리셋이 '{req.preset}' (목표 오프셋 {res['offsetC']}°C)으로 변경되었습니다.",
+            )
         await engine.run_control_cycle()
         return res
 
