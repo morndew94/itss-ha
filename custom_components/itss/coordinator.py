@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Any
@@ -12,8 +13,11 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
     CONF_CLIMATE_ENTITY,
+    CONF_DRY_RUN,
+    CONF_FLOOR_OFFSET_C,
     CONF_FLOOR_TEMP_ENTITY,
     CONF_GEMINI_API_KEY,
+    CONF_HAS_FLOOR_SENSOR,
     CONF_HUMIDITY_ENTITY,
     CONF_OUTDOOR_TEMP_ENTITY,
     CONF_PREDICTOR_MODEL,
@@ -22,12 +26,15 @@ from .const import (
     CONF_TARGET_TEMP,
     CONF_UPDATE_INTERVAL_SEC,
     CONF_WEATHER_LOCATION,
+    CONF_ZONE_STRATEGY,
     DEFAULT_DB_FILENAME,
+    DEFAULT_RECHECK_DELAY_SEC,
     DEFAULT_TARGET_TEMP,
     DEFAULT_UPDATE_INTERVAL_SEC,
     DOMAIN,
     KST,
     MODEL_ADAPTIVE_RC,
+    STRATEGY_HYBRID,
 )
 from .integrations.google_alerts import GeminiTTSAlert
 from .integrations.google_weather import GoogleWeatherClient
@@ -103,7 +110,15 @@ class ItssCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         cycle_id = f"{now.strftime('%Y%m%d-%H%M%S')}-{self.room_name}"
 
         room_temp, room_ts, room_age = self._read_float(self.entry.data.get(CONF_ROOM_TEMP_ENTITY))
-        floor_temp, floor_ts, floor_age = self._read_float(self.entry.data.get(CONF_FLOOR_TEMP_ENTITY))
+        raw_floor_temp, floor_ts, floor_age = self._read_float(self.entry.data.get(CONF_FLOOR_TEMP_ENTITY))
+        has_floor_sensor = bool(self.entry.data.get(CONF_HAS_FLOOR_SENSOR, True))
+        floor_offset = float(self.entry.data.get(CONF_FLOOR_OFFSET_C, 0.0))
+        floor_sensor_source = "MEASURED" if has_floor_sensor else "ESTIMATED"
+        floor_temp = (
+            round(raw_floor_temp + (0.0 if has_floor_sensor else floor_offset), 1)
+            if raw_floor_temp is not None
+            else None
+        )
         humidity, _, _ = self._read_float(self.entry.data.get(CONF_HUMIDITY_ENTITY))
         outdoor_temp, _, _ = self._read_float(self.entry.data.get(CONF_OUTDOOR_TEMP_ENTITY))
         wind_speed_ms: float | None = None
@@ -171,6 +186,7 @@ class ItssCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             sensor_measured_at_floor=floor_ts,
             room_temp=room_temp,
             floor_temp=floor_temp,
+            floor_sensor_source=floor_sensor_source,
             target_temp=target_temp,
             safety_reason=verdict.reason_code,
             device_mode_event=hvac_mode,
@@ -215,6 +231,16 @@ class ItssCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             record.residual_learning_status = prediction.residual_learning_status
             record.command_action = prediction.recommended_action
 
+            # Hybrid co-heating: if any sibling room is already heating and this room is
+            # slightly below target, join the active boiler cycle to avoid short-cycling
+            if (
+                self.entry.data.get(CONF_ZONE_STRATEGY, STRATEGY_HYBRID) == STRATEGY_HYBRID
+                and record.command_action == "OFF"
+                and room_temp <= (prediction.effective_target_temp - 0.05)
+                and self._is_any_sibling_heating()
+            ):
+                record.command_action = "HEAT"
+
         if record.command_action in ("HEAT", "OFF"):
             record.command_setpoint = round_thermostat_setpoint(
                 target_temp, action=record.command_action
@@ -222,15 +248,64 @@ class ItssCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             record.opposing_command_interval_sec = compute_opposing_interval(
                 self._last_command_action, record.command_action, sec_since_switch
             )
-            record.control_issued_at = now_kst_iso()
-            # Re-read state timestamp placeholder; real climate service call hooks here
-            record.control_confirmed_at = now_kst_iso()
-            record.observed_at = now_kst_iso()
+            await self._async_dispatch_climate(climate_id, record)
             self._last_command_action = record.command_action
             self._last_command_time = now
 
         await self._async_save_cycle(record)
         return record.to_payload()
+
+    def _is_any_sibling_heating(self) -> bool:
+        """Return True if another registered ITSS room coordinator is currently heating."""
+        siblings = self.hass.data.get(DOMAIN, {})
+        for entry_id, coord in siblings.items():
+            if entry_id == self.entry.entry_id or not isinstance(coord, ItssCoordinator):
+                continue
+            if coord.data and coord.data.get("commandAction") == "HEAT":
+                return True
+        return False
+
+    async def _async_dispatch_climate(self, climate_id: str | None, record: CycleRecord) -> None:
+        """Issue climate service commands (when dry_run=False) and re-read device state."""
+        dry_run = bool(self.entry.data.get(CONF_DRY_RUN, True))
+        record.control_issued_at = now_kst_iso()
+
+        if not dry_run and climate_id:
+            try:
+                hvac_mode = "heat" if record.command_action == "HEAT" else "off"
+                await self.hass.services.async_call(
+                    "climate",
+                    "set_hvac_mode",
+                    {"entity_id": climate_id, "hvac_mode": hvac_mode},
+                    blocking=True,
+                )
+                if record.command_action == "HEAT" and record.command_setpoint is not None:
+                    await self.hass.services.async_call(
+                        "climate",
+                        "set_temperature",
+                        {"entity_id": climate_id, "temperature": record.command_setpoint},
+                        blocking=True,
+                    )
+                record.control_confirmed_at = now_kst_iso()
+
+                # Brief wait before re-reading actual device mode and combustion state
+                await asyncio.sleep(DEFAULT_RECHECK_DELAY_SEC)
+                recheck = self.hass.states.get(climate_id)
+                record.observed_at = now_kst_iso()
+                if recheck is not None:
+                    record.device_mode_event = recheck.state
+                    hvac_action = recheck.attributes.get("hvac_action")
+                    record.combustion_confirmed = (
+                        (hvac_action == "heating") if hvac_action is not None else None
+                    )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("P100 climate dispatch failed for %s: %s", climate_id, err)
+                record.execution_status = "FAILED"
+                record.observed_at = now_kst_iso()
+        else:
+            # Dry-run mode: log timestamps without sending commands to physical thermostat
+            record.control_confirmed_at = now_kst_iso()
+            record.observed_at = now_kst_iso()
 
     async def _async_save_cycle(self, record: CycleRecord) -> None:
         """Persist cycle audit record directly to the local SQLite database."""

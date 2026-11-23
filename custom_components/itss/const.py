@@ -22,10 +22,16 @@ CONF_UPDATE_INTERVAL_SEC = "update_interval_sec"
 CONF_GEMINI_API_KEY = "gemini_api_key"
 CONF_WEATHER_LOCATION = "weather_location"
 CONF_ZONE_STRATEGY = "zone_strategy"
+CONF_HAS_FLOOR_SENSOR = "has_floor_sensor"
+CONF_FLOOR_OFFSET_C = "floor_offset_c"
+CONF_DRY_RUN = "dry_run"
 
 # Multi-zone control strategies
 STRATEGY_HYBRID = "hybrid"
 STRATEGY_SIMULTANEOUS = "simultaneous"
+
+# P100 post-command state re-read delay
+DEFAULT_RECHECK_DELAY_SEC = 2.0
 
 # Predictor model identifiers (ITSS-P200)
 MODEL_LINEAR_V12 = "linear_v12"

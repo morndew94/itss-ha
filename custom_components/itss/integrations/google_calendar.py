@@ -81,3 +81,4 @@ class GoogleCalendarAdvisor:
             return dt.astimezone(KST) if dt.tzinfo else dt.replace(tzinfo=KST)
         except ValueError:
             return None
+

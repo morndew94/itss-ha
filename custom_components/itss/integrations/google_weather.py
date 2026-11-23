@@ -103,3 +103,4 @@ class GoogleWeatherClient:
         if not match:
             raise ValueError("No JSON object found in weather response")
         return json.loads(match.group(0))
+

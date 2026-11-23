@@ -141,3 +141,4 @@ def test_gemini_daily_advisor_and_alerts(tmp_path: Path):
 
     row = format_cycle_for_sheets(cycles[0])
     assert row[0] == "c1" and row[1] == "living"
+

@@ -7,8 +7,10 @@
         "data": {
           "room_name": "방 이름",
           "room_temp_entity": "실내 온도 센서 (0.1°C)",
-          "floor_temp_entity": "바닥 온도 센서 (0.1°C)",
-          "climate_entity": "온도조절기(Climate) 엔티티",
+          "floor_temp_entity": "바닥 온도 센서 (공유 마스터 센서 지정)",
+          "has_floor_sensor": "이 방에 실제 바닥 센서 설치 여부 (없으면 추정 모드)",
+          "floor_offset_c": "마스터 바닥 센서 대비 추정 오프셋 (°C)",
+          "climate_entity": "이 방의 온도조절기(Climate) 엔티티",
           "humidity_entity": "습도 센서 (선택)",
           "outdoor_temp_entity": "외기 온도 센서 (선택)",
           "target_temp": "목표 온도 (°C)",
@@ -16,6 +18,7 @@
           "zone_strategy": "다중 방 제어 방식 (hybrid 권장 / simultaneous 동시)",
           "gemini_api_key": "Gemini API 키 (선택: 날씨 보정, 일일 리포트, TTS 경고)",
           "weather_location": "기상 조회 지역명 (예: 서울)",
+          "dry_run": "시험 운전 모드 (체크 시 이력만 기록, 해제 시 실제 밸브 제어)",
           "update_interval_sec": "제어 주기 (초)"
         }
       }

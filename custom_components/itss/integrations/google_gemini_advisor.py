@@ -96,3 +96,4 @@ class GeminiThermalAdvisor:
             return {"kpis": kpis, "report": text, "status": "OK"}
         except Exception as err:  # noqa: BLE001
             return {"kpis": kpis, "report": None, "status": f"ERROR: {err}"}
+

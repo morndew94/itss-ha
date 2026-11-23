@@ -8,6 +8,8 @@
           "room_name": "Room Name",
           "room_temp_entity": "Room Temperature Sensor (0.1C)",
           "floor_temp_entity": "Floor Temperature Sensor (0.1C)",
+          "has_floor_sensor": "Physical Floor Sensor Installed in This Room",
+          "floor_offset_c": "Estimated Floor Offset from Master Sensor (C)",
           "climate_entity": "Thermostat Climate Entity",
           "humidity_entity": "Humidity Sensor (Optional)",
           "outdoor_temp_entity": "Outdoor Temperature Sensor (Optional)",
@@ -16,6 +18,7 @@
           "zone_strategy": "Multi-Zone Control Strategy (hybrid / simultaneous)",
           "gemini_api_key": "Gemini API Key (Optional: Weather, Report, TTS Alert)",
           "weather_location": "Weather Region (e.g. Seoul)",
+          "dry_run": "Dry-Run Mode (Log Only, No Physical Control)",
           "update_interval_sec": "Control Interval (seconds)"
         }
       }

@@ -88,3 +88,4 @@ def format_cycle_for_sheets(cycle_payload: dict[str, Any]) -> list[Any]:
         cycle_payload.get("combustionConfirmed"),
         cycle_payload.get("savedAt"),
     ]
+

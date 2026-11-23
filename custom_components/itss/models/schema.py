@@ -100,6 +100,7 @@ class CycleRecord:
     # Measured & predicted values
     room_temp: float | None = None
     floor_temp: float | None = None
+    floor_sensor_source: str = "MEASURED"      # MEASURED or ESTIMATED
     target_temp: float | None = None
     predicted_room_30m: float | None = None
     predicted_floor_30m: float | None = None
@@ -133,6 +134,7 @@ class CycleRecord:
             "opposingCommandIntervalSec": raw["opposing_command_interval_sec"],
             "roomTemp": raw["room_temp"],
             "floorTemp": raw["floor_temp"],
+            "floorSensorSource": raw["floor_sensor_source"],
             "targetTemp": raw["target_temp"],
             "predictedRoom30m": raw["predicted_room_30m"],
             "predictedFloor30m": raw["predicted_floor_30m"],

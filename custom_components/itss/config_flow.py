@@ -10,8 +10,11 @@ from homeassistant.helpers import selector
 
 from .const import (
     CONF_CLIMATE_ENTITY,
+    CONF_DRY_RUN,
+    CONF_FLOOR_OFFSET_C,
     CONF_FLOOR_TEMP_ENTITY,
     CONF_GEMINI_API_KEY,
+    CONF_HAS_FLOOR_SENSOR,
     CONF_HUMIDITY_ENTITY,
     CONF_OUTDOOR_TEMP_ENTITY,
     CONF_PREDICTOR_MODEL,
@@ -53,6 +56,8 @@ class ItssConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_FLOOR_TEMP_ENTITY): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="sensor")
                 ),
+                vol.Required(CONF_HAS_FLOOR_SENSOR, default=True): bool,
+                vol.Optional(CONF_FLOOR_OFFSET_C, default=0.0): vol.Coerce(float),
                 vol.Required(CONF_CLIMATE_ENTITY): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="climate")
                 ),
@@ -71,6 +76,7 @@ class ItssConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 ),
                 vol.Optional(CONF_GEMINI_API_KEY, default=""): str,
                 vol.Optional(CONF_WEATHER_LOCATION, default="서울"): str,
+                vol.Required(CONF_DRY_RUN, default=True): bool,
                 vol.Optional(
                     CONF_UPDATE_INTERVAL_SEC, default=DEFAULT_UPDATE_INTERVAL_SEC
                 ): vol.Coerce(int),
