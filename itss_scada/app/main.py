@@ -108,6 +108,36 @@ class RCFitRequest(BaseModel):
     observations: list[dict[str, Any]]
 
 
+def detect_boiler_running(climate_state: dict[str, Any] | None) -> bool | None:
+    """Determine actual boiler/valve running state from thermostat setpoint vs current temp.
+
+    Physical rule for Korean wallpad thermostats (e.g., Kocom):
+      - state == 'off' -> False (OFF)
+      - setpoint (temperature) > thermostat current_temperature -> True (Running / ON)
+      - setpoint (temperature) <= thermostat current_temperature -> False (OFF)
+      - fallback to hvac_action == 'heating' when temperatures are unavailable.
+    """
+    if not climate_state:
+        return None
+    mode = str(climate_state.get("state") or "").lower()
+    if mode in ("off", "unavailable", "unknown"):
+        return False if mode == "off" else None
+
+    attrs = climate_state.get("attributes") or {}
+    sp = attrs.get("temperature")
+    cur = attrs.get("current_temperature")
+    if sp is not None and cur is not None:
+        try:
+            return float(sp) > float(cur)
+        except (TypeError, ValueError):
+            pass
+
+    hvac_action = attrs.get("hvac_action")
+    if hvac_action is not None:
+        return str(hvac_action).lower() == "heating"
+    return None
+
+
 def compute_boiler_stats(
     cycles: list[dict[str, Any]],
     *,
@@ -293,9 +323,8 @@ class ItssEngine:
             r_temp, r_ts, r_age = await self.ha.get_numeric_state(rm["roomTempEntity"])
             c_state = await self.ha.get_state(rm["climateEntity"])
             hvac_mode = c_state.get("state") if c_state else None
-            hvac_action = (c_state.get("attributes") or {}).get("hvac_action") if c_state else None
-            is_heating = hvac_mode == "heat"
-            combustion = (hvac_action == "heating") if hvac_action is not None else None
+            combustion = detect_boiler_running(c_state)
+            is_heating = bool(combustion) if combustion is not None else (hvac_mode == "heat")
 
             eff_target = round(rm["targetTemp"] + atmos_offset + schedule_offset + preset_offset, 2)
             telemetry[r_name] = {
@@ -466,8 +495,7 @@ class ItssEngine:
             record.observed_at = now_kst_iso()
             if recheck:
                 record.device_mode_event = recheck.get("state")
-                act = (recheck.get("attributes") or {}).get("hvac_action")
-                record.combustion_confirmed = (act == "heating") if act is not None else None
+                record.combustion_confirmed = detect_boiler_running(recheck)
         except Exception as err:  # noqa: BLE001
             self.ha.last_error = f"Climate dispatch failed ({climate_entity}): {err}"
             record.execution_status = "FAILED"
@@ -538,11 +566,15 @@ def create_app(
                 if master_floor is not None
                 else None
             )
+            c_attrs = (c_state.get("attributes") or {}) if c_state else {}
+            boiler_running = detect_boiler_running(c_state)
             live_by_room[r_name] = {
                 "roomTemp": r_temp,
                 "floorTemp": eff_floor,
                 "climateState": c_state.get("state") if c_state else None,
-                "climateSetpoint": (c_state.get("attributes") or {}).get("temperature") if c_state else None,
+                "climateSetpoint": c_attrs.get("temperature"),
+                "climateCurrentTemp": c_attrs.get("current_temperature"),
+                "boilerRunning": boiler_running,
             }
 
         now_hour = datetime.now(tz=KST).hour
@@ -653,7 +685,8 @@ def create_app(
             "after": {
                 "state": after.get("state") if after else None,
                 "temperature": (after.get("attributes") or {}).get("temperature") if after else None,
-                "hvac_action": (after.get("attributes") or {}).get("hvac_action") if after else None,
+                "current_temperature": (after.get("attributes") or {}).get("current_temperature") if after else None,
+                "boiler_running": detect_boiler_running(after),
             },
         }
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from itss_scada.app.integrations.notifications import PushNotifier
-from itss_scada.app.main import create_app
+from itss_scada.app.main import create_app, detect_boiler_running
 
 
 class FakeHAClient:
@@ -54,11 +54,17 @@ def test_addon_v2_full_workflow(tmp_path: Path):
     app = create_app(db_path=str(tmp_path / "addon.db"), ha_client=fake_ha, notifier=notifier)
 
     with TestClient(app) as client:
-        # 1. Web UI & HA entity dropdown endpoint
+        # 1. Web UI table & HA entity dropdown endpoint
         r_html = client.get("/")
         assert r_html.status_code == 200
-        assert "I.T.S.S. Thermal SCADA Dashboard v2.0" in r_html.text
+        assert "roomTableBody" in r_html.text
         assert len(client.get("/api/v1/ha/entities").json()["tempSensors"]) == 1
+
+        # Verify physical boiler-running detection (setpoint > current_temperature)
+        assert detect_boiler_running({"state": "heat", "attributes": {"temperature": 24.0, "current_temperature": 21.0}}) is True
+        assert detect_boiler_running({"state": "heat", "attributes": {"temperature": 15.0, "current_temperature": 21.0}}) is False
+        assert detect_boiler_running({"state": "heat", "attributes": {"temperature": 21.0, "current_temperature": 21.0}}) is False
+        assert detect_boiler_running({"state": "off", "attributes": {"temperature": 24.0, "current_temperature": 21.0}}) is False
 
         # 2. Configure master floor sensor & register rooms
         client.patch("/api/v1/settings", json={"masterFloorEntity": "sensor.living_floor_temperature", "dryRun": False})

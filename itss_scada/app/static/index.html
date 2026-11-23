@@ -33,16 +33,28 @@
     .badge { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
     .badge.ok { background: rgba(34,197,94,.2); color: var(--ok); }
     .badge.warn { background: rgba(234,179,8,.2); color: var(--warn); }
-    .badge.heat { background: rgba(249,115,22,.2); color: var(--heat); }
+    .badge.heat { background: rgba(249,115,22,.22); color: var(--heat); }
     .badge.danger { background: rgba(239,68,68,.2); color: var(--danger); }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; margin-bottom: 16px; }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
-    .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 12px; }
-    .card-head-left { min-width: 0; flex: 1; }
-    .card-head-right { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
+    .badge.off { background: rgba(148,163,184,.16); color: var(--muted); }
+    .boiler-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; border-radius: 999px;
+                   font-size: 12px; font-weight: 800; letter-spacing: 0.2px; white-space: nowrap; }
+    .boiler-pill.running { background: linear-gradient(90deg, #ea580c, #f97316); color: #fff;
+                           box-shadow: 0 0 14px rgba(249, 115, 22, 0.55); }
+    .boiler-pill.stopped { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+    .boiler-dot { width: 8px; height: 8px; border-radius: 50%; background: #fff; display: inline-block;
+                  animation: pulse 1.2s infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.35; transform: scale(0.75); } }
+    .room-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .room-table th { background: #0b1220; color: var(--muted); font-size: 12px; padding: 10px 8px; text-align: left; white-space: nowrap; }
+    .room-table td { padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    .room-table tr.row-running { background: rgba(249, 115, 22, 0.10); }
+    .room-table tr.row-running td:first-child { border-left: 4px solid var(--heat); }
+    .temp-big { font-size: 17px; font-weight: 700; }
+    .inline-flex { display: inline-flex; align-items: center; gap: 4px; flex-wrap: nowrap; }
+    .btn-sm { padding: 4px 8px; font-size: 11px; }
+    .btn-del { padding: 4px 8px; font-size: 11px; color: var(--danger); border-color: rgba(239,68,68,.4); }
     .entity-sub { font-size: 11px; color: var(--muted); margin-top: 2px; word-break: break-all; }
-    .btn-del { padding: 3px 8px; font-size: 11px; color: var(--danger); border-color: rgba(239,68,68,.4); }
-    .room-name { font-size: 17px; font-weight: 700; }
+    .room-name { font-size: 15px; font-weight: 700; }
     .temps { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
     .metric { background: #0b1220; padding: 10px; border-radius: 8px; }
     .metric label { display: block; font-size: 11px; color: var(--muted); }
@@ -71,7 +83,10 @@
 <div class="container">
   <header>
     <div class="title">
-      <h1>I.T.S.S. Thermal SCADA Dashboard v2.0</h1>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <h1>I.T.S.S. Thermal SCADA Dashboard v2.1</h1>
+        <span id="globalBoilerPill" class="boiler-pill stopped">보일러 상태 확인중</span>
+      </div>
       <p id="subInfo">로딩 중...</p>
     </div>
     <div class="toolbar">
@@ -112,8 +127,28 @@
 
   <div id="actionMsg" class="msg-box" style="margin-bottom:16px;"></div>
 
-  <!-- Room Control Cards -->
-  <section id="roomGrid" class="grid"></section>
+  <!-- Room Control Table -->
+  <section class="panel">
+    <h2>
+      <span>방별 실시간 난방 제어 현황 (설정온도 &gt; 조절기온도 = 보일러 가동중)</span>
+    </h2>
+    <div style="overflow-x:auto;">
+      <table class="room-table">
+        <thead>
+          <tr>
+            <th>방 / 엔티티</th>
+            <th>보일러 실상태</th>
+            <th>실내 온도</th>
+            <th>바닥 온도</th>
+            <th>목표 온도 (0.1°C)</th>
+            <th>운전 모드</th>
+            <th>직접 테스트 / 관리</th>
+          </tr>
+        </thead>
+        <tbody id="roomTableBody"></tbody>
+      </table>
+    </div>
+  </section>
 
   <!-- 24h Time-Series Chart -->
   <section class="panel">
@@ -287,14 +322,25 @@ async function refresh() {
 }
 
 function renderRooms(rooms, liveByRoom, latestByRoom) {
-  const grid = document.getElementById("roomGrid");
+  const tbody = document.getElementById("roomTableBody");
+  const runningRooms = rooms.filter(r => liveByRoom[r.roomName]?.boilerRunning === true).map(r => r.roomName);
+  const gPill = document.getElementById("globalBoilerPill");
+  if (runningRooms.length > 0) {
+    gPill.className = "boiler-pill running";
+    gPill.innerHTML = `<span class="boiler-dot"></span>보일러 가동중 (${runningRooms.join(", ")})`;
+  } else {
+    gPill.className = "boiler-pill stopped";
+    gPill.textContent = "보일러 대기 (전체 OFF)";
+  }
+
   if (!rooms.length) {
-    grid.innerHTML = `<div class="card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:28px;">
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:24px;">
       등록된 방이 없습니다. 아래 드롭다운에서 실제 HA 엔티티로 방을 등록해 주세요.
-    </div>`;
+    </td></tr>`;
     return;
   }
-  grid.innerHTML = rooms.map(rm => {
+
+  tbody.innerHTML = rooms.map(rm => {
     const live = liveByRoom[rm.roomName] || {};
     const lat = latestByRoom[rm.roomName] || {};
     const rVal = live.roomTemp != null ? live.roomTemp : lat.roomTemp;
@@ -305,50 +351,62 @@ function renderRooms(rooms, liveByRoom, latestByRoom) {
     const isAuto = rm.controlMode === "AUTO";
     const isManHeat = !isAuto && rm.manualAction === "HEAT";
     const isManOff = !isAuto && rm.manualAction === "OFF";
-    const badgeClass = lat.commandAction === "HEAT" ? "heat" : (lat.safetyReason === "P000_OVERHEAT_CUTOFF" ? "danger" : "ok");
+    const isRunning = live.boilerRunning === true;
+    const isStopped = live.boilerRunning === false;
+
+    const boilerBadge = isRunning
+      ? `<span class="boiler-pill running"><span class="boiler-dot"></span>가동중</span>`
+      : (isStopped
+          ? `<span class="boiler-pill stopped">OFF</span>`
+          : `<span class="badge warn">미확인</span>`);
+
+    const spStr = live.climateSetpoint != null ? `${live.climateSetpoint}°C` : "--";
+    const curStr = live.climateCurrentTemp != null ? `${live.climateCurrentTemp}°C` : "--";
+    const cmpText = live.climateState != null
+      ? `<div style="font-size:11px;color:${isRunning ? "#fdba74" : "var(--muted)"};margin-top:4px;">설정 ${spStr} ${isRunning ? "&gt;" : "&le;"} 조절기 ${curStr} (${live.climateState})</div>`
+      : `<div style="font-size:11px;color:var(--danger);margin-top:4px;">조절기 미수신</div>`;
+
     const humWarn = rm.roomTempEntity.toLowerCase().includes("humidity")
-      ? `<div style="font-size:11px;color:var(--warn);margin-top:3px;">⚠ 습도(_humidity) 센서입니다. 온도 센서로 변경하세요.</div>` : "";
-    const climInfo = live.climateState != null
-      ? `<div style="font-size:11px;color:var(--accent);margin-top:3px;">조절기 현재: ${live.climateState} · 설정 ${live.climateSetpoint ?? "--"}°C</div>`
-      : `<div style="font-size:11px;color:var(--danger);margin-top:3px;">조절기 상태 미수신 (엔티티 ID 확인 필요)</div>`;
+      ? `<div style="font-size:11px;color:var(--warn);margin-top:2px;">⚠ 습도 센서입니다</div>` : "";
 
     return `
-      <div class="card">
-        <div class="card-head">
-          <div class="card-head-left">
-            <div class="room-name">${rm.roomName}</div>
-            <div class="entity-sub">${rm.roomTempEntity} · ${rm.climateEntity}</div>
-            ${climInfo}
-            ${humWarn}
+      <tr class="${isRunning ? "row-running" : ""}">
+        <td>
+          <div class="room-name">${rm.roomName} <span class="badge ${isAuto ? "ok" : "warn"}" style="margin-left:4px;">${isAuto ? "AUTO" : "수동"}</span></div>
+          <div class="entity-sub">${rm.roomTempEntity}<br/>${rm.climateEntity}</div>
+          ${humWarn}
+        </td>
+        <td>
+          ${boilerBadge}
+          ${cmpText}
+        </td>
+        <td><div class="temp-big">${rt}</div></td>
+        <td>
+          <div class="temp-big">${ft}</div>
+          <div style="font-size:11px;color:var(--muted);">${fSrc}</div>
+        </td>
+        <td>
+          <div class="inline-flex">
+            <button class="btn-sm" onclick="changeTarget('${rm.roomName}', ${(rm.targetTemp - 0.1).toFixed(1)})">-0.1</button>
+            <span style="font-size:16px;font-weight:700;min-width:52px;text-align:center;color:var(--accent);">${rm.targetTemp.toFixed(1)}°C</span>
+            <button class="btn-sm" onclick="changeTarget('${rm.roomName}', ${(rm.targetTemp + 0.1).toFixed(1)})">+0.1</button>
           </div>
-          <div class="card-head-right">
-            <span class="badge ${badgeClass}">${lat.commandAction || "대기"}</span>
-            <span class="badge ${isAuto ? "ok" : "warn"}">${isAuto ? "AUTO" : "수동"}</span>
+        </td>
+        <td>
+          <div class="inline-flex">
+            <button class="btn-sm ${isAuto ? "primary active" : ""}" onclick="setMode('${rm.roomName}', 'AUTO', 'HOLD')">자동</button>
+            <button class="btn-sm ${isManHeat ? "heat active" : ""}" onclick="setMode('${rm.roomName}', 'MANUAL', 'HEAT')">수동ON</button>
+            <button class="btn-sm ${isManOff ? "off active" : ""}" onclick="setMode('${rm.roomName}', 'MANUAL', 'OFF')">수동OFF</button>
+          </div>
+        </td>
+        <td>
+          <div class="inline-flex">
+            <button class="btn-sm" onclick="testClimate('${rm.roomName}', 'HEAT')">ON(${currentSettings.heatOnSetpoint}°)</button>
+            <button class="btn-sm" onclick="testClimate('${rm.roomName}', 'OFF')">OFF(${currentSettings.heatOffSetpoint}°)</button>
             <button class="btn-del" onclick="deleteRoom('${rm.roomName}')">삭제</button>
           </div>
-        </div>
-        <div class="temps">
-          <div class="metric"><label>실내 온도 (0.1°C)</label><div class="val">${rt}</div></div>
-          <div class="metric"><label>바닥 온도 (${fSrc})</label><div class="val">${ft}</div></div>
-        </div>
-        <div class="setpoint-row">
-          <span style="font-size:12px;color:var(--muted);">목표 온도</span>
-          <div class="setpoint-controls">
-            <button onclick="changeTarget('${rm.roomName}', ${(rm.targetTemp - 0.1).toFixed(1)})">-0.1</button>
-            <span class="setpoint-val">${rm.targetTemp.toFixed(1)}°C</span>
-            <button onclick="changeTarget('${rm.roomName}', ${(rm.targetTemp + 0.1).toFixed(1)})">+0.1</button>
-          </div>
-        </div>
-        <div class="mode-row">
-          <button class="${isAuto ? "primary active" : ""}" onclick="setMode('${rm.roomName}', 'AUTO', 'HOLD')">자동(AUTO)</button>
-          <button class="${isManHeat ? "heat active" : ""}" onclick="setMode('${rm.roomName}', 'MANUAL', 'HEAT')">수동 ON</button>
-          <button class="${isManOff ? "off active" : ""}" onclick="setMode('${rm.roomName}', 'MANUAL', 'OFF')">수동 OFF</button>
-        </div>
-        <div class="mode-row" style="margin-top:6px;">
-          <button style="font-size:11px;" onclick="testClimate('${rm.roomName}', 'HEAT')">직접 테스트 ON(${currentSettings.heatOnSetpoint}°C)</button>
-          <button style="font-size:11px;" onclick="testClimate('${rm.roomName}', 'OFF')">직접 테스트 OFF(${currentSettings.heatOffSetpoint}°C)</button>
-        </div>
-      </div>`;
+        </td>
+      </tr>`;
   }).join("");
 }
 
