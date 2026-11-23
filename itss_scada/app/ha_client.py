@@ -160,6 +160,10 @@ class HomeAssistantClient:
                 if dev_cls == "temperature" or "°C" in unit or "temp" in eid.lower():
                     if "humidity" not in eid.lower():
                         temp_sensors.append(entry)
+            elif eid.startswith("weather."):
+                entry["state"] = attrs.get("temperature", it.get("state"))
+                entry["unit"] = "°C"
+                temp_sensors.append(entry)
             elif eid.startswith("climate."):
                 entry["hvacModes"] = attrs.get("hvac_modes", [])
                 entry["temperature"] = attrs.get("temperature")

@@ -24,7 +24,7 @@ from .const import (
 from .ha_client import HomeAssistantClient
 from .integrations.google_alerts import GeminiTTSAlert
 from .integrations.google_gemini_advisor import GeminiThermalAdvisor, compute_daily_kpis
-from .integrations.google_weather import GoogleWeatherClient
+from .integrations.google_weather import FallbackWeatherProvider
 from .integrations.notifications import PushNotifier
 from .models.schema import CycleRecord, SensorSnapshot, ThermalInput, now_kst_iso
 from .protocols.multi_zone import MultiZoneController, ZoneReading
@@ -106,6 +106,7 @@ class SettingsPatchRequest(BaseModel):
     predictorModel: str | None = Field(default=None, pattern="^(linear_v12|adaptive_rc)$")
     masterFloorEntity: str | None = None
     outdoorTempEntity: str | None = None
+    weatherLocation: str | None = None
     heatOnSetpoint: float | None = Field(default=None, ge=15.0, le=30.0)
     heatOffSetpoint: float | None = Field(default=None, ge=5.0, le=25.0)
     floorOffLimitC: float | None = Field(default=None, ge=22.0, le=29.0)
@@ -247,7 +248,7 @@ class ItssEngine:
             "updateIntervalSec": int(opts.get("update_interval_sec", 60)),
             "masterFloorEntity": str(saved_settings.get("masterFloorEntity", opts.get("master_floor_entity", ""))),
             "outdoorTempEntity": str(saved_settings.get("outdoorTempEntity", opts.get("outdoor_temp_entity", ""))),
-            "weatherLocation": str(opts.get("weather_location", "서울")),
+            "weatherLocation": str(saved_settings.get("weatherLocation", opts.get("weather_location", "서울"))),
             "heatOnSetpoint": float(saved_settings.get("heatOnSetpoint", opts.get("heat_on_setpoint", 24.0))),
             "heatOffSetpoint": float(saved_settings.get("heatOffSetpoint", opts.get("heat_off_setpoint", 15.0))),
             "floorOffLimitC": float(saved_settings.get("floorOffLimitC", opts.get("floor_off_limit_c", 26.5))),
@@ -262,7 +263,10 @@ class ItssEngine:
         self._cycle_counter: int = 0
 
         gemini_key = str(opts.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
-        self.weather_client = GoogleWeatherClient(gemini_key, self.settings["weatherLocation"]) if gemini_key else None
+        self.weather_client = FallbackWeatherProvider(
+            location=self.settings["weatherLocation"],
+            gemini_api_key=gemini_key,
+        )
         self.advisor = GeminiThermalAdvisor(gemini_key)
         self.tts_alert = GeminiTTSAlert(gemini_key) if gemini_key else None
         self.notifier = notifier or PushNotifier(
@@ -429,24 +433,34 @@ class ItssEngine:
             "thermalLagProfiles": lag_profiles,
         }
 
-    async def _read_outdoor_weather(self) -> tuple[float | None, float | None]:
-        """Read outdoor temp/wind from configured HA sensor/weather entity or Gemini grounding."""
+    async def _read_outdoor_weather(self) -> tuple[float | None, float | None, str]:
+        """Read outdoor temp/wind from HA sensor (e.g., Naver Weather), else fallback to API for configured region."""
         ent = self.settings.get("outdoorTempEntity", "").strip()
         if ent:
             raw = await self.ha.get_state(ent)
-            if raw:
+            if raw and raw.get("state") not in (None, "unknown", "unavailable"):
                 if ent.startswith("weather."):
                     attrs = raw.get("attributes") or {}
                     t = attrs.get("temperature")
                     w = attrs.get("wind_speed")
-                    return (float(t) if t is not None else None), (float(w) if w is not None else None)
-                val, _, _ = await self.ha.get_numeric_state(ent)
-                if val is not None:
-                    return val, None
+                    if t is not None:
+                        try:
+                            return round(float(t), 1), (float(w) if w is not None else None), "HA센서"
+                        except (TypeError, ValueError):
+                            pass
+                else:
+                    val, _, _ = await self.ha.get_numeric_state(ent)
+                    if val is not None:
+                        return val, None, "HA센서"
+
+        # Fallback when HA outdoor/Naver Weather sensor fails or is unavailable
         if self.weather_client is not None:
             w = await asyncio.to_thread(self.weather_client.get_weather)
-            return w.outdoor_temp_c, w.wind_speed_ms
-        return None, None
+            if w.outdoor_temp_c is not None:
+                loc = self.settings.get("weatherLocation", "서울")
+                label = "Gemini API" if w.source == "GEMINI_SEARCH_GROUNDING" else "Open-Meteo API"
+                return w.outdoor_temp_c, w.wind_speed_ms, f"{label}·{loc}"
+        return None, None, "시간대폴백"
 
     def _timer_metrics(self, room_name: str, now: datetime) -> tuple[float, float]:
         """Return (continuous_run_min, cooldown_remaining_min) for one room."""
@@ -553,7 +567,7 @@ class ItssEngine:
             return []
 
         master_floor, floor_ts, floor_age = await self.ha.get_numeric_state(self.settings["masterFloorEntity"])
-        outdoor_temp, wind_speed = await self._read_outdoor_weather()
+        outdoor_temp, wind_speed, _ = await self._read_outdoor_weather()
 
         atmos_offset = self.atmos.compute_offset(outdoor_temp=outdoor_temp, wind_speed_ms=wind_speed, now_kst=now)
         max_run_min = self.atmos.compute_max_run_minutes(
@@ -957,7 +971,7 @@ def create_app(
 
         now_kst = datetime.now(tz=KST)
         master_floor, _, _ = await engine.ha.get_numeric_state(engine.settings["masterFloorEntity"])
-        outdoor_temp, _ = await engine._read_outdoor_weather()
+        outdoor_temp, _, outdoor_source = await engine._read_outdoor_weather()
         active_max_run = engine.atmos.compute_max_run_minutes(
             outdoor_temp=outdoor_temp,
             now_kst=now_kst,
@@ -996,6 +1010,7 @@ def create_app(
             "haLastError": getattr(engine.ha, "last_error", None),
             "masterFloorTemp": master_floor,
             "outdoorTemp": outdoor_temp,
+            "outdoorTempSource": outdoor_source,
             "activeMaxRunMin": active_max_run,
             "activePreset": engine.active_preset,
             "activeSchedule": {"label": sched_label, "offsetC": sched_offset},
@@ -1136,6 +1151,8 @@ def create_app(
     def patch_settings(req: SettingsPatchRequest) -> dict[str, Any]:
         for field_name, val in req.model_dump(exclude_none=True).items():
             engine.settings[field_name] = val
+        if req.weatherLocation is not None and engine.weather_client is not None:
+            engine.weather_client.set_location(req.weatherLocation)
         engine.db.set_kv("settings", engine.settings)
         return engine.settings
 

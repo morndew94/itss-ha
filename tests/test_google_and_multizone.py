@@ -16,7 +16,11 @@ from itss_scada.app.integrations.google_gemini_advisor import (
     GeminiThermalAdvisor,
     compute_daily_kpis,
 )
-from itss_scada.app.integrations.google_weather import GoogleWeatherClient
+from itss_scada.app.integrations.google_weather import (
+    FallbackWeatherProvider,
+    GoogleWeatherClient,
+    OpenMeteoWeatherClient,
+)
 from itss_scada.app.protocols.multi_zone import MultiZoneController, ZoneReading
 
 
@@ -78,6 +82,16 @@ def test_google_weather_client_caching_and_fallback():
     wf = fallback_client.get_weather(now_epoch=2000.0)
     assert wf.outdoor_temp_c is None
     assert wf.source == "FALLBACK"
+
+    # Open-Meteo fallback works without API key when Gemini/Naver weather fail
+    om = OpenMeteoWeatherClient(
+        "수원",
+        http_get=lambda _url: {"current": {"temperature_2m": 3.4, "wind_speed_10m": 1.8}},
+    )
+    provider = FallbackWeatherProvider("수원", gemini_client=fallback_client, open_meteo_client=om)
+    res = provider.get_weather(now_epoch=2000.0)
+    assert res.outdoor_temp_c == 3.4
+    assert res.source == "OPEN_METEO_API"
 
 
 def test_google_calendar_advisor_away_and_preheat():
