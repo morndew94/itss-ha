@@ -1,5 +1,5 @@
 name: "I.T.S.S. Thermal SCADA"
-version: "1.1.1"
+version: "1.2.0"
 slug: "itss_scada"
 description: "0.3C Ondol precision heating SCADA add-on with Ingress Web UI, per-room target temp, manual override, hybrid multi-zone control, and Google API integrations."
 url: "https://github.com/morndew94/itss-ha"
@@ -25,6 +25,8 @@ options:
   zone_strategy: "hybrid"
   predictor_model: "linear_v12"
   dry_run: true
+  heat_on_setpoint: 24.0
+  heat_off_setpoint: 15.0
   master_floor_entity: "sensor.living_floor_temperature"
   gemini_api_key: ""
   weather_location: "서울"
@@ -35,6 +37,8 @@ schema:
   zone_strategy: list(hybrid|simultaneous)
   predictor_model: list(linear_v12|adaptive_rc)
   dry_run: bool
+  heat_on_setpoint: float(15,30)
+  heat_off_setpoint: float(5,25)
   master_floor_entity: str
   gemini_api_key: password?
   weather_location: str?

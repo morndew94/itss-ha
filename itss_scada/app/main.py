@@ -73,6 +73,8 @@ class SettingsPatchRequest(BaseModel):
     zoneStrategy: str | None = Field(default=None, pattern="^(hybrid|simultaneous)$")
     predictorModel: str | None = Field(default=None, pattern="^(linear_v12|adaptive_rc)$")
     masterFloorEntity: str | None = None
+    heatOnSetpoint: float | None = Field(default=None, ge=15.0, le=30.0)
+    heatOffSetpoint: float | None = Field(default=None, ge=5.0, le=25.0)
 
 
 class RCFitRequest(BaseModel):
@@ -95,6 +97,8 @@ class ItssEngine:
             "updateIntervalSec": int(opts.get("update_interval_sec", 300)),
             "masterFloorEntity": str(opts.get("master_floor_entity", "sensor.living_floor_temperature")),
             "weatherLocation": str(opts.get("weather_location", "서울")),
+            "heatOnSetpoint": float(opts.get("heat_on_setpoint", 24.0)),
+            "heatOffSetpoint": float(opts.get("heat_off_setpoint", 15.0)),
         }
 
         gemini_key = str(opts.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
@@ -239,8 +243,11 @@ class ItssEngine:
                     record.command_action = mz_by_room[r_name].action
 
             if record.command_action in ("HEAT", "OFF"):
-                record.command_setpoint = round_thermostat_setpoint(
-                    rm["targetTemp"], action=record.command_action
+                # Fixed boiler swing setpoints: ON -> 24.0C (boiler ON), OFF -> 15.0C (boiler OFF)
+                record.command_setpoint = (
+                    float(self.settings["heatOnSetpoint"])
+                    if record.command_action == "HEAT"
+                    else float(self.settings["heatOffSetpoint"])
                 )
                 await self._dispatch(rm["climateEntity"], record)
 
@@ -252,7 +259,12 @@ class ItssEngine:
         return results
 
     async def _dispatch(self, climate_entity: str, record: CycleRecord) -> None:
-        """Issue climate command to HA Supervisor API (unless dryRun is True) and re-read."""
+        """Issue climate command to HA Supervisor API (unless dryRun is True) and re-read.
+
+        Uses setpoint swing control for Korean wallpad thermostats:
+          - HEAT: set hvac_mode='heat' and temperature=heatOnSetpoint (default 24.0C)
+          - OFF : set temperature=heatOffSetpoint (default 15.0C) to turn boiler off
+        """
         record.control_issued_at = now_kst_iso()
         if self.settings["dryRun"] or not self.ha.is_configured:
             record.control_confirmed_at = now_kst_iso()
@@ -260,9 +272,18 @@ class ItssEngine:
             return
 
         try:
-            mode = "heat" if record.command_action == "HEAT" else "off"
-            await self.ha.call_service("climate", "set_hvac_mode", {"entity_id": climate_entity, "hvac_mode": mode})
-            if record.command_action == "HEAT" and record.command_setpoint is not None:
+            if record.command_action == "HEAT":
+                await self.ha.call_service(
+                    "climate",
+                    "set_hvac_mode",
+                    {"entity_id": climate_entity, "hvac_mode": "heat"},
+                )
+                await self.ha.call_service(
+                    "climate",
+                    "set_temperature",
+                    {"entity_id": climate_entity, "temperature": record.command_setpoint},
+                )
+            elif record.command_action == "OFF":
                 await self.ha.call_service(
                     "climate",
                     "set_temperature",
@@ -323,21 +344,48 @@ def create_app(db_path: str | None = None, ha_client: HomeAssistantClient | None
         }
 
     @app.get("/api/v1/status")
-    def get_status() -> dict[str, Any]:
+    async def get_status() -> dict[str, Any]:
         rooms = engine.db.list_rooms()
         recent = engine.db.list_cycles(limit=100)
         latest_by_room: dict[str, dict[str, Any]] = {}
         for c in recent:
             if c["roomName"] not in latest_by_room:
                 latest_by_room[c["roomName"]] = c
+
+        # Fetch live real-time temperatures directly from HA so UI never stays '--'
+        master_floor, _, _ = await engine.ha.get_numeric_state(engine.settings["masterFloorEntity"])
+        live_by_room: dict[str, dict[str, Any]] = {}
+        for rm in rooms:
+            r_name = rm["roomName"]
+            r_temp, _, _ = await engine.ha.get_numeric_state(rm["roomTempEntity"])
+            c_state = await engine.ha.get_state(rm["climateEntity"])
+            eff_floor = (
+                round(master_floor + (0.0 if rm["hasFloorSensor"] else rm["floorOffsetC"]), 1)
+                if master_floor is not None
+                else None
+            )
+            live_by_room[r_name] = {
+                "roomTemp": r_temp,
+                "floorTemp": eff_floor,
+                "climateState": c_state.get("state") if c_state else None,
+                "climateSetpoint": (c_state.get("attributes") or {}).get("temperature") if c_state else None,
+            }
+
         return {
             "timeKst": now_kst_iso(),
             "haConnected": engine.ha.is_configured,
+            "haLastError": getattr(engine.ha, "last_error", None),
+            "masterFloorTemp": master_floor,
             "settings": engine.settings,
             "rooms": rooms,
+            "liveByRoom": live_by_room,
             "latestByRoom": latest_by_room,
             "kpis": compute_daily_kpis(recent),
         }
+
+    @app.get("/api/v1/ha/entities")
+    async def list_ha_entities() -> dict[str, Any]:
+        return await engine.ha.list_entities()
 
     @app.get("/api/v1/rooms")
     def list_rooms() -> list[dict[str, Any]]:
@@ -376,6 +424,10 @@ def create_app(db_path: str | None = None, ha_client: HomeAssistantClient | None
             engine.settings["predictorModel"] = req.predictorModel
         if req.masterFloorEntity is not None:
             engine.settings["masterFloorEntity"] = req.masterFloorEntity
+        if req.heatOnSetpoint is not None:
+            engine.settings["heatOnSetpoint"] = float(req.heatOnSetpoint)
+        if req.heatOffSetpoint is not None:
+            engine.settings["heatOffSetpoint"] = float(req.heatOffSetpoint)
         return engine.settings
 
     @app.post("/api/v1/control/run-now")

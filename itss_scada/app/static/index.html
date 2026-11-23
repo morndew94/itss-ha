@@ -35,7 +35,11 @@
     .badge.danger { background: rgba(239,68,68,.2); color: var(--danger); }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 16px; margin-bottom: 20px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
-    .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 12px; }
+    .card-head-left { min-width: 0; flex: 1; }
+    .card-head-right { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
+    .entity-sub { font-size: 11px; color: var(--muted); margin-top: 2px; word-break: break-all; }
+    .btn-del { padding: 3px 8px; font-size: 11px; color: var(--danger); border-color: rgba(239,68,68,.4); white-space: nowrap; }
     .room-name { font-size: 17px; font-weight: 700; }
     .temps { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
     .metric { background: #0b1220; padding: 10px; border-radius: 8px; }
@@ -81,21 +85,35 @@
     </div>
   </header>
 
+  <section id="haErrorBox" class="panel" style="display:none;border-color:var(--danger);color:#fecaca;font-size:13px;"></section>
+
   <section id="roomGrid" class="grid"></section>
 
   <section class="panel">
+    <h2><span>보일러 ON/OFF 스윙 온도 &amp; 바닥 마스터 센서 설정</span></h2>
+    <div class="form-grid">
+      <div><label>ON 시 보일러 설정온도 (°C)</label><input id="onSetpoint" type="number" step="0.5" value="24.0" /></div>
+      <div><label>OFF 시 보일러 설정온도 (°C)</label><input id="offSetpoint" type="number" step="0.5" value="15.0" /></div>
+      <div><label>마스터 바닥 온도 센서 엔티티 (1개)</label><input id="masterFloorInput" list="sensorList" placeholder="sensor.floor_temperature" /></div>
+      <div><button class="primary" style="width:100%" onclick="saveSwingSettings()">설정 저장</button></div>
+    </div>
+  </section>
+
+  <section class="panel">
     <h2>
-      <span>방 추가 / 엔티티 매핑</span>
+      <span>방 추가 / 엔티티 매핑 (동일 방 이름으로 재등록 시 수정됨)</span>
     </h2>
     <div class="form-grid">
-      <div><label>방 이름</label><input id="newRoomName" placeholder="예: 작은방" /></div>
-      <div><label>실내 온도 센서 엔티티</label><input id="newRoomTemp" placeholder="sensor.room2_temp" /></div>
-      <div><label>온도조절기(Climate) 엔티티</label><input id="newClimate" placeholder="climate.room2" /></div>
+      <div><label>방 이름</label><input id="newRoomName" placeholder="예: 방3" /></div>
+      <div><label>실내 온도 센서 (_temperature 확인!)</label><input id="newRoomTemp" list="sensorList" placeholder="sensor.room_temperature" /></div>
+      <div><label>온도조절기(Climate) 엔티티</label><input id="newClimate" list="climateList" placeholder="climate.room_heater" /></div>
       <div><label>목표 온도 (°C)</label><input id="newTarget" type="number" step="0.1" value="23.0" /></div>
       <div><label>마스터 바닥 오프셋 (°C)</label><input id="newOffset" type="number" step="0.1" value="0.0" /></div>
       <div><label>바닥 센서 설치 방 여부</label><select id="newHasFloor"><option value="false">없음 (추정)</option><option value="true">있음 (마스터)</option></select></div>
-      <div><button class="primary" style="width:100%" onclick="addRoom()">+ 방 등록</button></div>
+      <div><button class="primary" style="width:100%" onclick="addRoom()">+ 방 등록/수정</button></div>
     </div>
+    <datalist id="sensorList"></datalist>
+    <datalist id="climateList"></datalist>
   </section>
 
   <section class="panel">
@@ -135,25 +153,47 @@ async function api(path, options = {}) {
   return res.json();
 }
 
+async function loadEntities() {
+  try {
+    const data = await api("/ha/entities");
+    document.getElementById("sensorList").innerHTML = (data.sensors || [])
+      .map(s => `<option value="${s.entityId}">${s.name} (${s.state}${s.unit})</option>`).join("");
+    document.getElementById("climateList").innerHTML = (data.climates || [])
+      .map(c => `<option value="${c.entityId}">${c.name} (${c.state})</option>`).join("");
+  } catch (e) {}
+}
+
 async function refresh() {
   const [status, cycles] = await Promise.all([api("/status"), api("/cycles?limit=30")]);
   currentSettings = status.settings;
 
   document.getElementById("subInfo").textContent =
-    `KST ${status.timeKst} · HA 연결: ${status.haConnected ? "정상" : "로컬/테스트 모드"} · 바닥 마스터 센서: ${currentSettings.masterFloorEntity}`;
+    `KST ${status.timeKst} · HA 연결: ${status.haConnected ? "정상" : "미연결(토큰없음)"} · ON:${currentSettings.heatOnSetpoint}°C / OFF:${currentSettings.heatOffSetpoint}°C · 바닥센서: ${currentSettings.masterFloorEntity}`;
   document.getElementById("strategySel").value = currentSettings.zoneStrategy;
   document.getElementById("modelSel").value = currentSettings.predictorModel;
+
+  if (document.activeElement.id !== "onSetpoint") document.getElementById("onSetpoint").value = currentSettings.heatOnSetpoint;
+  if (document.activeElement.id !== "offSetpoint") document.getElementById("offSetpoint").value = currentSettings.heatOffSetpoint;
+  if (document.activeElement.id !== "masterFloorInput") document.getElementById("masterFloorInput").value = currentSettings.masterFloorEntity;
+
+  const errBox = document.getElementById("haErrorBox");
+  if (status.haLastError) {
+    errBox.style.display = "block";
+    errBox.textContent = `HA 엔티티 조회 오류: ${status.haLastError}`;
+  } else {
+    errBox.style.display = "none";
+  }
 
   const dryBtn = document.getElementById("dryRunBtn");
   dryBtn.textContent = currentSettings.dryRun ? "시험 운전(Dry-Run): ON" : "실제 보일러 제어: LIVE";
   dryBtn.className = currentSettings.dryRun ? "" : "heat";
 
-  renderRooms(status.rooms, status.latestByRoom);
+  renderRooms(status.rooms, status.liveByRoom || {}, status.latestByRoom || {});
   renderKpis(status.kpis);
   renderCycles(cycles.items);
 }
 
-function renderRooms(rooms, latestByRoom) {
+function renderRooms(rooms, liveByRoom, latestByRoom) {
   const grid = document.getElementById("roomGrid");
   if (!rooms.length) {
     grid.innerHTML = `<div class="card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:28px;">
@@ -162,26 +202,33 @@ function renderRooms(rooms, latestByRoom) {
     return;
   }
   grid.innerHTML = rooms.map(rm => {
+    const live = liveByRoom[rm.roomName] || {};
     const lat = latestByRoom[rm.roomName] || {};
-    const rt = lat.roomTemp != null ? `${lat.roomTemp.toFixed(1)}°C` : "--";
-    const ft = lat.floorTemp != null ? `${lat.floorTemp.toFixed(1)}°C` : "--";
+    const rVal = live.roomTemp != null ? live.roomTemp : lat.roomTemp;
+    const fVal = live.floorTemp != null ? live.floorTemp : lat.floorTemp;
+    const rt = rVal != null ? `${Number(rVal).toFixed(1)}°C` : "--";
+    const ft = fVal != null ? `${Number(fVal).toFixed(1)}°C` : "--";
     const fSrc = rm.hasFloorSensor ? "실측" : `추정(${rm.floorOffsetC >= 0 ? "+" : ""}${rm.floorOffsetC})`;
     const isAuto = rm.controlMode === "AUTO";
     const isManHeat = !isAuto && rm.manualAction === "HEAT";
     const isManOff = !isAuto && rm.manualAction === "OFF";
     const badgeClass = lat.commandAction === "HEAT" ? "heat" : (lat.safetyReason === "P000_OVERHEAT_CUTOFF" ? "danger" : "ok");
+    const humWarn = rm.roomTempEntity.toLowerCase().includes("humidity")
+      ? `<div style="font-size:11px;color:var(--warn);margin-top:3px;">⚠ 습도(_humidity) 센서가 지정되어 있습니다. 온도(_temperature) 엔티티로 변경하세요.</div>`
+      : "";
 
     return `
       <div class="card">
         <div class="card-head">
-          <div>
+          <div class="card-head-left">
             <div class="room-name">${rm.roomName}</div>
-            <div style="font-size:11px;color:var(--muted);margin-top:2px;">${rm.roomTempEntity} · ${rm.climateEntity}</div>
+            <div class="entity-sub">${rm.roomTempEntity} · ${rm.climateEntity}</div>
+            ${humWarn}
           </div>
-          <div style="display:flex;gap:4px;align-items:center;">
+          <div class="card-head-right">
             <span class="badge ${badgeClass}">${lat.commandAction || "대기"}</span>
             <span class="badge ${isAuto ? "ok" : "warn"}">${isAuto ? "AUTO" : "수동"}</span>
-            <button style="padding:3px 8px;font-size:11px;color:var(--danger);border-color:rgba(239,68,68,.4);" onclick="deleteRoom('${rm.roomName}')">삭제</button>
+            <button class="btn-del" onclick="deleteRoom('${rm.roomName}')">삭제</button>
           </div>
         </div>
         <div class="temps">
@@ -266,6 +313,18 @@ async function updateSettings() {
   await refresh();
 }
 
+async function saveSwingSettings() {
+  await api("/settings", {
+    method: "PATCH",
+    body: JSON.stringify({
+      heatOnSetpoint: Number(document.getElementById("onSetpoint").value),
+      heatOffSetpoint: Number(document.getElementById("offSetpoint").value),
+      masterFloorEntity: document.getElementById("masterFloorInput").value.trim(),
+    }),
+  });
+  await refresh();
+}
+
 async function runNow() {
   await api("/control/run-now", { method: "POST" });
   await refresh();
@@ -305,6 +364,7 @@ async function requestReport() {
   box.textContent = res.report || `상태: ${res.status} (Gemini API 키가 설정되지 않았거나 이력이 부족합니다.)`;
 }
 
+loadEntities();
 refresh();
 setInterval(refresh, 15000);
 </script>

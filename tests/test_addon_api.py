@@ -72,17 +72,33 @@ def test_addon_web_ui_room_target_and_manual_mode(tmp_path: Path):
         assert r_man.json()["controlMode"] == "MANUAL"
         assert r_man.json()["manualAction"] == "HEAT"
 
-        # 5. Run control cycle and verify MANUAL override takes effect
+        # 5. Live status immediately shows real-time room & floor temperatures
+        r_status = client.get("/api/v1/status")
+        assert r_status.status_code == 200
+        live = r_status.json()["liveByRoom"]
+        assert live["거실"]["roomTemp"] == 22.7
+        assert live["거실"]["floorTemp"] == 25.0
+
+        # 6. Enable live dispatch and verify ON->24.0C and OFF->15.0C swing setpoints
+        client.patch("/api/v1/settings", json={"dryRun": False})
+        client.patch("/api/v1/rooms/안방", json={"controlMode": "MANUAL", "manualAction": "OFF"})
         r_run = client.post("/api/v1/control/run-now")
         assert r_run.status_code == 200
         records = {rec["roomName"]: rec for rec in r_run.json()["records"]}
         assert records["거실"]["commandAction"] == "HEAT"
+        assert records["거실"]["commandSetpoint"] == 24.0
         assert records["거실"]["floorSensorSource"] == "MEASURED"
         assert records["안방"]["safetyReason"] == "P000_MANUAL_OVERRIDE"
-        assert records["안방"]["commandAction"] == "HEAT"
+        assert records["안방"]["commandAction"] == "OFF"
+        assert records["안방"]["commandSetpoint"] == 15.0
         assert records["안방"]["floorSensorSource"] == "ESTIMATED"
 
-        # 6. Delete a room and verify it stays deleted
+        # Verify actual HA climate service calls sent 24.0C for ON and 15.0C for OFF
+        temp_calls = {d["entity_id"]: d["temperature"] for _, svc, d in fake_ha.calls if svc == "set_temperature"}
+        assert temp_calls["climate.living_thermostat"] == 24.0
+        assert temp_calls["climate.master_bedroom_thermostat"] == 15.0
+
+        # 7. Delete a room and verify it stays deleted
         r_del = client.delete("/api/v1/rooms/안방")
         assert r_del.status_code == 200
         remaining = [r["roomName"] for r in client.get("/api/v1/rooms").json()]
