@@ -19,8 +19,8 @@ from custom_components.itss.protocols.p200_therm import (
 )
 from custom_components.itss.protocols.p300_atmos import AtmosProtocol
 from custom_components.itss.protocols.p400_circadia import CircadiaProtocol
-from itss_scada.app.db import ScadaDatabase
-from itss_scada.app.rc_optimizer import RCObservation, fit_rc_parameters
+from custom_components.itss.protocols.rc_optimizer import RCObservation, fit_rc_parameters
+from custom_components.itss.storage.db import ScadaDatabase
 
 
 def test_p000_overheat_cutoff():

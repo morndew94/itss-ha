@@ -6,7 +6,6 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any
 
-import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
@@ -19,10 +18,9 @@ from .const import (
     CONF_PREDICTOR_MODEL,
     CONF_ROOM_NAME,
     CONF_ROOM_TEMP_ENTITY,
-    CONF_SCADA_URL,
     CONF_TARGET_TEMP,
     CONF_UPDATE_INTERVAL_SEC,
-    DEFAULT_SCADA_URL,
+    DEFAULT_DB_FILENAME,
     DEFAULT_TARGET_TEMP,
     DEFAULT_UPDATE_INTERVAL_SEC,
     DOMAIN,
@@ -35,6 +33,7 @@ from .protocols.p100_core import compute_opposing_interval, round_thermostat_set
 from .protocols.p200_therm import AdaptiveRCModel, LinearExtrapolationV12, ThermalPredictor
 from .protocols.p300_atmos import AtmosProtocol
 from .protocols.p400_circadia import CircadiaProtocol
+from .storage.db import ScadaDatabase
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -62,6 +61,7 @@ class ItssCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if entry.data.get(CONF_PREDICTOR_MODEL) == MODEL_ADAPTIVE_RC
             else LinearExtrapolationV12()
         )
+        self.db = ScadaDatabase(hass.config.path(DEFAULT_DB_FILENAME))
 
         self._prev_room_temp: float | None = None
         self._prev_floor_temp: float | None = None
@@ -202,24 +202,14 @@ class ItssCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_command_action = record.command_action
             self._last_command_time = now
 
-        await self._async_push_to_scada(record)
+        await self._async_save_cycle(record)
         return record.to_payload()
 
-    async def _async_push_to_scada(self, record: CycleRecord) -> None:
-        """Persist cycle audit record to the I.T.S.S. SCADA Add-on API."""
-        scada_url = self.entry.data.get(CONF_SCADA_URL, DEFAULT_SCADA_URL).rstrip("/")
-        if not scada_url:
-            return
+    async def _async_save_cycle(self, record: CycleRecord) -> None:
+        """Persist cycle audit record directly to the local SQLite database."""
         record.saved_at = now_kst_iso()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{scada_url}/api/v1/cycles",
-                    json=record.to_payload(),
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    if resp.status >= 400:
-                        _LOGGER.warning("SCADA sync returned HTTP %s", resp.status)
+            await self.hass.async_add_executor_job(self.db.insert_cycle, record.to_payload())
         except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("SCADA sync skipped (add-on unreachable): %s", err)
+            _LOGGER.warning("Failed to save I.T.S.S. cycle record: %s", err)
 

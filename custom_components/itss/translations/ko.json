@@ -13,7 +13,6 @@
           "outdoor_temp_entity": "외기 온도 센서 (선택)",
           "target_temp": "목표 온도 (°C)",
           "predictor_model": "P200 예측 모델 (선형 v1.2 / 적응형 RC)",
-          "scada_url": "I.T.S.S. SCADA 애드온 주소",
           "update_interval_sec": "제어 주기 (초)"
         }
       }

@@ -19,7 +19,7 @@ class RCObservation:
 
 
 def fit_rc_parameters(observations: list[RCObservation]) -> dict[str, float | str]:
-    """Estimate 2-node RC parameters using lightweight coordinate search.
+    """Estimate 2-node RC parameters using lightweight bounded coordinate search.
 
     Requires at least 10 valid transitions; otherwise reports insufficient samples.
     """
@@ -50,7 +50,6 @@ def fit_rc_parameters(observations: list[RCObservation]) -> dict[str, float | st
         return err / len(observations)
 
     best_loss = loss(best)
-    # Simple bounded coordinate descent (dependency-free for Alpine containers)
     bounds = {
         "c_floor": (600.0, 5000.0),
         "c_room": (150.0, 2000.0),
@@ -75,4 +74,3 @@ def fit_rc_parameters(observations: list[RCObservation]) -> dict[str, float | st
         "mse": round(best_loss, 6),
         **{k: round(v, 3) for k, v in best.items()},
     }
-

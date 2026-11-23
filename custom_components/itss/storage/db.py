@@ -1,4 +1,4 @@
-"""SQLite persistence layer for I.T.S.S. cycle audit logs."""
+"""SQLite persistence layer for I.T.S.S. cycle audit logs inside Home Assistant."""
 
 from __future__ import annotations
 
@@ -98,4 +98,3 @@ class ScadaDatabase:
                     (limit,),
                 ).fetchall()
         return [json.loads(r["payload_json"]) for r in rows]
-

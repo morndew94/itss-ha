@@ -13,7 +13,6 @@
           "outdoor_temp_entity": "Outdoor Temperature Sensor (Optional)",
           "target_temp": "Target Temperature (C)",
           "predictor_model": "P200 Thermal Predictor Model",
-          "scada_url": "I.T.S.S. SCADA Add-on URL",
           "update_interval_sec": "Control Interval (seconds)"
         }
       }

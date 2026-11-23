@@ -18,7 +18,6 @@ CONF_VALVE_ENTITY = "valve_entity"
 CONF_OUTDOOR_TEMP_ENTITY = "outdoor_temp_entity"
 CONF_TARGET_TEMP = "target_temp"
 CONF_PREDICTOR_MODEL = "predictor_model"
-CONF_SCADA_URL = "scada_url"
 CONF_UPDATE_INTERVAL_SEC = "update_interval_sec"
 
 # Predictor model identifiers (ITSS-P200)
@@ -29,7 +28,7 @@ MODEL_ADAPTIVE_RC = "adaptive_rc"
 DEFAULT_TARGET_TEMP = 23.0
 DEFAULT_CONTROL_BAND_HALF = 0.15  # 0.3 degC total band (+/- 0.15 degC)
 DEFAULT_UPDATE_INTERVAL_SEC = 300  # 5 minutes
-DEFAULT_SCADA_URL = "http://localhost:8099"
+DEFAULT_DB_FILENAME = "itss_scada.db"
 
 # ITSS-P000 SENTINEL default safety limits
 DEFAULT_OVERHEAT_ROOM_C = 27.0

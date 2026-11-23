@@ -16,10 +16,8 @@ from .const import (
     CONF_PREDICTOR_MODEL,
     CONF_ROOM_NAME,
     CONF_ROOM_TEMP_ENTITY,
-    CONF_SCADA_URL,
     CONF_TARGET_TEMP,
     CONF_UPDATE_INTERVAL_SEC,
-    DEFAULT_SCADA_URL,
     DEFAULT_TARGET_TEMP,
     DEFAULT_UPDATE_INTERVAL_SEC,
     DOMAIN,
@@ -63,7 +61,6 @@ class ItssConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_PREDICTOR_MODEL, default=MODEL_LINEAR_V12): selector.SelectSelector(
                     selector.SelectSelectorConfig(options=[MODEL_LINEAR_V12, MODEL_ADAPTIVE_RC])
                 ),
-                vol.Optional(CONF_SCADA_URL, default=DEFAULT_SCADA_URL): str,
                 vol.Optional(
                     CONF_UPDATE_INTERVAL_SEC, default=DEFAULT_UPDATE_INTERVAL_SEC
                 ): vol.Coerce(int),
