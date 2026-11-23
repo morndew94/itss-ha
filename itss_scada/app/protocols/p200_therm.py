@@ -20,7 +20,7 @@ class ResidualHeatStats:
 
     sample_count: int = 0
     mean_rise_c: float = 0.0
-    min_samples_required: int = 5
+    min_samples_required: int = 2
 
     def status(self, is_transient: bool = False) -> str:
         """Return explicit learning readiness state."""
@@ -28,6 +28,8 @@ class ResidualHeatStats:
             return "TRANSIENT_SKIP"
         if self.sample_count < self.min_samples_required:
             return "INSUFFICIENT_SAMPLES"
+        if self.sample_count < 5:
+            return "LEARNING"
         return "READY"
 
 
@@ -67,13 +69,14 @@ class LinearExtrapolationV12(ThermalPredictor):
         f_pred = data.floor_temp + data.v_floor_per_min * data.horizon_min
         r_pred = data.room_temp + data.v_room_per_min * data.horizon_min
 
-        # Apply learned residual rise only when learning state is READY
-        residual_rise = stats.mean_rise_c if learning_status == "READY" else 0.0
+        # Apply learned residual rise when learning state is LEARNING or READY
+        use_residual = learning_status in ("LEARNING", "READY")
+        residual_rise = stats.mean_rise_c if use_residual else 0.0
         upper_bound = effective_target + self.band_half_c
         lower_bound = effective_target - self.band_half_c
 
         if data.is_heating:
-            # Predictive OFF when projected room temp + residual exceeds upper band
+            # Predictive OFF when projected room temp + learned residual exceeds upper band
             action = "OFF" if (r_pred + residual_rise) >= upper_bound else "HEAT"
         else:
             # Predictive ON when projected room temp falls below lower band
@@ -86,7 +89,7 @@ class LinearExtrapolationV12(ThermalPredictor):
             predicted_floor_temp=round(f_pred, 2),
             effective_target_temp=round(effective_target, 2),
             residual_learning_status=learning_status,
-            estimated_residual_rise_c=round(residual_rise, 2) if learning_status == "READY" else None,
+            estimated_residual_rise_c=round(residual_rise, 2) if use_residual else None,
             diagnostics={
                 "v_room_per_min": data.v_room_per_min,
                 "v_floor_per_min": data.v_floor_per_min,
@@ -182,23 +185,27 @@ class AdaptiveRCModel(ThermalPredictor):
 
         upper_bound = effective_target + self.band_half_c
         lower_bound = effective_target - self.band_half_c
-        residual_rise = max(0.0, r_coast - data.room_temp)
+        # Combine physics coasting with learned empirical residual rise (take conservative max)
+        physics_residual = max(0.0, r_coast - data.room_temp)
+        learned_residual = stats.mean_rise_c if learning_status in ("LEARNING", "READY") else 0.0
+        residual_rise = max(physics_residual, learned_residual)
+        projected_coast = max(r_coast, data.room_temp + learned_residual)
 
         if data.is_heating:
-            # Cut off early if coasting alone reaches or exceeds target band
-            if r_coast >= effective_target or r_heat >= upper_bound:
+            # Cut off early if coasting or learned residual reaches target band
+            if projected_coast >= effective_target or r_heat >= upper_bound:
                 action = "OFF"
-                pred_f, pred_r = f_coast, r_coast
+                pred_f, pred_r = f_coast, projected_coast
             else:
                 action = "HEAT"
                 pred_f, pred_r = f_heat, r_heat
         else:
-            if r_coast <= lower_bound:
+            if projected_coast <= lower_bound:
                 action = "HEAT"
                 pred_f, pred_r = f_heat, r_heat
             else:
                 action = "OFF"
-                pred_f, pred_r = f_coast, r_coast
+                pred_f, pred_r = f_coast, projected_coast
 
         return ThermalPrediction(
             model_name=self.model_name,

@@ -64,7 +64,7 @@ def test_p200_linear_v12_and_rc_shared_interface():
         v_room_per_min=0.01,
         outdoor_temp=2.0,
     )
-    linear_pred = LinearExtrapolationV12().predict(thermal_input, ResidualHeatStats(sample_count=2))
+    linear_pred = LinearExtrapolationV12().predict(thermal_input, ResidualHeatStats(sample_count=1))
     assert linear_pred.residual_learning_status == "INSUFFICIENT_SAMPLES"
     assert linear_pred.recommended_action == "OFF"
 

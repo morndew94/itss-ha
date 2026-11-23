@@ -33,10 +33,12 @@ from .protocols.p200_therm import (
     AdaptiveRCModel,
     LinearExtrapolationV12,
     RCParameters,
+    ResidualHeatStats,
     ThermalPredictor,
 )
 from .protocols.p300_atmos import AtmosProtocol
 from .protocols.rc_optimizer import RCObservation, fit_rc_parameters
+from .protocols.thermal_lag_learner import learn_room_lag_profile
 from .storage.db import ScadaDatabase
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -255,7 +257,9 @@ class ItssEngine:
             "notifyEvents": bool(saved_settings.get("notifyEvents", True)),
         }
         self.active_preset: str = str(self.db.get_kv("active_preset", "AUTO_ALL"))
-        self.room_timers: dict[str, dict[str, str | None]] = self.db.get_kv("room_timers", {})
+        self.room_timers: dict[str, dict[str, Any]] = self.db.get_kv("room_timers", {})
+        self.lag_profiles: dict[str, dict[str, Any]] = {}
+        self._cycle_counter: int = 0
 
         gemini_key = str(opts.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
         self.weather_client = GoogleWeatherClient(gemini_key, self.settings["weatherLocation"]) if gemini_key else None
@@ -268,6 +272,93 @@ class ItssEngine:
         )
         self.sentinel = SentinelProtocol()
         self.atmos = AtmosProtocol()
+
+        # Recompute learned thermal lags and restore active residual cooldowns across restarts
+        self.refresh_lag_profiles()
+        self._restore_cooldowns_from_history()
+
+    def refresh_lag_profiles(self) -> dict[str, dict[str, Any]]:
+        """Learn per-room floor/room rise dead-times and post-OFF residual peaks from cycles DB."""
+        cycles = self.db.list_cycles(limit=1000)
+        base_cd = int(self.settings["cooldownMin"])
+        profiles: dict[str, dict[str, Any]] = {}
+        for rm in self.db.list_rooms():
+            r_name = rm["roomName"]
+            prof = learn_room_lag_profile(r_name, cycles, base_cooldown_min=base_cd)
+            profiles[r_name] = prof.to_dict()
+        self.lag_profiles = profiles
+        self.db.set_kv("thermal_lag_profiles", profiles)
+        return profiles
+
+    def _restore_cooldowns_from_history(self) -> None:
+        """Guarantee residual-heat cooldown survives add-on restarts.
+
+        Scans recent cycles per room: if the room recently transitioned from HEAT to OFF
+        (or was already in P000_RESIDUAL_COOLDOWN) within its effective cooldown window,
+        preserves/reconstructs cooldownUntil so restart never triggers immediate re-heating.
+        """
+        now = datetime.now(tz=KST)
+        changed = False
+        for rm in self.db.list_rooms():
+            r_name = rm["roomName"]
+            tm = self.room_timers.setdefault(r_name, {"heatingStartedAt": None, "cooldownUntil": None})
+            # Check if persisted cooldownUntil is already active in the future
+            existing_cd = tm.get("cooldownUntil")
+            if existing_cd:
+                try:
+                    if datetime.fromisoformat(str(existing_cd)) > now:
+                        continue
+                except ValueError:
+                    pass
+
+            recent = self.db.list_cycles(room_name=r_name, limit=60)
+            if not recent:
+                continue
+
+            prof = self.lag_profiles.get(r_name) or {}
+            cd_min = int(prof.get("recommendedCooldownMin", self.settings["cooldownMin"]))
+            latest = recent[0]
+            # Only protect rooms that are currently OFF / in residual cooldown
+            latest_on = (
+                latest.get("combustionConfirmed") is True
+                or (latest.get("combustionConfirmed") is None and latest.get("commandAction") == "HEAT")
+            )
+            if latest_on:
+                continue
+
+            # Find the most recent HEAT -> OFF boundary in chronological order (recent is DESC)
+            off_boundary_ts: datetime | None = None
+            for idx in range(len(recent) - 1):
+                curr_c = recent[idx]
+                prev_c = recent[idx + 1]
+                prev_on = (
+                    prev_c.get("combustionConfirmed") is True
+                    or (prev_c.get("combustionConfirmed") is None and prev_c.get("commandAction") == "HEAT")
+                )
+                curr_off = curr_c.get("commandAction") == "OFF" or curr_c.get("safetyReason") in (
+                    "P000_RESIDUAL_COOLDOWN",
+                    "P000_MAX_RUN_CUTOFF",
+                    "P000_FLOOR_LIMIT_OFF",
+                    "P000_OVERHEAT_CUTOFF",
+                    "P200_PREDICTIVE_OFF",
+                    "HYBRID_EARLY_CUTOFF",
+                )
+                if prev_on and curr_off and curr_c.get("executionStartedAt"):
+                    try:
+                        off_boundary_ts = datetime.fromisoformat(str(curr_c["executionStartedAt"]))
+                    except ValueError:
+                        off_boundary_ts = None
+                    break
+
+            if off_boundary_ts is not None:
+                until = off_boundary_ts + timedelta(minutes=cd_min)
+                if until > now:
+                    tm["cooldownUntil"] = until.isoformat(timespec="seconds")
+                    tm["heatingStartedAt"] = None
+                    changed = True
+
+        if changed:
+            self.db.set_kv("room_timers", self.room_timers)
 
     def apply_preset(self, preset: str) -> dict[str, Any]:
         """Apply one-touch preset (AUTO_ALL / AWAY / SLEEP / PREHEAT / ALL_OFF)."""
@@ -331,7 +422,12 @@ class ItssEngine:
                     self.db.update_room_control(rm["roomName"], floor_offset_c=est_offset)
                     offset_updates[rm["roomName"]] = est_offset
 
-        return {"rcFit": rc_result, "updatedFloorOffsets": offset_updates}
+        lag_profiles = self.refresh_lag_profiles()
+        return {
+            "rcFit": rc_result,
+            "updatedFloorOffsets": offset_updates,
+            "thermalLagProfiles": lag_profiles,
+        }
 
     async def _read_outdoor_weather(self) -> tuple[float | None, float | None]:
         """Read outdoor temp/wind from configured HA sensor/weather entity or Gemini grounding."""
@@ -471,6 +567,11 @@ class ItssEngine:
         schedule_offset, _ = self.db.active_schedule_offset(now.hour)
         preset_offset = PRESET_OFFSETS.get(self.active_preset, 0.0)
 
+        # Periodically refresh learned floor/room lag profiles from accumulating cycles
+        self._cycle_counter += 1
+        if self._cycle_counter % 30 == 0 or not self.lag_profiles:
+            self.refresh_lag_profiles()
+
         telemetry: dict[str, dict[str, Any]] = {}
         auto_zone_readings: list[ZoneReading] = []
         p200_by_room: dict[str, Any] = {}
@@ -526,7 +627,13 @@ class ItssEngine:
 
             eff_target = round(rm["targetTemp"] + atmos_offset + schedule_offset + preset_offset, 2)
 
-            # Run P200 predictive engine (Linear v1.2 or Adaptive RC) whenever temps are available
+            # Run P200 predictive engine using learned room/floor thermal lag & residual rise
+            lag_prof = self.lag_profiles.get(r_name) or {}
+            learned_horizon = int(lag_prof.get("recommendedHorizonMin", 30))
+            learned_stats = ResidualHeatStats(
+                sample_count=int(lag_prof.get("sampleCount", 0)),
+                mean_rise_c=float(lag_prof.get("roomResidualRiseC", 0.0)),
+            )
             if r_temp is not None and eff_floor is not None:
                 p200_by_room[r_name] = predictor.predict(
                     ThermalInput(
@@ -539,7 +646,9 @@ class ItssEngine:
                         outdoor_temp=outdoor_temp,
                         atmos_loss_offset_c=atmos_offset,
                         circadia_target_offset_c=schedule_offset + preset_offset,
-                    )
+                        horizon_min=learned_horizon,
+                    ),
+                    residual_stats=learned_stats,
                 )
 
             telemetry[r_name] = {
@@ -636,6 +745,12 @@ class ItssEngine:
                 (t["roomTemp"] is not None and t["roomTemp"] >= 27.0)
                 or (eff_floor is not None and eff_floor >= 29.0)
             )
+            lag_prof = self.lag_profiles.get(r_name) or {}
+            room_max_run_min = max(
+                5.0,
+                min(15.0, max_run_min - float(lag_prof.get("recommendedRunTrimMin", 0.0))),
+            )
+            room_cooldown_min = int(lag_prof.get("recommendedCooldownMin", self.settings["cooldownMin"]))
             tm = self.room_timers.setdefault(r_name, {"heatingStartedAt": None, "cooldownUntil": None})
             decision_reason = "P000_OK"
 
@@ -646,7 +761,7 @@ class ItssEngine:
                 record.execution_status = "SKIPPED_SAFETY"
                 tm["heatingStartedAt"] = None
                 tm["cooldownUntil"] = (
-                    now + timedelta(minutes=int(self.settings["cooldownMin"]))
+                    now + timedelta(minutes=room_cooldown_min)
                 ).isoformat(timespec="seconds")
             elif is_manual:
                 decision_reason = "P000_MANUAL_OVERRIDE"
@@ -659,7 +774,7 @@ class ItssEngine:
                     is_heating=t["isHeating"],
                     v_room_per_min=t["vRoom"],
                     continuous_run_min=t["runMin"],
-                    max_run_min=max_run_min,
+                    max_run_min=room_max_run_min,
                     cooldown_remaining_min=t["cdMin"],
                 )
                 record.safety_reason = verdict.reason_code
@@ -670,7 +785,7 @@ class ItssEngine:
                     if verdict.reason_code in ("P000_MAX_RUN_CUTOFF", "P000_FLOOR_LIMIT_OFF"):
                         tm["heatingStartedAt"] = None
                         tm["cooldownUntil"] = (
-                            now + timedelta(minutes=int(self.settings["cooldownMin"]))
+                            now + timedelta(minutes=room_cooldown_min)
                         ).isoformat(timespec="seconds")
                 elif verdict.hold_current_state or r_name not in mz_by_room:
                     decision_reason = verdict.reason_code
@@ -697,9 +812,15 @@ class ItssEngine:
                     record.safety_reason = decision_reason
 
             prev_run_min = t["runMin"]
+            was_heating = t["isHeating"] or (tm.get("heatingStartedAt") is not None)
             if record.command_action == "HEAT" and not tm.get("heatingStartedAt"):
                 tm["heatingStartedAt"] = now.isoformat(timespec="seconds")
             elif record.command_action == "OFF":
+                # Enter residual-heat soak cooldown on ANY HEAT -> OFF transition (survives restarts)
+                if was_heating and not is_manual and t["cdMin"] <= 0:
+                    tm["cooldownUntil"] = (
+                        now + timedelta(minutes=room_cooldown_min)
+                    ).isoformat(timespec="seconds")
                 tm["heatingStartedAt"] = None
 
             if record.command_action in ("HEAT", "OFF"):
@@ -719,7 +840,7 @@ class ItssEngine:
                     pred_room=record.predicted_room_30m,
                     setpoint=record.command_setpoint,
                     run_min=prev_run_min,
-                    max_run_min=max_run_min,
+                    max_run_min=room_max_run_min,
                 )
 
             record.saved_at = now_kst_iso()
@@ -889,6 +1010,7 @@ def create_app(
                 gas_krw_per_hour=engine.settings["gasKrwPerHour"],
             ),
             "fittedRcParams": engine.db.get_kv("fitted_rc_params"),
+            "thermalLagProfiles": engine.lag_profiles,
         }
 
     @app.get("/api/v1/ha/entities")
