@@ -419,7 +419,7 @@
     <header>
       <div class="title">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-          <h1>I.T.S.S. Thermal SCADA Dashboard v2.6.0</h1>
+          <h1>I.T.S.S. Thermal SCADA Dashboard <span id="appVer">v2.6.1</span></h1>
           <span id="globalBoilerPill" class="boiler-pill stopped">보일러 상태 확인중</span>
         </div>
         <p id="subInfo">로딩 중...</p>
@@ -677,6 +677,7 @@
         api("/schedules"),
       ]);
       currentSettings = status.settings;
+      if (status.appVersion) document.getElementById("appVer").textContent = `v${status.appVersion}`;
       activeMaxRunMin = status.activeMaxRunMin ?? currentSettings.maxRunCapMin ?? 15;
       allCycles = cycles.items || [];
       currentSchedules = schedules;

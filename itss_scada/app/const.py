@@ -3,7 +3,7 @@
 from datetime import timedelta, timezone
 
 DOMAIN = "itss"
-VERSION = "1.0.0"
+VERSION = "2.6.1"
 
 # Korea Standard Time (UTC+9)
 KST = timezone(timedelta(hours=9))

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -20,6 +20,7 @@ from .const import (
     MODEL_ADAPTIVE_RC,
     MODEL_LINEAR_V12,
     STRATEGY_HYBRID,
+    VERSION,
 )
 from .ha_client import HomeAssistantClient
 from .integrations.google_alerts import GeminiTTSAlert
@@ -1099,6 +1100,14 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        print(
+            f"[ITSS] Starting I.T.S.S. Thermal SCADA v{VERSION} "
+            f"(build={os.environ.get('ITSS_BUILD_VERSION', VERSION)}, "
+            f"interval={engine.settings['updateIntervalSec']}s, "
+            f"dryRun={engine.settings['dryRun']}, "
+            f"haConnected={engine.ha.is_configured})",
+            flush=True,
+        )
         stop_event = asyncio.Event()
 
         async def _loop():
@@ -1118,17 +1127,31 @@ def create_app(
             stop_event.set()
             task.cancel()
 
-    app = FastAPI(title="I.T.S.S. Thermal SCADA", version="2.0.0", lifespan=lifespan)
+    app = FastAPI(title="I.T.S.S. Thermal SCADA", version=VERSION, lifespan=lifespan)
     app.state.engine = engine
+
+    NO_CACHE_HEADERS = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+
+    @app.middleware("http")
+    async def disable_ingress_cache(request: Request, call_next):
+        response = await call_next(request)
+        for k, v in NO_CACHE_HEADERS.items():
+            response.headers[k] = v
+        return response
 
     @app.get("/")
     def index():
-        return FileResponse(STATIC_DIR / "index.html")
+        return FileResponse(STATIC_DIR / "index.html", headers=NO_CACHE_HEADERS)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
         return {
             "status": "ok",
+            "appVersion": VERSION,
             "timeKst": now_kst_iso(),
             "haConnected": engine.ha.is_configured,
             "tokenSource": getattr(engine.ha, "token_source", "mock"),
@@ -1197,6 +1220,7 @@ def create_app(
             }
 
         return {
+            "appVersion": VERSION,
             "timeKst": now_kst_iso(),
             "haConnected": engine.ha.is_configured,
             "tokenSource": getattr(engine.ha, "token_source", "mock"),
