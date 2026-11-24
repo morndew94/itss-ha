@@ -127,9 +127,9 @@ class HomeAssistantClient:
         return val, updated_iso, age_sec
 
     async def list_entities(self) -> dict[str, list[dict[str, Any]]]:
-        """Return temperature sensors, all sensors, climate, and notify entities from HA."""
+        """Return temperature sensors, all sensors, climate, window binary_sensors, and notify entities."""
         if not self.is_configured:
-            return {"tempSensors": [], "sensors": [], "climates": [], "notifies": []}
+            return {"tempSensors": [], "sensors": [], "climates": [], "windowSensors": [], "notifies": []}
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{self.base_url}/states", headers=self._headers())
@@ -137,11 +137,12 @@ class HomeAssistantClient:
                 items = resp.json()
         except Exception as err:  # noqa: BLE001
             self.last_state_error = f"HA states list error: {err}"
-            return {"tempSensors": [], "sensors": [], "climates": [], "notifies": []}
+            return {"tempSensors": [], "sensors": [], "climates": [], "windowSensors": [], "notifies": []}
 
         temp_sensors: list[dict[str, Any]] = []
         sensors: list[dict[str, Any]] = []
         climates: list[dict[str, Any]] = []
+        window_sensors: list[dict[str, Any]] = []
         notifies: list[dict[str, Any]] = []
         for it in items:
             eid = str(it.get("entity_id", ""))
@@ -169,17 +170,24 @@ class HomeAssistantClient:
                 entry["temperature"] = attrs.get("temperature")
                 entry["currentTemperature"] = attrs.get("current_temperature")
                 climates.append(entry)
+            elif eid.startswith("binary_sensor."):
+                window_sensors.append(entry)
             elif eid.startswith("notify."):
                 notifies.append(entry)
 
         temp_sensors.sort(key=lambda x: x["entityId"])
         sensors.sort(key=lambda x: x["entityId"])
         climates.sort(key=lambda x: x["entityId"])
+        # Sort window/door/opening device classes to the top for easy selection
+        window_sensors.sort(
+            key=lambda x: (0 if x["deviceClass"] in ("window", "door", "opening") else 1, x["entityId"])
+        )
         notifies.sort(key=lambda x: x["entityId"])
         return {
             "tempSensors": temp_sensors,
             "sensors": sensors,
             "climates": climates,
+            "windowSensors": window_sensors,
             "notifies": notifies,
         }
 

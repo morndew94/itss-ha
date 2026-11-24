@@ -40,6 +40,7 @@ class ScadaDatabase:
                     room_name TEXT PRIMARY KEY,
                     room_temp_entity TEXT NOT NULL,
                     climate_entity TEXT NOT NULL,
+                    window_sensor_entity TEXT NOT NULL DEFAULT '',
                     has_floor_sensor INTEGER NOT NULL DEFAULT 0,
                     floor_offset_c REAL NOT NULL DEFAULT 0.0,
                     target_temp REAL NOT NULL DEFAULT 23.0,
@@ -95,6 +96,10 @@ class ScadaDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_cycles_room_time "
                 "ON cycles (room_name, execution_started_at DESC)"
             )
+            # Safe schema migration for existing DBs upgrading to v2.5.0
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(rooms)").fetchall()}
+            if "window_sensor_entity" not in cols:
+                conn.execute("ALTER TABLE rooms ADD COLUMN window_sensor_entity TEXT NOT NULL DEFAULT ''")
             # Initialize default P400 schedule slots once
             cnt = conn.execute("SELECT COUNT(*) FROM schedules").fetchone()[0]
             if cnt == 0:
@@ -170,13 +175,14 @@ class ScadaDatabase:
             conn.execute(
                 """
                 INSERT INTO rooms (
-                    room_name, room_temp_entity, climate_entity,
+                    room_name, room_temp_entity, climate_entity, window_sensor_entity,
                     has_floor_sensor, floor_offset_c, target_temp,
                     control_mode, manual_action, weight, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(room_name) DO UPDATE SET
                     room_temp_entity=excluded.room_temp_entity,
                     climate_entity=excluded.climate_entity,
+                    window_sensor_entity=excluded.window_sensor_entity,
                     has_floor_sensor=excluded.has_floor_sensor,
                     floor_offset_c=excluded.floor_offset_c,
                     target_temp=excluded.target_temp,
@@ -189,6 +195,7 @@ class ScadaDatabase:
                     room["roomName"],
                     room["roomTempEntity"],
                     room["climateEntity"],
+                    str(room.get("windowSensorEntity", "") or "").strip(),
                     1 if room.get("hasFloorSensor") else 0,
                     float(room.get("floorOffsetC", 0.0)),
                     round(float(room.get("targetTemp", 23.0)), 1),
@@ -245,6 +252,7 @@ class ScadaDatabase:
             "roomName": row["room_name"],
             "roomTempEntity": row["room_temp_entity"],
             "climateEntity": row["climate_entity"],
+            "windowSensorEntity": row["window_sensor_entity"] if "window_sensor_entity" in row.keys() else "",
             "hasFloorSensor": bool(row["has_floor_sensor"]),
             "floorOffsetC": row["floor_offset_c"],
             "targetTemp": row["target_temp"],

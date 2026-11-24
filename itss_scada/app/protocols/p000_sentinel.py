@@ -45,6 +45,10 @@ class SentinelProtocol:
         continuous_run_min: float | None = None,
         max_run_min: float | None = None,
         cooldown_remaining_min: float | None = None,
+        window_open: bool = False,
+        drop_5m_room_c: float | None = None,
+        drop_5m_floor_c: float | None = None,
+        ventilation_remaining_min: float | None = None,
     ) -> SafetyVerdict:
         """Run prioritized safety checks.
 
@@ -146,14 +150,42 @@ class SentinelProtocol:
                 message=f"Residual heat soak cooldown active ({cooldown_remaining_min:.1f}m remaining).",
             )
 
-        # 5. Ventilation rapid temperature drop protection
-        if v_room_per_min <= self.config.ventilation_drop_rate_per_min:
+        # 6a. Physical window contact sensor open (0-second immediate cutoff)
+        if window_open:
+            return SafetyVerdict(
+                allow_heating=False,
+                force_off=True,
+                hold_current_state=False,
+                reason_code="P000_WINDOW_OPEN",
+                message="Window open sensor active; pausing heating immediately.",
+            )
+
+        # 6b. Ventilation rapid drop detection (1-min slope OR 5-min air-only drop cross-checked with floor)
+        air_only_5m_drop = (
+            drop_5m_room_c is not None
+            and drop_5m_room_c <= -0.5
+            and (drop_5m_floor_c is None or drop_5m_floor_c > -0.2)
+        )
+        if v_room_per_min <= self.config.ventilation_drop_rate_per_min or air_only_5m_drop:
             return SafetyVerdict(
                 allow_heating=False,
                 force_off=True,
                 hold_current_state=False,
                 reason_code="P000_VENTILATION_PROTECT",
-                message=f"Rapid indoor drop ({v_room_per_min:.3f} C/min) detected; pausing heat.",
+                message=(
+                    f"Ventilation drop detected (1m={v_room_per_min:.3f} C/min, "
+                    f"5m={drop_5m_room_c}); latching ventilation hold."
+                ),
+            )
+
+        # 6c. Active ventilation hold / post-window-close natural recovery wait
+        if ventilation_remaining_min is not None and ventilation_remaining_min > 0:
+            return SafetyVerdict(
+                allow_heating=False,
+                force_off=True,
+                hold_current_state=False,
+                reason_code="P000_VENTILATION_HOLD",
+                message=f"Ventilation recovery hold active ({ventilation_remaining_min:.1f}m remaining).",
             )
 
         # 6. Anti-chattering minimum dwell time

@@ -113,3 +113,60 @@ def test_thermal_lag_learner_extracts_floor_and_room_delays():
     assert prof.recommended_cooldown_min == 22
     assert prof.recommended_run_trim_min >= 1.0
 
+    # Verify ventilation-contaminated episodes are excluded from lag learning
+    vent_cycles = []
+    for c in cycles:
+        vc = dict(c)
+        if vc["commandAction"] == "OFF":
+            vc["safetyReason"] = "P000_VENTILATION_PROTECT"
+        vent_cycles.append(vc)
+    vent_prof = learn_room_lag_profile("방3", vent_cycles)
+    assert vent_prof.sample_count == 0
+    assert vent_prof.status == "INSUFFICIENT_SAMPLES"
+
+
+def test_ventilation_5m_window_latch_and_contact_sensor(tmp_path: Path):
+    from itss_scada.app.protocols.p000_sentinel import SentinelProtocol
+    from itss_scada.app.models.schema import SensorSnapshot
+
+    sentinel = SentinelProtocol()
+    snap = SensorSnapshot("방3", room_temp=20.8, floor_temp=25.0)
+
+    # 5-min air-only drop (-0.6C room, 0.0C floor) triggers ventilation even if 1m slope is gentle
+    v5 = sentinel.evaluate(snap, is_heating=False, v_room_per_min=-0.10, drop_5m_room_c=-0.6, drop_5m_floor_c=0.0)
+    assert v5.force_off is True
+    assert v5.reason_code == "P000_VENTILATION_PROTECT"
+
+    # Normal cooling where both air and floor cool together does NOT false-trigger ventilation
+    v_norm = sentinel.evaluate(snap, is_heating=False, v_room_per_min=-0.05, drop_5m_room_c=-0.5, drop_5m_floor_c=-0.4)
+    assert v_norm.reason_code == "P000_OK"
+
+    # Physical window contact sensor open -> 0-sec immediate cutoff
+    v_win = sentinel.evaluate(snap, is_heating=True, window_open=True)
+    assert v_win.force_off is True
+    assert v_win.reason_code == "P000_WINDOW_OPEN"
+
+    # One-touch VENTILATION preset latches hold and survives restart
+    db_file = str(tmp_path / "vent.db")
+    ha = StaticFakeHA(room_temp=20.5, floor_temp=25.0, heating=False)
+    app1 = create_app(db_path=db_file, ha_client=ha)
+    with TestClient(app1) as c1:
+        c1.patch("/api/v1/settings", json={"masterFloorEntity": "sensor.floor_temp", "ventilationHoldMin": 20})
+        c1.post("/api/v1/rooms", json={
+            "roomName": "방3",
+            "roomTempEntity": "sensor.room_temp",
+            "climateEntity": "climate.room_heater",
+            "windowSensorEntity": "binary_sensor.room_window",
+            "hasFloorSensor": True,
+            "targetTemp": 22.5,
+        })
+        p_res = c1.post("/api/v1/preset", json={"preset": "VENTILATION"}).json()
+        assert p_res["ventilationHoldMin"] == 20
+
+    # After simulated restart, ventilation hold MUST remain active
+    app2 = create_app(db_path=db_file, ha_client=ha)
+    with TestClient(app2) as c2:
+        r2 = c2.post("/api/v1/control/run-now").json()
+        assert r2["records"][0]["safetyReason"] == "P000_VENTILATION_HOLD"
+        assert r2["records"][0]["commandAction"] == "OFF"
+

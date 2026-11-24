@@ -151,6 +151,9 @@ def learn_room_lag_profile(
         best_floor = off_floor
         best_floor_min = 0.0
         soak_duration = 0.0
+        ventilation_contaminated = str(c_off.get("safetyReason") or "").startswith(
+            ("P000_VENTILATION", "P000_WINDOW_OPEN")
+        )
 
         k = j + 1
         while k < n and not _is_heating_cycle(rows[k][1]):
@@ -158,6 +161,8 @@ def learn_room_lag_profile(
             after_off = (tk - t_off).total_seconds() / 60.0
             if after_off > 60.0:
                 break
+            if str(ck.get("safetyReason") or "").startswith(("P000_VENTILATION", "P000_WINDOW_OPEN")):
+                ventilation_contaminated = True
             soak_duration = after_off
 
             # Continue detecting delayed room rise even after boiler turned OFF
@@ -177,8 +182,8 @@ def learn_room_lag_profile(
                     best_floor_min = after_off
             k += 1
 
-        # Record post-OFF residual episode only when soak window was observed >= 5 min
-        if soak_duration >= 5.0:
+        # Record post-OFF residual episode only when soak >= 5 min and not contaminated by ventilation
+        if soak_duration >= 5.0 and not ventilation_contaminated:
             room_rise = max(0.0, round(best_room - off_room, 2))
             if room_rise <= 2.5:  # Ignore abnormal sensor jumps
                 room_off_rises.append(room_rise)

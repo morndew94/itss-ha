@@ -1,5 +1,5 @@
 name: "I.T.S.S. Thermal SCADA"
-version: "2.4.1"
+version: "2.5.0"
 slug: "itss_scada"
 description: "0.3C Ondol precision heating SCADA add-on with Ingress Web UI, 24h chart, presets, P400 scheduler, 1-click RC fitting, boiler cost stats, and HA/Telegram alerts."
 url: "https://github.com/morndew94/itss-ha"
@@ -30,6 +30,7 @@ options:
   floor_off_limit_c: 26.5
   max_run_cap_min: 15
   cooldown_min: 20
+  ventilation_hold_min: 20
   master_floor_entity: ""
   outdoor_temp_entity: ""
   gas_krw_per_hour: 1200
@@ -50,6 +51,7 @@ schema:
   floor_off_limit_c: float(22,29)
   max_run_cap_min: int(3,15)
   cooldown_min: int(5,90)
+  ventilation_hold_min: int(5,60)
   master_floor_entity: str?
   outdoor_temp_entity: str?
   gas_krw_per_hour: int(100,10000)

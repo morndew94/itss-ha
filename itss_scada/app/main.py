@@ -48,6 +48,7 @@ PRESET_OFFSETS = {
     "AWAY": -2.0,
     "SLEEP": -0.3,
     "PREHEAT": 0.2,
+    "VENTILATION": 0.0,
     "ALL_OFF": 0.0,
 }
 
@@ -56,7 +57,9 @@ REASON_KO = {
     "P000_FLOOR_LIMIT_OFF": "바닥 온도 상한 도달(잔열 과다 방지 차단)",
     "P000_MAX_RUN_CUTOFF": "외기 연동 1회 최대 가동 시간 도달(잔열 휴지 진입)",
     "P000_RESIDUAL_COOLDOWN": "차단 후 잔열 흡수 대기 중",
-    "P000_VENTILATION_PROTECT": "환기 급락 감지(난방 일시 중지)",
+    "P000_WINDOW_OPEN": "창문 열림 센서 감지(즉시 난방 중지)",
+    "P000_VENTILATION_PROTECT": "환기 급락 감지(1분 급락/5분 공기급랭 -> 환기 보호 유지 시작)",
+    "P000_VENTILATION_HOLD": "환기 보호 및 자연 회복 대기 중",
     "P000_SENSOR_MISSING": "온도 센서 값 누락으로 안전 차단",
     "P000_SENSOR_STALE": "온도 센서 장시간 미갱신으로 안전 차단",
     "P000_ANTI_CHATTER": "최소 가동/휴지 시간 유지(채터링 방지)",
@@ -85,6 +88,7 @@ class RoomCreateRequest(BaseModel):
     roomName: str = Field(..., min_length=1)
     roomTempEntity: str = Field(..., min_length=1)
     climateEntity: str = Field(..., min_length=1)
+    windowSensorEntity: str = ""
     hasFloorSensor: bool = False
     floorOffsetC: float = 0.0
     targetTemp: float = Field(default=23.0, ge=10.0, le=27.0)
@@ -112,12 +116,13 @@ class SettingsPatchRequest(BaseModel):
     floorOffLimitC: float | None = Field(default=None, ge=22.0, le=29.0)
     maxRunCapMin: int | None = Field(default=None, ge=3, le=15)
     cooldownMin: int | None = Field(default=None, ge=5, le=90)
+    ventilationHoldMin: int | None = Field(default=None, ge=5, le=60)
     gasKrwPerHour: int | None = Field(default=None, ge=100, le=10000)
     notifyEvents: bool | None = None
 
 
 class PresetRequest(BaseModel):
-    preset: str = Field(..., pattern="^(AUTO_ALL|AWAY|SLEEP|PREHEAT|ALL_OFF)$")
+    preset: str = Field(..., pattern="^(AUTO_ALL|AWAY|SLEEP|PREHEAT|VENTILATION|ALL_OFF)$")
 
 
 class ScheduleSlot(BaseModel):
@@ -254,6 +259,7 @@ class ItssEngine:
             "floorOffLimitC": float(saved_settings.get("floorOffLimitC", opts.get("floor_off_limit_c", 26.5))),
             "maxRunCapMin": min(15, int(saved_settings.get("maxRunCapMin", opts.get("max_run_cap_min", 15)))),
             "cooldownMin": int(saved_settings.get("cooldownMin", opts.get("cooldown_min", 20))),
+            "ventilationHoldMin": int(saved_settings.get("ventilationHoldMin", opts.get("ventilation_hold_min", 20))),
             "gasKrwPerHour": int(saved_settings.get("gasKrwPerHour", opts.get("gas_krw_per_hour", 1200))),
             "notifyEvents": bool(saved_settings.get("notifyEvents", True)),
         }
@@ -365,32 +371,50 @@ class ItssEngine:
             self.db.set_kv("room_timers", self.room_timers)
 
     def apply_preset(self, preset: str) -> dict[str, Any]:
-        """Apply one-touch preset (AUTO_ALL / AWAY / SLEEP / PREHEAT / ALL_OFF)."""
-        self.active_preset = preset
-        self.db.set_kv("active_preset", preset)
+        """Apply one-touch preset (AUTO_ALL / AWAY / SLEEP / PREHEAT / VENTILATION / ALL_OFF)."""
+        now = datetime.now(tz=KST)
+        self.active_preset = "AUTO_ALL" if preset == "VENTILATION" else preset
+        self.db.set_kv("active_preset", self.active_preset)
         rooms = self.db.list_rooms()
+        hold_min = int(self.settings["ventilationHoldMin"])
         for rm in rooms:
-            if preset == "ALL_OFF":
-                self.db.update_room_control(rm["roomName"], control_mode="MANUAL", manual_action="OFF")
+            r_name = rm["roomName"]
+            tm = self.room_timers.setdefault(r_name, {"heatingStartedAt": None, "cooldownUntil": None})
+            if preset == "VENTILATION":
+                self.db.update_room_control(r_name, control_mode="AUTO", manual_action="HOLD")
+                tm["ventilationUntil"] = (now + timedelta(minutes=hold_min)).isoformat(timespec="seconds")
+                tm["heatingStartedAt"] = None
+            elif preset == "ALL_OFF":
+                self.db.update_room_control(r_name, control_mode="MANUAL", manual_action="OFF")
             elif preset == "AUTO_ALL":
-                self.db.update_room_control(rm["roomName"], control_mode="AUTO", manual_action="HOLD")
+                self.db.update_room_control(r_name, control_mode="AUTO", manual_action="HOLD")
+                tm["ventilationUntil"] = None
             else:
-                self.db.update_room_control(rm["roomName"], control_mode="AUTO", manual_action="HOLD")
-        return {"activePreset": preset, "offsetC": PRESET_OFFSETS.get(preset, 0.0)}
+                self.db.update_room_control(r_name, control_mode="AUTO", manual_action="HOLD")
+        self.db.set_kv("room_timers", self.room_timers)
+        return {
+            "activePreset": preset,
+            "offsetC": PRESET_OFFSETS.get(preset, 0.0),
+            "ventilationHoldMin": hold_min if preset == "VENTILATION" else 0,
+        }
 
     def calibrate_rc_and_offsets(self) -> dict[str, Any]:
-        """Fit RC parameters and estimate slave floor offsets from stored cycles."""
+        """Fit RC parameters and estimate slave floor offsets, excluding ventilation intervals."""
         cycles = list(reversed(self.db.list_cycles(limit=500)))
         rooms = self.db.list_rooms()
         by_room: dict[str, list[dict[str, Any]]] = {}
         for c in cycles:
             by_room.setdefault(c["roomName"], []).append(c)
 
-        # Build consecutive observations for RC fitting
+        # Build consecutive observations for RC fitting, skipping ventilation-contaminated samples
         observations: list[RCObservation] = []
         dt_sec = float(self.settings["updateIntervalSec"])
         for r_cycles in by_room.values():
             for prev, curr in zip(r_cycles, r_cycles[1:]):
+                if str(prev.get("safetyReason") or "").startswith(("P000_VENTILATION", "P000_WINDOW_OPEN")):
+                    continue
+                if str(curr.get("safetyReason") or "").startswith(("P000_VENTILATION", "P000_WINDOW_OPEN")):
+                    continue
                 if None in (prev.get("floorTemp"), prev.get("roomTemp"), curr.get("floorTemp"), curr.get("roomTemp")):
                     continue
                 observations.append(
@@ -462,11 +486,12 @@ class ItssEngine:
                 return w.outdoor_temp_c, w.wind_speed_ms, f"{label}·{loc}"
         return None, None, "시간대폴백"
 
-    def _timer_metrics(self, room_name: str, now: datetime) -> tuple[float, float]:
-        """Return (continuous_run_min, cooldown_remaining_min) for one room."""
+    def _timer_metrics(self, room_name: str, now: datetime) -> tuple[float, float, float]:
+        """Return (continuous_run_min, cooldown_remaining_min, ventilation_remaining_min) for one room."""
         tm = self.room_timers.get(room_name, {})
         run_min = 0.0
         cd_min = 0.0
+        vent_min = 0.0
         started = tm.get("heatingStartedAt")
         if started:
             try:
@@ -479,7 +504,13 @@ class ItssEngine:
                 cd_min = max(0.0, (datetime.fromisoformat(cd_until) - now).total_seconds() / 60.0)
             except ValueError:
                 pass
-        return round(run_min, 1), round(cd_min, 1)
+        vent_until = tm.get("ventilationUntil")
+        if vent_until:
+            try:
+                vent_min = max(0.0, (datetime.fromisoformat(vent_until) - now).total_seconds() / 60.0)
+            except ValueError:
+                pass
+        return round(run_min, 1), round(cd_min, 1), round(vent_min, 1)
 
     def _build_predictor(self) -> ThermalPredictor:
         """Instantiate the configured P200 predictor (Linear v1.2 or Adaptive RC)."""
@@ -521,6 +552,7 @@ class ItssEngine:
             "P000_OVERHEAT_CUTOFF",
             "P000_FLOOR_LIMIT_OFF",
             "P000_MAX_RUN_CUTOFF",
+            "P000_WINDOW_OPEN",
             "P000_VENTILATION_PROTECT",
             "P000_SENSOR_MISSING",
             "P000_SENSOR_STALE",
@@ -631,13 +663,56 @@ class ItssEngine:
                 if eff_floor is not None:
                     tm["prevFloorTemp"] = eff_floor
 
+            # 5-minute sliding window for air-only drop detection (cross-checked against floor)
+            samples: list[dict[str, Any]] = list(tm.get("recentSamples") or [])
+            if r_temp is not None:
+                samples.append({"ts": now.isoformat(timespec="seconds"), "r": r_temp, "f": eff_floor})
+            kept_samples: list[dict[str, Any]] = []
+            for s in samples[-15:]:
+                try:
+                    age_m = (now - datetime.fromisoformat(str(s["ts"]))).total_seconds() / 60.0
+                    if 0.0 <= age_m <= 7.0:
+                        kept_samples.append(s)
+                except ValueError:
+                    pass
+            tm["recentSamples"] = kept_samples
+
+            drop_5m_room: float | None = None
+            drop_5m_floor: float | None = None
+            if r_temp is not None and len(kept_samples) >= 2:
+                oldest = kept_samples[0]
+                try:
+                    span_m = (now - datetime.fromisoformat(str(oldest["ts"]))).total_seconds() / 60.0
+                    if span_m >= 1.0:
+                        drop_5m_room = round(r_temp - float(oldest["r"]), 2)
+                        if eff_floor is not None and oldest.get("f") is not None:
+                            drop_5m_floor = round(eff_floor - float(oldest["f"]), 2)
+                except (ValueError, TypeError):
+                    pass
+
+            # Optional physical window contact sensor check (0-sec cutoff + 10m recovery on close)
+            window_open = False
+            win_ent = str(rm.get("windowSensorEntity") or "").strip()
+            if win_ent:
+                w_raw = await self.ha.get_state(win_ent)
+                if w_raw:
+                    window_open = str(w_raw.get("state") or "").lower() in ("on", "open")
+            was_win_open = bool(tm.get("wasWindowOpen", False))
+            if was_win_open and not window_open:
+                # Window just closed: allow 10 min natural air rebound from warm floor before heating
+                rec_until = now + timedelta(minutes=10)
+                cur_v = tm.get("ventilationUntil")
+                if not cur_v or datetime.fromisoformat(str(cur_v)) < rec_until:
+                    tm["ventilationUntil"] = rec_until.isoformat(timespec="seconds")
+            tm["wasWindowOpen"] = window_open
+
             # Track continuous heating duration per room based on real boiler state
             if is_heating:
                 if not tm.get("heatingStartedAt"):
                     tm["heatingStartedAt"] = now.isoformat(timespec="seconds")
             else:
                 tm["heatingStartedAt"] = None
-            run_min, cd_min = self._timer_metrics(r_name, now)
+            run_min, cd_min, vent_min = self._timer_metrics(r_name, now)
 
             eff_target = round(rm["targetTemp"] + atmos_offset + schedule_offset + preset_offset, 2)
 
@@ -679,6 +754,10 @@ class ItssEngine:
                 "effTarget": eff_target,
                 "runMin": run_min,
                 "cdMin": cd_min,
+                "ventMin": vent_min,
+                "windowOpen": window_open,
+                "drop5mRoom": drop_5m_room,
+                "drop5mFloor": drop_5m_floor,
             }
 
             if rm["controlMode"] == "AUTO" and r_temp is not None:
@@ -790,6 +869,10 @@ class ItssEngine:
                     continuous_run_min=t["runMin"],
                     max_run_min=room_max_run_min,
                     cooldown_remaining_min=t["cdMin"],
+                    window_open=t["windowOpen"],
+                    drop_5m_room_c=t["drop5mRoom"],
+                    drop_5m_floor_c=t["drop5mFloor"],
+                    ventilation_remaining_min=t["ventMin"],
                 )
                 record.safety_reason = verdict.reason_code
                 if verdict.force_off:
@@ -800,6 +883,11 @@ class ItssEngine:
                         tm["heatingStartedAt"] = None
                         tm["cooldownUntil"] = (
                             now + timedelta(minutes=room_cooldown_min)
+                        ).isoformat(timespec="seconds")
+                    elif verdict.reason_code == "P000_VENTILATION_PROTECT":
+                        tm["heatingStartedAt"] = None
+                        tm["ventilationUntil"] = (
+                            now + timedelta(minutes=int(self.settings["ventilationHoldMin"]))
                         ).isoformat(timespec="seconds")
                 elif verdict.hold_current_state or r_name not in mz_by_room:
                     decision_reason = verdict.reason_code
@@ -989,7 +1077,13 @@ def create_app(
             )
             c_attrs = (c_state.get("attributes") or {}) if c_state else {}
             boiler_running = detect_boiler_running(c_state)
-            run_min, cd_min = engine._timer_metrics(r_name, now_kst)
+            run_min, cd_min, vent_min = engine._timer_metrics(r_name, now_kst)
+            win_open = False
+            win_ent = str(rm.get("windowSensorEntity") or "").strip()
+            if win_ent:
+                w_raw = await engine.ha.get_state(win_ent)
+                if w_raw:
+                    win_open = str(w_raw.get("state") or "").lower() in ("on", "open")
             live_by_room[r_name] = {
                 "roomTemp": r_temp,
                 "floorTemp": eff_floor,
@@ -999,6 +1093,8 @@ def create_app(
                 "boilerRunning": boiler_running,
                 "runtimeMin": run_min,
                 "cooldownRemainMin": cd_min,
+                "ventilationRemainMin": vent_min,
+                "windowOpen": win_open,
             }
 
         sched_offset, sched_label = engine.db.active_schedule_offset(now_kst.hour)
