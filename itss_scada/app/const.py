@@ -3,7 +3,7 @@
 from datetime import timedelta, timezone
 
 DOMAIN = "itss"
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 
 # Korea Standard Time (UTC+9)
 KST = timezone(timedelta(hours=9))
@@ -44,9 +44,9 @@ DEFAULT_UPDATE_INTERVAL_SEC = 300  # 5 minutes
 DEFAULT_DB_FILENAME = "itss_scada.db"
 
 # ITSS-P000 SENTINEL default safety limits
-DEFAULT_OVERHEAT_ROOM_C = 23.0
-DEFAULT_OVERHEAT_FLOOR_C = 24.0
-DEFAULT_GENERAL_OFF_FLOOR_C = 20.0
+DEFAULT_OVERHEAT_ROOM_C = 24.0
+DEFAULT_OVERHEAT_FLOOR_C = 25.0
+DEFAULT_GENERAL_OFF_FLOOR_C = 25.0
 DEFAULT_VENTILATION_DROP_RATE = -0.15  # degC per minute
 DEFAULT_MIN_ON_SEC = 300   # 최소 가동 유지 5분 (예측 OFF 채터링 방지, 안전 OFF는 예외)
 DEFAULT_MIN_OFF_SEC = 600  # 최소 휴지 유지 10분

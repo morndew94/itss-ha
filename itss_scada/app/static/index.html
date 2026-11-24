@@ -419,7 +419,7 @@
     <header>
       <div class="title">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-          <h1>I.T.S.S. Thermal SCADA Dashboard <span id="appVer">v2.7.0</span></h1>
+          <h1>I.T.S.S. Thermal SCADA Dashboard <span id="appVer">v2.8.0</span></h1>
           <span id="globalBoilerPill" class="boiler-pill stopped">보일러 상태 확인중</span>
         </div>
         <p id="subInfo">로딩 중...</p>
@@ -488,7 +488,7 @@
               <th>방 / 엔티티</th>
               <th>보일러 실상태</th>
               <th>실내 온도</th>
-              <th>바닥 온도</th>
+              <th>바닥 온도 / 추정 설정</th>
               <th>목표 온도 (0.1°C)</th>
               <th>운전 모드</th>
               <th>직접 테스트 / 관리</th>
@@ -626,6 +626,10 @@
         <div><label>바닥 센서 설치 방 여부</label><select id="newHasFloor">
             <option value="false">없음 (추정)</option>
             <option value="true">있음 (마스터)</option>
+          </select></div>
+        <div><label>바닥 추정 (센서 없는 방)</label><select id="newFloorEstimate">
+            <option value="true">사용 (마스터 실측 + 오프셋)</option>
+            <option value="false">미사용 (실내 기준 제어)</option>
           </select></div>
         <div><button class="primary" style="width:100%" onclick="addRoom()">+ 방 등록/수정</button></div>
       </div>
@@ -827,7 +831,8 @@
       nBtn.textContent = currentSettings.notifyEvents !== false ? "텔레그램 알림: ON" : "텔레그램 알림: OFF";
       nBtn.className = currentSettings.notifyEvents !== false ? "primary" : "off";
 
-      renderRooms(status.rooms, status.liveByRoom || {}, status.latestByRoom || {});
+      renderRooms(status.rooms, status.liveByRoom || {}, status.latestByRoom || {},
+        (status.suggestedFloorOffsets || {}).offsets || {});
       renderKpis(status.kpis || {}, status.boilerStats, status.statsCoverageHours);
       renderLagProfiles(status.thermalLagProfiles || {});
       renderSensors(status.sensorHealth || []);
@@ -841,7 +846,7 @@
       await drawChart();
     }
 
-    function renderRooms(rooms, liveByRoom, latestByRoom) {
+    function renderRooms(rooms, liveByRoom, latestByRoom, suggested = {}) {
       const tbody = document.getElementById("roomTableBody");
       const runningRooms = rooms.filter(r => liveByRoom[r.roomName]?.boilerRunning === true).map(r => r.roomName);
       const gPill = document.getElementById("globalBoilerPill");
@@ -869,7 +874,24 @@
         const rt = rVal != null ? `${fmtNum(rVal)}°C` : "--";
         const ft = fVal != null ? `${fmtNum(fVal)}°C` : "--";
         const off = Number(rm.floorOffsetC) || 0;
-        const fSrc = rm.hasFloorSensor ? "실측" : `추정(${off >= 0 ? "+" : ""}${fmtNum(off)})`;
+        const offStr = `${off >= 0 ? "+" : ""}${fmtNum(off)}`;
+        const estOn = rm.floorEstimateEnabled !== false;
+        const fSrc = rm.hasFloorSensor
+          ? "실측(마스터)"
+          : (estOn
+            ? `추정 = 마스터 ${offStr}°C`
+            : `추정 OFF · 안전판정 마스터 ${live.guardFloorTemp != null ? `${fmtNum(live.guardFloorTemp)}°C` : "--"}`);
+        const sugg = suggested[rm.roomName];
+        const floorCtl = rm.hasFloorSensor ? "" : `
+          <div class="inline-flex" style="margin-top:4px;flex-wrap:wrap;">
+            <button class="btn-sm ${estOn ? "primary active" : "off"}" data-act="estimate" data-room="${name}" data-val="${estOn ? "false" : "true"}">추정 ${estOn ? "ON" : "OFF"}</button>
+            <button class="btn-sm" data-act="offset" data-room="${name}" data-val="${(off - 0.1).toFixed(1)}" ${estOn ? "" : "disabled"}>-0.1</button>
+            <span style="font-size:12px;min-width:44px;text-align:center;">${offStr}</span>
+            <button class="btn-sm" data-act="offset" data-room="${name}" data-val="${(off + 0.1).toFixed(1)}" ${estOn ? "" : "disabled"}>+0.1</button>
+            ${sugg != null && Math.abs(Number(sugg) - off) >= 0.05
+              ? `<button class="btn-sm" data-act="offset" data-room="${name}" data-val="${Number(sugg).toFixed(1)}">제안 ${Number(sugg) >= 0 ? "+" : ""}${fmtNum(sugg)} 적용</button>`
+              : ""}
+          </div>`;
         const isAuto = rm.controlMode === "AUTO";
         const isManHeat = !isAuto && rm.manualAction === "HEAT";
         const isManOff = !isAuto && rm.manualAction === "OFF";
@@ -922,8 +944,9 @@
           ${underheat}
         </td>
         <td>
-          <div class="temp-big">${ft}</div>
-          <div style="font-size:11px;color:var(--muted);">${fSrc}${live.effectiveFloorLimitC != null ? ` · 상한 ${fmtNum(live.effectiveFloorLimitC)}°C` : ""}</div>
+          <div class="temp-big">${estOn || rm.hasFloorSensor ? ft : "--"}</div>
+          <div style="font-size:11px;color:var(--muted);">${fSrc}${(estOn || rm.hasFloorSensor) && live.effectiveFloorLimitC != null ? ` · 상한 ${fmtNum(live.effectiveFloorLimitC)}°C` : ""}</div>
+          ${floorCtl}
         </td>
         <td>
           <div class="inline-flex">
@@ -1151,7 +1174,7 @@
         showMsg(
           `RC 피팅 결과: ${JSON.stringify(res.rcFit)}\n` +
           `슬레이브 바닥 오프셋 제안값(자동 적용 안 함): ${JSON.stringify(res.suggestedFloorOffsets)}\n` +
-          "→ 적용하려면 방 등록 폼에서 바닥 오프셋을 입력해 같은 이름으로 재등록하세요."
+          "→ 방 테이블 바닥 칸의 '제안 … 적용' 버튼 또는 ±0.1 버튼으로 적용하세요."
         );
         await refresh();
       });
@@ -1195,6 +1218,34 @@
     function changeTarget(roomName, newTemp) {
       return guarded(async () => {
         await api(`/rooms/${encodeURIComponent(roomName)}`, { method: "PATCH", body: JSON.stringify({ targetTemp: Number(newTemp) }) });
+        await refresh();
+      });
+    }
+
+    function setFloorEstimate(roomName, enabled) {
+      return guarded(async () => {
+        if (!enabled && !confirm(
+          `'${roomName}' 의 바닥 추정을 끕니다.\n` +
+          "- 이 방은 P200 예측 없이 실내 온도(목표 ±0.15°C) 기준으로 제어됩니다.\n" +
+          "- 바닥 과열·상한 안전 판정은 마스터 실측 바닥값으로 계속 적용됩니다.\n계속할까요?"
+        )) return;
+        await api(`/rooms/${encodeURIComponent(roomName)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ floorEstimateEnabled: enabled }),
+        });
+        showMsg(`${roomName}: 바닥 추정 ${enabled ? "ON (마스터 실측 + offset)" : "OFF (실내 기준 제어)"}`);
+        await refresh();
+      });
+    }
+
+    function setFloorOffset(roomName, value) {
+      return guarded(async () => {
+        const v = Math.max(-5, Math.min(5, Math.round(Number(value) * 10) / 10));
+        await api(`/rooms/${encodeURIComponent(roomName)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ floorOffsetC: v }),
+        });
+        showMsg(`${roomName}: 바닥 추정 offset ${v >= 0 ? "+" : ""}${v.toFixed(1)}°C 적용`);
         await refresh();
       });
     }
@@ -1293,6 +1344,7 @@
           body: JSON.stringify({
             roomName, roomTempEntity, climateEntity, windowSensorEntity,
             hasFloorSensor: document.getElementById("newHasFloor").value === "true",
+            floorEstimateEnabled: document.getElementById("newFloorEstimate").value === "true",
             targetTemp: Number(document.getElementById("newTarget").value),
             floorOffsetC: Number(document.getElementById("newOffset").value),
           }),
@@ -1322,6 +1374,8 @@
         case "mode": setMode(room, btn.dataset.mode, btn.dataset.manual); break;
         case "test": testClimate(room, btn.dataset.action); break;
         case "delete": deleteRoom(room); break;
+        case "estimate": setFloorEstimate(room, btn.dataset.val === "true"); break;
+        case "offset": setFloorOffset(room, Number(btn.dataset.val)); break;
       }
     });
 

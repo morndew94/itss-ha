@@ -34,6 +34,7 @@ class ZoneReading:
     has_floor_sensor: bool = False
     floor_offset_from_master_c: float = 0.0
     weight: float = 1.0
+    floor_estimate_enabled: bool = True  # False: 방 바닥 추정 미사용 -> 마스터 실측을 안전 판정용 대리값(PROXY)으로 사용
 
 
 @dataclass(slots=True)
@@ -43,7 +44,7 @@ class ZoneCommand:
     room_name: str
     action: str  # "HEAT", "OFF", "HOLD"
     effective_floor_temp: float
-    floor_sensor_source: str  # "MEASURED" or "ESTIMATED"
+    floor_sensor_source: str  # "MEASURED", "ESTIMATED" or "PROXY"
     reason: str
 
 
@@ -83,6 +84,8 @@ class MultiZoneController:
         """Return (floor_temp, source) using real sensor for master and offset for slaves."""
         if zone.has_floor_sensor:
             return round(master_floor_temp, 1), "MEASURED"
+        if not zone.floor_estimate_enabled:
+            return round(master_floor_temp, 1), "PROXY"
         return round(master_floor_temp + zone.floor_offset_from_master_c, 1), "ESTIMATED"
 
     def evaluate(

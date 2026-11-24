@@ -58,6 +58,7 @@ class SentinelProtocol:
         room_stale_after_sec: float | None = None,
         floor_stale_after_sec: float | None = None,
         floor_latency_c: float = 0.0,
+        floor_is_proxy: bool = False,
     ) -> SafetyVerdict:
         """Run prioritized safety checks.
 
@@ -74,7 +75,13 @@ class SentinelProtocol:
         v2.7.0:
           - room/floor_stale_after_sec: 센서별 관측 보고 주기 기반 적응형 stale 임계 (None이면 기본값)
           - floor_latency_c: 바닥 센서 보고 지연 동안의 추정 상승분. 바닥 상한/예측 판정에 가산
+        v2.8.0:
+          - floor_is_proxy: 바닥 추정 OFF 방. floor_temp 는 마스터 실측(대리값)이므로
+            과열·일반 바닥 상한(설정값)만 판정하고, 방 바닥값에 의존하는
+            목표연동 동적 상한(4a)·예측 상한(4b)·시작 전 여유(5c)·잔열 가드(6d)는 생략
         """
+        if floor_is_proxy:
+            effective_floor_limit_c = None
         room_stale_limit = room_stale_after_sec if room_stale_after_sec is not None else self.config.max_sensor_age_sec
         floor_stale_limit = (
             floor_stale_after_sec if floor_stale_after_sec is not None else self.config.max_sensor_age_sec
@@ -259,7 +266,7 @@ class SentinelProtocol:
             )
 
         # 6d. Active floor residual release / room rebound guard (blocks double-run stacking)
-        if not is_heating:
+        if not is_heating and not floor_is_proxy:
             floor_warmer_than_room = snapshot.floor_temp - snapshot.room_temp
             floor_still_rising = (
                 trend_10m_floor_c is not None

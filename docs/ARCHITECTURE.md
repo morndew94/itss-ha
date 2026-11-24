@@ -36,7 +36,7 @@
 3. **P300 보정**: `atmos_offset = min(0.25, max(0, -outdoor x 0.015) + (풍속 >= 6.0 m/s 이면 0.05))` °C. 외기 미확인 시 시간대 프로파일. 외기 연동 최대 가동 시간(<= -5 °C: 15 min, <= 0 °C: 13 min, <= 5 °C: 11 min, <= 10 °C: 9 min, 그 외 7 min)을 `maxRunCapMin` 으로 제한합니다.
 4. **P400 + 프리셋 offset**: DB 스케줄 슬롯(`active_schedule_offset(hour)`) + 프리셋 offset(`AWAY` -2.0 °C, `SLEEP` -0.3 °C, `PREHEAT` +0.2 °C).
 5. **주기 작업**: 30 회차마다(또는 프로파일 없을 때) 잔열/지연 학습 갱신, 60 회차마다 이력/트레이스 보존 정리.
-6. **방별 telemetry 수집**: 실내 sensor 읽기 + `observe`, `climate` 상태, 보일러 가동 추정(`detect_boiler_running`), 바닥값(`MEASURED`/`ESTIMATED`/`MISSING`/`UNCONFIGURED`), 창문 접점, 기울기/추세, `effTarget = targetTemp + atmos + schedule + preset`, P200 예측(실내/바닥값 모두 있을 때).
+6. **방별 telemetry 수집**: 실내 sensor 읽기 + `observe`, `climate` 상태, 보일러 가동 추정(`detect_boiler_running`), 바닥값(`MEASURED`/`ESTIMATED`/`ESTIMATE_OFF`/`MISSING`/`UNCONFIGURED`, `_room_floor()` 가 제어용 `effFloor` 와 안전 판정용 `guardFloor` 를 함께 결정 — 추정 OFF 방은 `effFloor=None`, `guardFloor=마스터 실측`, P200 생략, sentinel `floor_is_proxy=True` 로 4a 목표연동 상한·4b·5c·6d 생략), 창문 접점, 기울기/추세, `effTarget = targetTemp + atmos + schedule + preset`, P200 예측(실내/바닥값 모두 있을 때).
 7. **다중 방 계획(`MultiZoneController`)**: 마스터 바닥값이 있을 때만 `AUTO` 방에 대해 수립. 바닥 실측이 없으면 계획을 만들지 않습니다(가짜 바닥값 사용 금지).
 8. **방별 판단 `_decide_room`** (3장 우선순위) -> 명령 설정온도 계산 -> `_dispatch` -> 알림 -> 이력 저장 -> 로그/트레이스.
 9. **상태 저장**: `room_timers`, `sensor_tracks`(사용 중인 sensor 만 유지) 를 KV 에 저장. 방 하나가 실패해도 `INTERNAL_ERROR` 회차 기록을 남기고 나머지 방은 계속 처리하며, 모든 방이 실패하면 회차 실패로 집계합니다.
@@ -63,7 +63,7 @@
 
 | 순서 | 조건 | 결과 (`safetyReason`) | 비고 |
 | :--- | :--- | :--- | :--- |
-| 1 | 실내 >= 23.0 °C 또는 바닥 >= 24.0 °C | OFF, `P000_OVERHEAT_CUTOFF` | `const.py`. `AUTO`/`MANUAL` 공통. 잔열 휴지 시작 |
+| 1 | 실내 >= 24.0 °C 또는 바닥 >= 25.0 °C | OFF, `P000_OVERHEAT_CUTOFF` | `const.py`. `AUTO`/`MANUAL` 공통. 잔열 휴지 시작 |
 | 2 | `MANUAL` | `manualAction` 수행, `P000_MANUAL_OVERRIDE` | `HEAT` 일 때만 최소 안전 조건 검사: `P000_FLOOR_UNCONFIGURED`, `P000_SENSOR_MISSING`, `P000_SENSOR_STALE`, `P000_FLOOR_LIMIT_OFF`(래치, 1.0 °C hysteresis) 이면 OFF |
 | 3 | `AUTO` + 마스터 바닥 미설정 | OFF, `P000_FLOOR_UNCONFIGURED` | |
 | 4 | `SentinelProtocol.evaluate()` | 아래 4.1 | `force_off` -> OFF, `hold` -> HOLD |
@@ -90,7 +90,7 @@
 | - | 모두 통과 | `P000_OK` |
 
 - 목표 연동 바닥 상한: `min(floorOffLimitC, effTarget + margin)`. margin = 4.5 °C(외기 <= -5 °C), 3.0 °C(외기 > 5 °C), 그 외 3.5 °C.
-- `floorOffLimitC`(기본 26.5 °C)가 과열 바닥 기준(24.0 °C)보다 높으면 과열 차단이 먼저 작동합니다. `/health` 의 `warnings` 로 알립니다.
+- `floorOffLimitC`(기본 26.5 °C)가 과열 바닥 기준(25.0 °C)보다 높으면 과열 차단이 먼저 작동합니다. `/health` 의 `warnings` 로 알립니다.
 - 1회 최대 가동 시간은 외기 연동 값에서 학습된 `recommendedRunTrimMin` 을 빼고, 바닥 여유가 적으면 축소(최소 5 min)합니다.
 
 ### 3.2 예측 모델 (P200)
@@ -118,7 +118,7 @@
 
 | 테이블 | 주요 컬럼 |
 | :--- | :--- |
-| `rooms` | `room_name`(PK), `room_temp_entity`, `climate_entity`, `window_sensor_entity`, `has_floor_sensor`, `floor_offset_c`, `target_temp`, `control_mode`, `manual_action`, `weight`, `updated_at` |
+| `rooms` | `room_name`(PK), `room_temp_entity`, `climate_entity`, `window_sensor_entity`, `has_floor_sensor`, `floor_estimate_enabled`(v2.8.0, 기본 1), `floor_offset_c`, `target_temp`, `control_mode`, `manual_action`, `weight`, `updated_at` |
 | `schedules` | `slot_id`(PK), `label`, `start_hour`, `end_hour`, `offset_c`, `enabled` (기본 4개 슬롯) |
 | `kv_store` | `key`(PK), `value_json` |
 | `cycles` | `cycle_id`(PK), `room_name`, 시각 컬럼(`scheduled_at`, `execution_started_at`, `control_issued_at`, `control_confirmed_at`, `observed_at`, `saved_at`), `execution_status`, `command_action`, `safety_reason`, `room_temp`, `floor_temp`, `target_temp`, `payload_json`, v2.7.0 추가: `combustion_confirmed`, `dry_run`, `effective_target`, `outdoor_temp`, `floor_sensor_source` |
@@ -156,7 +156,7 @@
 | `controlIssuedAt`, `controlConfirmedAt`, `observedAt`, `savedAt` | 명령 전송, 수락 확인, 재조회 관측, 저장 |
 | `executionStatus` | `EXECUTED`, `SKIPPED_SAFETY`, `FAILED` (`DELAYED` 는 스키마 정의만 존재) |
 | `delaySec`, `opposingCommandIntervalSec` | 지연, 직전 반대 명령(HEAT<->OFF)과의 간격(s) |
-| `roomTemp`, `floorTemp`, `floorSensorSource` | 실내/바닥(실효값) 온도, `MEASURED`/`ESTIMATED`/`MISSING`/`UNCONFIGURED` |
+| `roomTemp`, `floorTemp`, `floorSensorSource` | 실내/바닥(실효값) 온도, `MEASURED`/`ESTIMATED`/`ESTIMATE_OFF`/`MISSING`/`UNCONFIGURED` (`ESTIMATE_OFF` 는 `floorTemp=null`, `diagnostics.guardFloor` 에 대리값) |
 | `targetTemp` | 방 설정 목표 |
 | `effectiveTargetTemp` | **(v2.7.0)** 외기/스케줄/프리셋 보정 후 실효 목표 |
 | `outdoorTemp` | **(v2.7.0)** 회차 당시 외기 (RC 피팅 입력) |

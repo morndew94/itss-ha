@@ -57,6 +57,7 @@ class ScadaDatabase:
                     climate_entity TEXT NOT NULL,
                     window_sensor_entity TEXT NOT NULL DEFAULT '',
                     has_floor_sensor INTEGER NOT NULL DEFAULT 0,
+                    floor_estimate_enabled INTEGER NOT NULL DEFAULT 1,
                     floor_offset_c REAL NOT NULL DEFAULT 0.0,
                     target_temp REAL NOT NULL DEFAULT 23.0,
                     control_mode TEXT NOT NULL DEFAULT 'AUTO',
@@ -118,6 +119,9 @@ class ScadaDatabase:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(rooms)").fetchall()}
             if "window_sensor_entity" not in cols:
                 conn.execute("ALTER TABLE rooms ADD COLUMN window_sensor_entity TEXT NOT NULL DEFAULT ''")
+            # v2.8.0: 바닥 센서 없는 방의 추정 바닥값 사용 여부 (기존 방은 사용=1 유지)
+            if "floor_estimate_enabled" not in cols:
+                conn.execute("ALTER TABLE rooms ADD COLUMN floor_estimate_enabled INTEGER NOT NULL DEFAULT 1")
             cycle_cols = {r[1] for r in conn.execute("PRAGMA table_info(cycles)").fetchall()}
             for col, col_type in _CYCLE_EXTRA_COLUMNS.items():
                 if col not in cycle_cols:
@@ -199,14 +203,15 @@ class ScadaDatabase:
                 """
                 INSERT INTO rooms (
                     room_name, room_temp_entity, climate_entity, window_sensor_entity,
-                    has_floor_sensor, floor_offset_c, target_temp,
+                    has_floor_sensor, floor_estimate_enabled, floor_offset_c, target_temp,
                     control_mode, manual_action, weight, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(room_name) DO UPDATE SET
                     room_temp_entity=excluded.room_temp_entity,
                     climate_entity=excluded.climate_entity,
                     window_sensor_entity=excluded.window_sensor_entity,
                     has_floor_sensor=excluded.has_floor_sensor,
+                    floor_estimate_enabled=excluded.floor_estimate_enabled,
                     floor_offset_c=excluded.floor_offset_c,
                     target_temp=excluded.target_temp,
                     control_mode=excluded.control_mode,
@@ -220,6 +225,7 @@ class ScadaDatabase:
                     room["climateEntity"],
                     str(room.get("windowSensorEntity", "") or "").strip(),
                     1 if room.get("hasFloorSensor") else 0,
+                    1 if room.get("floorEstimateEnabled", True) else 0,
                     float(room.get("floorOffsetC", 0.0)),
                     round(float(room.get("targetTemp", 23.0)), 1),
                     str(room.get("controlMode", "AUTO")).upper(),
@@ -238,6 +244,7 @@ class ScadaDatabase:
         control_mode: str | None = None,
         manual_action: str | None = None,
         floor_offset_c: float | None = None,
+        floor_estimate_enabled: bool | None = None,
     ) -> dict[str, Any] | None:
         existing = self.get_room(room_name)
         if not existing:
@@ -250,6 +257,8 @@ class ScadaDatabase:
             existing["manualAction"] = manual_action.upper()
         if floor_offset_c is not None:
             existing["floorOffsetC"] = round(float(floor_offset_c), 2)
+        if floor_estimate_enabled is not None:
+            existing["floorEstimateEnabled"] = bool(floor_estimate_enabled)
         return self.upsert_room(existing)
 
     def delete_room(self, room_name: str) -> bool:
@@ -277,6 +286,7 @@ class ScadaDatabase:
             "climateEntity": row["climate_entity"],
             "windowSensorEntity": row["window_sensor_entity"] if "window_sensor_entity" in row.keys() else "",
             "hasFloorSensor": bool(row["has_floor_sensor"]),
+            "floorEstimateEnabled": bool(row["floor_estimate_enabled"]) if "floor_estimate_enabled" in row.keys() else True,
             "floorOffsetC": row["floor_offset_c"],
             "targetTemp": row["target_temp"],
             "controlMode": row["control_mode"],

@@ -1,6 +1,6 @@
 # I.T.S.S. Thermal SCADA (Home Assistant Add-on)
 
-Home Assistant **전용 애드온(Add-on + Ingress 웹 UI)** 입니다. 온돌(바닥 난방) 방별 제어, 단일 마스터 바닥 sensor 기반 하이브리드 다중 방 제어, 센서 보고 주기 학습, KST 회차 이력 DB, 실운전 분석용 로그/트레이스를 제공합니다. 버전은 **2.7.0** 입니다.
+Home Assistant **전용 애드온(Add-on + Ingress 웹 UI)** 입니다. 온돌(바닥 난방) 방별 제어, 단일 마스터 바닥 sensor 기반 하이브리드 다중 방 제어, 센서 보고 주기 학습, KST 회차 이력 DB, 실운전 분석용 로그/트레이스를 제공합니다. 버전은 **2.8.0** 입니다.
 
 핵심 요약
 
@@ -10,7 +10,7 @@ Home Assistant **전용 애드온(Add-on + Ingress 웹 UI)** 입니다. 온돌(�
 | 아키텍처 | `amd64` 전용 (`config.yaml` `arch: [amd64]`) |
 | 외부 노출 | `config.yaml` 에 `ports` 없음. Ingress(Supervisor)만 접속 가능 |
 | 기본 운전 모드 | 시험 운전(`dry_run: true`). 실제 조절기 명령은 LIVE 전환 후에만 전송 |
-| 과열 차단 | 실내 23.0 °C / 바닥 24.0 °C (`const.py`, AUTO/MANUAL 공통) |
+| 과열 차단 | 실내 24.0 °C / 바닥 25.0 °C (`const.py`, AUTO/MANUAL 공통) |
 
 ---
 
@@ -21,7 +21,8 @@ Home Assistant **전용 애드온(Add-on + Ingress 웹 UI)** 입니다. 온돌(�
 - **운전 모드 `AUTO` / `MANUAL`(`HEAT`/`OFF`/`HOLD`)**: 수동 운전에도 최소 안전 조건이 적용됩니다(3장 참조).
 - **단일 마스터 바닥 sensor + 방별 밸브 하이브리드 제어**:
   - 동시 기동(Co-heating Batch)으로 보일러 단펄스를 줄이고, 목표 상한 도달 방은 개별 선차단합니다.
-  - 마스터 방은 `MEASURED`, 나머지 방은 `ESTIMATED`(마스터 바닥값 + `floorOffsetC`)로 구분 기록합니다.
+  - 마스터 방은 `MEASURED`, 나머지 방은 `ESTIMATED`(마스터 바닥값 + `floorOffsetC`) 또는 `ESTIMATE_OFF`로 구분 기록합니다.
+  - **바닥 추정 ON/OFF (v2.8.0, 바닥 sensor 없는 방)**: 방 테이블의 `추정 ON/OFF` 토글과 offset `±0.1 °C` 버튼(범위 −5.0 ~ +5.0 °C), RC 피팅 제안 offset `제안 … 적용` 버튼으로 조절합니다. 추정 OFF(`ESTIMATE_OFF`) 방은 P200 예측 없이 실내 온도 band(목표 ±0.15 °C) 기준 multi-zone 제어를 하고, 과열(바닥 25.0 °C)·설정 바닥 상한(`floorOffLimitC`) 안전 판정만 마스터 실측 바닥을 대리값(proxy)으로 사용합니다. 목표연동 동적 상한·예측 상한·시작 전 여유·잔열 가드는 방 바닥값이 필요하므로 생략됩니다.
   - 전략: `hybrid`(기본) / `simultaneous`(가중평균 일괄 기동).
 - **센서 보고 주기 감지 (v2.7.0)**: HA `last_reported`(없으면 `last_updated`) 기준으로 sensor별 보고 간격을 학습하여 stale 임계, 기울기, 바닥 지연 보상에 반영합니다. UI 패널 "센서 보고 주기 감지 현황"에서 확인합니다.
 - **예측 제어(P200)**: `linear_v12`(선형 외삽) 또는 `adaptive_rc`(2-node RC) 모델로 30분(학습값에 따라 가변) 후 온도를 예측하여 예측 기동/선차단을 판단합니다.
@@ -31,7 +32,7 @@ Home Assistant **전용 애드온(Add-on + Ingress 웹 UI)** 입니다. 온돌(�
 - **외기 입력**: HA 센서(`outdoor_temp_entity`) 우선 -> 없으면 Open-Meteo API -> 실패 시 Gemini Search Grounding(API key 설정 시) -> 모두 실패하면 시간대 폴백.
 - **알림**: HA `notify` 서비스 및 HA `telegram_bot`(`chat_id`, 구형 HA 는 `target` 으로 재시도). 보일러 ON/OFF 변화, 치명 안전 사유, 조절기 명령 실패, 난방 부족, 제어 루프 연속 실패를 알립니다.
 - **Gemini 일일 진단 리포트**: UI 버튼(`POST /api/v1/report/daily`)으로 24 h KPI 와 Gemini 요약을 생성합니다. API key 가 없으면 KPI 만 반환합니다.
-- **RC 피팅/offset 제안**: `POST /api/v1/calibrate/auto`. 마스터 방의 실측 바닥만 사용하고, 슬레이브 방 floor offset 은 **제안값만** 반환하며 자동 적용하지 않습니다.
+- **RC 피팅/offset 제안**: `POST /api/v1/calibrate/auto`. 마스터 방의 실측 바닥만 사용하고, 슬레이브 방 floor offset 은 **제안값만** 반환·저장(`suggested_floor_offsets`)하며 자동 적용하지 않습니다. UI 에서 방별 버튼으로 적용합니다.
 
 ### 라이브러리 전용 모듈 (제어 루프에 연결되어 있지 않음)
 
@@ -60,8 +61,8 @@ Home Assistant **전용 애드온(Add-on + Ingress 웹 UI)** 입니다. 온돌(�
 ### 안전 동작 요약
 
 - **마스터 바닥 sensor 미설정**: `AUTO` 방은 강제 OFF(`P000_FLOOR_UNCONFIGURED`)이며, `dryRun=false`(LIVE) 전환 요청은 **HTTP 409** 로 거부됩니다.
-- **과열 차단**: 실내 >= 23.0 °C 또는 바닥 >= 24.0 °C 이면 `P000_OVERHEAT_CUTOFF` 로 OFF 합니다(`const.py` 의 `DEFAULT_OVERHEAT_ROOM_C`, `DEFAULT_OVERHEAT_FLOOR_C`, `AUTO`/`MANUAL` 공통).
-  - `floor_off_limit_c`(기본 26.5 °C)가 24.0 °C 이상이면 과열 차단이 항상 먼저 작동합니다. 이 경우 `/health` 의 `warnings` 와 UI 에 경고가 표시됩니다.
+- **과열 차단**: 실내 >= 24.0 °C 또는 바닥 >= 25.0 °C 이면 `P000_OVERHEAT_CUTOFF` 로 OFF 합니다(`const.py` 의 `DEFAULT_OVERHEAT_ROOM_C`, `DEFAULT_OVERHEAT_FLOOR_C`, `AUTO`/`MANUAL` 공통).
+  - `floor_off_limit_c`(기본 26.5 °C)가 25.0 °C 이상이면 과열 차단이 항상 먼저 작동합니다. 이 경우 `/health` 의 `warnings` 와 UI 에 경고가 표시됩니다.
 - **수동 ON 보호**: 센서 누락/stale 이면 수동 ON 도 차단하고, 바닥이 `floorOffLimitC` 에 도달하면 래치 OFF 하며 `floorOffLimitC - 1.0 °C` 이하로 내려가야 해제됩니다(1.0 °C hysteresis).
 - **제어 회차 직렬화**: 루프, `run-now`, 프리셋, 수동 전환, 방 삭제, 조절기 테스트가 `asyncio.Lock` 으로 직렬화됩니다.
 - **설정 교차 검증**: `heatOffSetpoint <= heatOnSetpoint - 3.0 °C` 를 만족해야 하며 위반 시 **HTTP 422** 입니다.
@@ -106,6 +107,7 @@ itss-ha/
 ├── tests/
 │   ├── conftest.py                    # 테스트 중 외부 네트워크 차단
 │   ├── test_v27_hardening.py          # v2.7.0 안전/센서/통계/디버그 회귀 테스트
+│   ├── test_v28_floor_estimate.py     # v2.8.0 바닥 추정 ON/OFF·offset 테스트
 │   ├── test_addon_api.py, test_protocols.py, test_lag_and_restart.py, test_google_and_multizone.py
 └── .github/workflows/validate.yml     # ruff + pytest (Python 3.12)
 ```
@@ -140,7 +142,7 @@ HA **애드온 구성** 화면의 옵션입니다.
 | `dry_run` | `true` | bool | `true` 면 명령 미전송(`DRY_RUN` 기록) |
 | `heat_on_setpoint` | 24.0 | 15 ~ 30 °C | HEAT 시 조절기 기본 설정온도 |
 | `heat_off_setpoint` | 15.0 | 5 ~ 25 °C | OFF 시 조절기 기본 설정온도. `heat_on_setpoint - 3.0 °C` 이하여야 함 |
-| `floor_off_limit_c` | 26.5 | 22 ~ 29 °C | 바닥 OFF 상한 (24.0 °C 이상이면 과열 차단이 먼저 작동) |
+| `floor_off_limit_c` | 26.5 | 22 ~ 29 °C | 바닥 OFF 상한 (25.0 °C 이상이면 과열 차단이 먼저 작동) |
 | `max_run_cap_min` | 15 | 3 ~ 15 min | 1회 최대 연속 가동 상한 (내부적으로 최소 5 min 보장) |
 | `cooldown_min` | 20 | 5 ~ 90 min | 차단 후 잔열 휴지 기본값 (학습값이 있으면 학습값 사용) |
 | `ventilation_hold_min` | 20 | 5 ~ 60 min | 환기 보호 유지 시간 |
@@ -225,12 +227,20 @@ ITSS_ALLOWED_IPS="*" uvicorn --factory itss_scada.app.main:create_app --port 809
 
 ---
 
-## 8. v2.7.0 변경 사항
+## 8. v2.8.0 변경 사항
+
+- 바닥 sensor 없는 방의 바닥 추정 ON/OFF (`floorEstimateEnabled`, 방 등록 폼·방 테이블 토글, `PATCH /api/v1/rooms/{name}`)
+- 방 테이블에서 floor offset `±0.1 °C` 조절, RC 피팅 제안 offset 원클릭 적용 (`/status` 의 `suggestedFloorOffsets`)
+- 추정 OFF 방: P200 생략·실내 기준 multi-zone 제어, 과열/설정 바닥 상한은 마스터 실측 대리 판정 (`ESTIMATE_OFF`, `guardFloor`)
+- 바닥 sensor 방에 추정/offset 설정 시 HTTP 409, offset 범위 −5.0 ~ +5.0 °C (HTTP 422)
+- DB `rooms.floor_estimate_enabled` 컬럼 자동 마이그레이션 (기존 방은 ON 유지)
+
+## 9. v2.7.0 변경 사항
 
 | 구분 | 내용 |
 | :--- | :--- |
 | 배포/보안 | `ports` 제거(Ingress 전용), 앱 IP 필터(403), `arch: amd64` 전용, 베이스 이미지 날짜 태그 고정, 의존성 `==` 고정, `run.sh` 가 `uvicorn --factory` 로 기동 |
-| 안전 | 과열 기준 `const.py` 단일 출처(실내 23.0 °C / 바닥 24.0 °C, AUTO/MANUAL 공통), 마스터 바닥 미설정 시 AUTO 차단 + LIVE 전환 409, 수동 ON 보호(센서 누락/stale, 바닥 상한 래치), 제어 회차 `asyncio.Lock` 직렬화, 설정 교차 검증(422), 입력 검증/UI escape |
+| 안전 | 과열 기준 `const.py` 단일 출처(실내 24.0 °C / 바닥 25.0 °C, AUTO/MANUAL 공통), 마스터 바닥 미설정 시 AUTO 차단 + LIVE 전환 409, 수동 ON 보호(센서 누락/stale, 바닥 상한 래치), 제어 회차 `asyncio.Lock` 직렬화, 설정 교차 검증(422), 입력 검증/UI escape |
 | 센서 | `last_reported` 기반 보고 주기 학습, 적응형 stale 임계(`last_reported` 기준 간격 6개 이상 + 관측 6 h 이상일 때만 `clamp(2.0 x 최대 보고 간격, 600 s, 7200 s)` (최대 보고 간격 = max(최근 간격, 최근 24 h 내 120 s 이상 공백)). 그 외 7200 s), 센서 시각 기준 선형 보간 기울기(이벤트형 Zigbee 환기 오탐 수정), 바닥 지연 보상(상한 1.0 °C), 보고 주기에 따른 추세 구간 확장 |
 | 제어 | 재량 반전에만 채터링 방지, 최소 펄스 5 min, 목표 상태면 명령 생략(`NO_CHANGE`, 30 min 재동기화), 조절기 `current_temperature` 기반 동적 HEAT/OFF 설정온도(HEAT 최대 +3.0 °C, `min_temp`/`max_temp` 준수), 명령 실패 알림, 난방 부족 알림(목표 - 0.3 °C 미달 90 min), 루프 3회 연속 실패 알림 + `/health degraded` |
 | 통계/학습 | KPI/보일러 통계/차트를 24 h 시간 기준으로 집계, dry-run 가상 HEAT 제외, `GET /api/v1/chart`, RC 피팅은 마스터 실측 바닥 + 실제 dt + 회차별 외기 + 패턴 탐색(>= 30 샘플), 슬레이브 offset 은 제안만 |
@@ -244,4 +254,4 @@ ITSS_ALLOWED_IPS="*" uvicorn --factory itss_scada.app.main:create_app --port 809
 
 1. Dry-Run 으로 1~2일 운전하며 `itss.cycle` 로그와 JSONL 트레이스의 `decision.reason` 분포를 확인하십시오.
 2. 마스터 바닥 sensor 의 관측 보고 주기가 UI 에 학습된 뒤(표본 6개 이상, 관측 6 h 이상) stale 임계가 적절한지 점검하십시오.
-3. `floor_off_limit_c`(26.5 °C)와 과열 차단 바닥 기준(24.0 °C)의 관계를 의도에 맞게 정리하십시오(현재는 과열 차단이 먼저 작동).
+3. `floor_off_limit_c`(26.5 °C)와 과열 차단 바닥 기준(25.0 °C)의 관계를 의도에 맞게 정리하십시오(현재는 과열 차단이 먼저 작동).

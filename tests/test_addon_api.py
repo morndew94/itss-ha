@@ -61,10 +61,10 @@ def test_addon_v2_full_workflow(tmp_path: Path):
         assert "no-store" in r_html.headers.get("cache-control", "").lower()
         assert "no-cache" in r_html.headers.get("pragma", "").lower()
         health = client.get("/health").json()
-        assert health["appVersion"] == "2.7.0"
+        assert health["appVersion"] == "2.8.0"
         repo_root = Path(__file__).resolve().parents[1]
-        assert 'version: "2.7.0"' in (repo_root / "itss_scada" / "config.yaml").read_text(encoding="utf-8")
-        assert 'ITSS_BUILD_VERSION="2.7.0"' in (repo_root / "itss_scada" / "Dockerfile").read_text(encoding="utf-8")
+        assert 'version: "2.8.0"' in (repo_root / "itss_scada" / "config.yaml").read_text(encoding="utf-8")
+        assert 'ITSS_BUILD_VERSION="2.8.0"' in (repo_root / "itss_scada" / "Dockerfile").read_text(encoding="utf-8")
         assert len(client.get("/api/v1/ha/entities").json()["tempSensors"]) == 1
 
         # Verify physical boiler-running detection (setpoint > current_temperature)

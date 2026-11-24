@@ -271,6 +271,7 @@ class RoomCreateRequest(BaseModel):
     climateEntity: str = Field(..., pattern=r"^climate\.[a-z0-9_]+$")
     windowSensorEntity: str = Field(default="", pattern=OPTIONAL_ENTITY_ID_PATTERN)
     hasFloorSensor: bool = False
+    floorEstimateEnabled: bool = True  # 바닥 센서 없는 방: 마스터 실측 + offset 추정 사용 여부
     floorOffsetC: float = Field(default=0.0, ge=-5.0, le=5.0)
     targetTemp: float = Field(default=23.0, ge=10.0, le=27.0)
     controlMode: str = Field(default="AUTO", pattern="^(AUTO|MANUAL)$")
@@ -283,6 +284,7 @@ class RoomPatchRequest(BaseModel):
     controlMode: str | None = Field(default=None, pattern="^(AUTO|MANUAL)$")
     manualAction: str | None = Field(default=None, pattern="^(HEAT|OFF|HOLD)$")
     floorOffsetC: float | None = Field(default=None, ge=-5.0, le=5.0)
+    floorEstimateEnabled: bool | None = None
 
 
 class SettingsPatchRequest(BaseModel):
@@ -769,6 +771,11 @@ class ItssEngine:
                 if len(temps) >= 3:
                     suggested[rm["roomName"]] = max(-2.0, min(2.0, round(sum(temps) / len(temps) - master_mean, 1)))
 
+        # UI 에서 방별 '제안값 적용' 버튼으로 쓰도록 보관 (자동 적용 안 함)
+        self.db.set_kv(
+            "suggested_floor_offsets",
+            {"computedAt": now.isoformat(timespec="seconds"), "offsets": suggested},
+        )
         lag_profiles = self.refresh_lag_profiles()
         return {
             "rcFit": rc_result,
@@ -860,6 +867,32 @@ class ItssEngine:
             return MIN_PULSE_MIN
         ratio = max(0.25, (headroom / full_surge) * 0.75)
         return round(max(MIN_PULSE_MIN, min(base_max_run_min, base_max_run_min * ratio)), 1)
+
+    @staticmethod
+    def _room_floor(
+        rm: dict[str, Any],
+        master_floor: float | None,
+        floor_configured: bool,
+    ) -> tuple[float | None, str, float | None]:
+        """방 바닥값 결정 -> (제어/표시용 바닥, 출처, 안전 판정용 바닥).
+
+        - MEASURED     : 바닥 센서 방 = 마스터 실측
+        - ESTIMATED    : 바닥 센서 없는 방 + 추정 ON = 마스터 실측 + offset
+        - ESTIMATE_OFF : 바닥 센서 없는 방 + 추정 OFF = 방 바닥값 없음(P200 생략, 실내 기준 제어),
+                         안전 판정(과열/일반 상한)만 마스터 실측을 대리값으로 사용
+        - MISSING / UNCONFIGURED : 마스터 바닥 미수신 / 미설정
+        """
+        if not floor_configured:
+            return None, "UNCONFIGURED", None
+        if master_floor is None:
+            return None, "MISSING", None
+        if rm["hasFloorSensor"]:
+            v = round(master_floor, 1)
+            return v, "MEASURED", v
+        if bool(rm.get("floorEstimateEnabled", True)):
+            v = round(master_floor + float(rm["floorOffsetC"]), 1)
+            return v, "ESTIMATED", v
+        return None, "ESTIMATE_OFF", round(master_floor, 1)
 
     def _build_predictor(self) -> ThermalPredictor:
         """Instantiate the configured P200 predictor (Linear v1.2 or Adaptive RC)."""
@@ -1153,10 +1186,13 @@ class ItssEngine:
         floor_age: float | None,
         floor_stale_sec: float,
     ) -> str | None:
-        """수동 ON 에도 적용되는 최소 안전 조건 (센서 누락/stale, 바닥 상한 + 1.0°C 히스테리시스)."""
+        """수동 ON 에도 적용되는 최소 안전 조건 (센서 누락/stale, 바닥 상한 + 1.0°C 히스테리시스).
+
+        바닥 추정 OFF 방은 마스터 실측(guardFloor)으로 판정한다.
+        """
         if t["floorSrc"] == "UNCONFIGURED":
             return "P000_FLOOR_UNCONFIGURED"
-        if t["roomTemp"] is None or t["effFloor"] is None:
+        if t["roomTemp"] is None or t["guardFloor"] is None:
             return "P000_SENSOR_MISSING"
         if (t["roomAge"] is not None and t["roomAge"] > t["roomStaleSec"]) or (
             floor_age is not None and floor_age > floor_stale_sec
@@ -1164,9 +1200,9 @@ class ItssEngine:
             return "P000_SENSOR_STALE"
         limit = float(self.settings["floorOffLimitC"])
         latched = bool(tm.get("manualFloorLatched"))
-        if t["effFloor"] + t["floorLatency"] >= limit:
+        if t["guardFloor"] + t["floorLatency"] >= limit:
             latched = True
-        elif t["effFloor"] <= limit - 1.0:
+        elif t["guardFloor"] <= limit - 1.0:
             latched = False
         tm["manualFloorLatched"] = latched
         return "P000_FLOOR_LIMIT_OFF" if latched else None
@@ -1353,16 +1389,8 @@ class ItssEngine:
             combustion = detect_boiler_running(c_state)
             is_heating = bool(combustion) if combustion is not None else (hvac_mode == "heat")
 
-            has_floor = rm["hasFloorSensor"]
-            if not floor_configured:
-                eff_floor = None
-                floor_src = "UNCONFIGURED"
-            elif master_floor is not None:
-                eff_floor = round(master_floor + (0.0 if has_floor else rm["floorOffsetC"]), 1)
-                floor_src = "MEASURED" if has_floor else "ESTIMATED"
-            else:
-                eff_floor = None
-                floor_src = "MISSING"
+            eff_floor, floor_src, guard_floor = self._room_floor(rm, master_floor, floor_configured)
+            estimate_on = bool(rm.get("floorEstimateEnabled", True))
 
             tm = self.room_timers.setdefault(r_name, {"heatingStartedAt": None, "cooldownUntil": None})
             # v2.6 이하의 제어주기 기준 샘플 키 정리 (센서 시각 기준 sensor_tracks 로 대체)
@@ -1378,7 +1406,8 @@ class ItssEngine:
                 r_track, now, st.adaptive_window_min(r_track, 10.0, factor=2.0, cap_min=30.0), min_span_min=3.0
             )
             room_stale_sec = st.stale_threshold_sec(r_track)
-            has_eff_floor = eff_floor is not None
+            # 바닥 동특성(기울기/추세/지연)은 안전 판정에 쓰는 바닥값(실측·추정·대리)이 있을 때만 사용
+            has_eff_floor = guard_floor is not None
 
             # 창문 접점 센서 (열림 즉시 차단 + 닫힘 후 10분 회복 대기)
             window_open = False
@@ -1444,7 +1473,9 @@ class ItssEngine:
                 "roomStaleSec": room_stale_sec,
                 "roomInterval": st.typical_interval_sec(r_track),
                 "effFloor": eff_floor,
+                "guardFloor": guard_floor,
                 "floorSrc": floor_src,
+                "floorEstimateEnabled": estimate_on,
                 "vRoomRate": v_room_rate,
                 "vRoomSmooth": v_room_smooth,
                 "vFloor": v_floor_master if has_eff_floor else 0.0,
@@ -1473,6 +1504,7 @@ class ItssEngine:
                         has_floor_sensor=rm["hasFloorSensor"],
                         floor_offset_from_master_c=rm["floorOffsetC"],
                         weight=rm["weight"],
+                        floor_estimate_enabled=estimate_on,
                     )
                 )
 
@@ -1597,14 +1629,16 @@ class ItssEngine:
         exec_started = now_kst_iso()
         cycle_id = f"{now.strftime('%Y%m%d-%H%M%S')}-{seq:05d}-{r_name}"
         eff_floor = t["effFloor"]
+        guard_floor = t["guardFloor"]  # 안전 판정용 (추정 OFF 방은 마스터 실측 대리값)
         floor_src = t["floorSrc"]
+        floor_is_proxy = floor_src == "ESTIMATE_OFF"
         is_manual = rm["controlMode"] == "MANUAL"
-        floor_age_eff = floor_age if eff_floor is not None else None
+        floor_age_eff = floor_age if guard_floor is not None else None
 
         snapshot = SensorSnapshot(
             room_name=r_name,
             room_temp=t["roomTemp"],
-            floor_temp=eff_floor,
+            floor_temp=guard_floor,
             outdoor_temp=outdoor_temp,
             thermostat_hvac_mode=t["hvacMode"],
             combustion_confirmed=t["combustion"],
@@ -1648,12 +1682,14 @@ class ItssEngine:
             "drop5mRoom": t["drop5mRoom"],
             "trend10mRoom": t["trend10mRoom"],
             "trend10mFloor": t["trend10mFloor"],
+            "floorEstimateEnabled": t["floorEstimateEnabled"],
+            "guardFloor": guard_floor,
         }
 
-        # 과열 기준은 const.py 단일 출처 (수동 운전에도 항상 적용)
+        # 과열 기준은 const.py 단일 출처 (수동 운전에도 항상 적용, 추정 OFF 방은 마스터 실측으로 판정)
         overheat = (
             (t["roomTemp"] is not None and t["roomTemp"] >= DEFAULT_OVERHEAT_ROOM_C)
-            or (eff_floor is not None and eff_floor >= DEFAULT_OVERHEAT_FLOOR_C)
+            or (guard_floor is not None and guard_floor >= DEFAULT_OVERHEAT_FLOOR_C)
         )
         lag_prof = self.lag_profiles.get(r_name) or {}
         eff_floor_limit = self._compute_effective_floor_limit(t["effTarget"], outdoor_temp)
@@ -1735,6 +1771,7 @@ class ItssEngine:
                 room_stale_after_sec=t["roomStaleSec"],
                 floor_stale_after_sec=floor_stale_sec,
                 floor_latency_c=t["floorLatency"],
+                floor_is_proxy=floor_is_proxy,
             )
             record.safety_reason = verdict.reason_code
             if verdict.force_off:
@@ -1903,7 +1940,9 @@ class ItssEngine:
                     "roomMaxIntervalSec": t.get("roomMaxInterval"),
                     "roomStaleSec": t["roomStaleSec"],
                     "floorTemp": eff_floor,
+                    "guardFloor": guard_floor,
                     "floorSrc": floor_src,
+                    "floorEstimateEnabled": t["floorEstimateEnabled"],
                     "floorOffsetC": rm["floorOffsetC"],
                     "floorAgeSec": floor_age_eff,
                     "floorStaleSec": floor_stale_sec,
@@ -2129,11 +2168,7 @@ def create_app(
             r_name = rm["roomName"]
             r_temp, _, _, _ = await engine._read_numeric(rm["roomTempEntity"])
             c_state = await engine.ha.get_state(rm["climateEntity"])
-            eff_floor = (
-                round(master_floor + (0.0 if rm["hasFloorSensor"] else rm["floorOffsetC"]), 1)
-                if master_floor is not None
-                else None
-            )
+            eff_floor, floor_src, guard_floor = engine._room_floor(rm, master_floor, engine.floor_configured)
             c_attrs = (c_state.get("attributes") or {}) if c_state else {}
             run_min, cd_min, vent_min = engine._timer_metrics(r_name, now_kst)
             win_open = False
@@ -2161,6 +2196,8 @@ def create_app(
             live_by_room[r_name] = {
                 "roomTemp": r_temp,
                 "floorTemp": eff_floor,
+                "floorSrc": floor_src,
+                "guardFloorTemp": guard_floor,
                 "effectiveTargetTemp": eff_target_live,
                 "climateState": c_state.get("state") if c_state else None,
                 "climateSetpoint": c_attrs.get("temperature"),
@@ -2205,6 +2242,7 @@ def create_app(
             "sensorHealth": engine.sensor_health(now_kst),
             "controlLoop": engine.health_status(),
             "fittedRcParams": engine.db.get_kv("fitted_rc_params"),
+            "suggestedFloorOffsets": engine.db.get_kv("suggested_floor_offsets"),
             "thermalLagProfiles": engine.lag_profiles,
         }
 
@@ -2308,15 +2346,33 @@ def create_app(
 
     @app.patch("/api/v1/rooms/{room_name}")
     async def patch_room(room_name: str, req: RoomPatchRequest) -> dict[str, Any]:
+        before = engine.db.get_room(room_name)
+        if not before:
+            raise HTTPException(status_code=404, detail="Room not found")
+        if before["hasFloorSensor"] and (req.floorEstimateEnabled is not None or req.floorOffsetC is not None):
+            raise HTTPException(
+                status_code=409,
+                detail="바닥 센서(마스터) 방은 실측값을 사용하므로 바닥 추정/offset 을 설정할 수 없습니다.",
+            )
         updated = engine.db.update_room_control(
             room_name,
             target_temp=req.targetTemp,
             control_mode=req.controlMode,
             manual_action=req.manualAction,
             floor_offset_c=req.floorOffsetC,
+            floor_estimate_enabled=req.floorEstimateEnabled,
         )
         if not updated:
             raise HTTPException(status_code=404, detail="Room not found")
+        if updated["floorEstimateEnabled"] != before["floorEstimateEnabled"]:
+            _LOGGER.info(
+                "[%s] 바닥 추정 %s (offset %+.2f°C)",
+                room_name,
+                "ON: 마스터 실측 + offset 사용" if updated["floorEstimateEnabled"] else "OFF: 실내 기준 제어, 안전은 마스터 실측 대리 판정",
+                updated["floorOffsetC"],
+            )
+        if updated["floorOffsetC"] != before["floorOffsetC"]:
+            _LOGGER.info("[%s] 바닥 추정 offset 변경 %+.2f -> %+.2f°C", room_name, before["floorOffsetC"], updated["floorOffsetC"])
         # 수동/자동 전환 시 즉시 1회 제어
         if req.controlMode is not None or req.manualAction is not None:
             await engine.run_control_cycle()

@@ -1,4 +1,4 @@
-# I.T.S.S. Thermal SCADA 애드온 사용 설명서 (v2.7.0)
+# I.T.S.S. Thermal SCADA 애드온 사용 설명서 (v2.8.0)
 
 온돌 방별 제어 + 단일 마스터 바닥 sensor 하이브리드 제어 애드온입니다. **HA Ingress 전용**이며 외부 포트를 열지 않습니다.
 
@@ -19,7 +19,8 @@
 - 하이브리드 다중 방 제어(동시 기동 + 개별 선차단) 또는 `simultaneous` 전략
 - 센서 보고 주기 자동 학습: UI 패널 **"센서 보고 주기 감지 현황"**
 - 24 h 차트, KPI, 보일러 가동 시간/duty/단펄스/추정 가스비 (시험 운전의 가상 HEAT 제외)
-- P400 시간대별 목표 offset 스케줄(UI 편집), RC 피팅 및 슬레이브 floor offset **제안**(자동 적용 안 함)
+- P400 시간대별 목표 offset 스케줄(UI 편집), RC 피팅 및 슬레이브 floor offset **제안**(자동 적용 안 함, 방 테이블 버튼으로 적용)
+- **바닥 sensor 없는 방의 바닥 추정 ON/OFF·offset 조절**: 방 테이블 바닥 칸의 `추정 ON/OFF` 토글, `±0.1 °C` 버튼. 추정 OFF 방은 실내 온도 기준으로 제어하고, 바닥 과열·상한 안전 판정은 마스터 실측값으로 계속 적용합니다.
 - 알림: HA `notify`, Telegram(`chat_id`). Gemini 일일 진단 리포트(버튼, API key 필요)
 
 > Google Calendar 예열, Gemini TTS 음성 경보, Google Sheets 내보내기는 코드에 라이브러리로만 존재하며 **현재 동작하지 않습니다.**
@@ -58,8 +59,8 @@
 
 | 상황 | 동작 |
 | :--- | :--- |
-| 실내 >= 23.0 °C 또는 바닥 >= 24.0 °C | 즉시 OFF (`P000_OVERHEAT_CUTOFF`, `AUTO`/`MANUAL` 공통) |
-| `floor_off_limit_c` > 24.0 °C (기본 26.5 °C) | 과열 차단이 먼저 작동 (`/health` warnings 및 UI 에 경고) |
+| 실내 >= 24.0 °C 또는 바닥 >= 25.0 °C | 즉시 OFF (`P000_OVERHEAT_CUTOFF`, `AUTO`/`MANUAL` 공통) |
+| `floor_off_limit_c` > 25.0 °C (기본 26.5 °C) | 과열 차단이 먼저 작동 (`/health` warnings 및 UI 에 경고) |
 | 센서 누락 / stale | 강제 OFF. 수동 ON 도 차단 |
 | 수동 ON 중 바닥이 `floor_off_limit_c` 도달 | 래치 OFF, `floor_off_limit_c - 1.0 °C` 이하에서 해제 |
 | 환기 급락 / 창문 열림 | 난방 중지 후 보호 시간 유지 |
@@ -94,6 +95,6 @@ flat = pd.json_normalize(df.to_dict("records"))   # inputs.roomTemp, decision.re
 | 난방이 안 켜지고 사유가 `P000_FLOOR_UNCONFIGURED` | `master_floor_entity` 설정 |
 | LIVE 전환이 409 로 거부됨 | 마스터 바닥 sensor 설정 필요 |
 | 설정 저장이 422 | `heat_off_setpoint <= heat_on_setpoint - 3.0 °C` 확인 |
-| 사유가 `P000_OVERHEAT_CUTOFF` 로 반복 | 실내 23.0 °C / 바닥 24.0 °C 도달 여부, 트레이스 `limits` 확인 |
+| 사유가 `P000_OVERHEAT_CUTOFF` 로 반복 | 실내 24.0 °C / 바닥 25.0 °C 도달 여부, 트레이스 `limits` 확인 |
 | 접속 403 | Ingress(사이드바)로 접속하십시오 |
 | `/health` 가 `degraded` | 로그의 "제어 회차 실패" 항목 확인 |

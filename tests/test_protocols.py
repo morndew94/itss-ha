@@ -32,9 +32,13 @@ def test_p000_overheat_cutoff():
 
 
 def test_p000_general_floor_limit():
-    sentinel = SentinelProtocol()
-    # 기본 일반 바닥 상한(DEFAULT_GENERAL_OFF_FLOOR_C) 이상, 과열 기준 미만
-    snap = SensorSnapshot(room_name="living", room_temp=21.0, floor_temp=21.0)
+    # 설정 바닥 상한 이상 & 과열 기준 미만 (const.py 과열 값을 조정해도 성립하도록 상대값 사용)
+    from itss_scada.app.const import DEFAULT_OVERHEAT_FLOOR_C, DEFAULT_OVERHEAT_ROOM_C
+    from itss_scada.app.protocols.p000_sentinel import SentinelConfig
+
+    limit = DEFAULT_OVERHEAT_FLOOR_C - 1.0
+    sentinel = SentinelProtocol(SentinelConfig(general_off_floor_c=limit))
+    snap = SensorSnapshot(room_name="living", room_temp=DEFAULT_OVERHEAT_ROOM_C - 2.0, floor_temp=limit + 0.1)
     verdict = sentinel.evaluate(snap, is_heating=True)
     assert verdict.force_off is True
     assert verdict.reason_code == "P000_FLOOR_LIMIT_OFF"

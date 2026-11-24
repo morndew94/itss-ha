@@ -8,8 +8,8 @@ COPY requirements.txt /app/requirements.txt
 RUN pip3 install --no-cache-dir -r /app/requirements.txt
 
 # 릴리스마다 ITSS_BUILD_VERSION을 올려 Docker 앱 레이어 캐시를 무효화
-ENV ITSS_BUILD_VERSION="2.7.0"
-LABEL itss.version="2.7.0"
+ENV ITSS_BUILD_VERSION="2.8.0"
+LABEL itss.version="2.8.0"
 
 COPY app /app/app
 COPY run.sh /app/run.sh
