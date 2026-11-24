@@ -75,12 +75,22 @@ class LinearExtrapolationV12(ThermalPredictor):
         upper_bound = effective_target + self.band_half_c
         lower_bound = effective_target - self.band_half_c
 
+        # Estimate radiant heat gain still stored in the warm floor slab
+        slab_surplus_c = max(0.0, data.floor_temp - effective_target)
+        # Floor above target + 3.5C (or projected floor surge) signals enough stored slab heat
+        floor_already_charged = (f_pred >= effective_target + 4.0 and data.v_floor_per_min > 0.03)
+
         if data.is_heating:
-            # Predictive OFF when projected room temp + learned residual exceeds upper band
-            action = "OFF" if (r_pred + residual_rise) >= upper_bound else "HEAT"
+            # Predictive OFF when projected room temp + learned residual reaches upper band,
+            # OR when rapidly rising floor slab is already overcharged relative to target
+            action = "OFF" if ((r_pred + residual_rise) >= upper_bound or floor_already_charged) else "HEAT"
         else:
-            # Predictive ON when projected room temp falls below lower band
-            action = "HEAT" if r_pred <= lower_bound else "OFF"
+            # Predictive ON when projected room temp falls below lower band,
+            # unless slab is actively heating up and already warmer than target
+            if r_pred <= lower_bound and not (slab_surplus_c >= 0.8 and data.v_floor_per_min >= 0.03):
+                action = "HEAT"
+            else:
+                action = "OFF"
 
         return ThermalPrediction(
             model_name=self.model_name,

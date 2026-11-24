@@ -55,17 +55,19 @@ PRESET_OFFSETS = {
 REASON_KO = {
     "P000_OVERHEAT_CUTOFF": "긴급 과열 차단(실내 >= 27°C 또는 바닥 >= 29°C)",
     "P000_FLOOR_LIMIT_OFF": "바닥 온도 상한 도달(잔열 과다 방지 차단)",
-    "P000_MAX_RUN_CUTOFF": "외기 연동 1회 최대 가동 시간 도달(잔열 휴지 진입)",
+    "P000_FLOOR_PREDICTED_LIMIT": "바닥 잔열 상승 예측 상한 도달(바닥 오버슈트 선차단)",
+    "P000_FLOOR_RESIDUAL_ACTIVE": "따뜻한 바닥 잔열 방출·실내 회복 중(연속 재가동 보류)",
+    "P000_MAX_RUN_CUTOFF": "외기·바닥 여유 연동 1회 최대 가동 시간 도달(잔열 휴지 진입)",
     "P000_RESIDUAL_COOLDOWN": "차단 후 잔열 흡수 대기 중",
     "P000_WINDOW_OPEN": "창문 열림 센서 감지(즉시 난방 중지)",
-    "P000_VENTILATION_PROTECT": "환기 급락 감지(1분 급락/5분 공기급랭 -> 환기 보호 유지 시작)",
+    "P000_VENTILATION_PROTECT": "환기 급락 감지(1분 급락/5분 급랭 -> 환기 보호 유지 시작)",
     "P000_VENTILATION_HOLD": "환기 보호 및 자연 회복 대기 중",
     "P000_SENSOR_MISSING": "온도 센서 값 누락으로 안전 차단",
     "P000_SENSOR_STALE": "온도 센서 장시간 미갱신으로 안전 차단",
     "P000_ANTI_CHATTER": "최소 가동/휴지 시간 유지(채터링 방지)",
     "P000_MANUAL_OVERRIDE": "사용자 수동 운전 조작",
     "P200_PREDICTIVE_ON": "P200 예측 온도가 목표 하한 이하 하락 예상(예측 기동)",
-    "P200_PREDICTIVE_OFF": "P200 30분 예측/잔열이 목표 상한 도달 예상(예측 선차단)",
+    "P200_PREDICTIVE_OFF": "P200 예측/바닥 잔열이 목표 상한 도달 예상(예측 선차단)",
     "HYBRID_COHEAT_BATCH": "타 방 보일러 가동 중 동시 난방 합류(단펄스 방지)",
     "HYBRID_EARLY_CUTOFF": "목표 상한 도달(개별 선차단)",
     "SIMULTANEOUS_WEIGHTED_DEMAND": "전체 방 가중평균 하한 도달(동시 기동)",
@@ -349,6 +351,7 @@ class ItssEngine:
                     "P000_RESIDUAL_COOLDOWN",
                     "P000_MAX_RUN_CUTOFF",
                     "P000_FLOOR_LIMIT_OFF",
+                    "P000_FLOOR_PREDICTED_LIMIT",
                     "P000_OVERHEAT_CUTOFF",
                     "P200_PREDICTIVE_OFF",
                     "HYBRID_EARLY_CUTOFF",
@@ -512,6 +515,37 @@ class ItssEngine:
                 pass
         return round(run_min, 1), round(cd_min, 1), round(vent_min, 1)
 
+    def _compute_effective_floor_limit(self, eff_target: float, outdoor_temp: float | None) -> float:
+        """Compute target-linked dynamic floor ceiling bounded by configured floorOffLimitC."""
+        configured = float(self.settings["floorOffLimitC"])
+        if outdoor_temp is not None and outdoor_temp <= -5.0:
+            margin = 4.5
+        elif outdoor_temp is not None and outdoor_temp > 5.0:
+            margin = 3.0
+        else:
+            margin = 3.5
+        return round(min(configured, eff_target + margin), 1)
+
+    def _compute_floor_scaled_max_run(
+        self,
+        *,
+        base_max_run_min: float,
+        floor_temp: float | None,
+        effective_floor_limit_c: float,
+        expected_floor_surge_c: float,
+    ) -> float:
+        """Shorten single-run pulse proportionally when floor is already pre-warmed."""
+        if floor_temp is None:
+            return base_max_run_min
+        headroom = effective_floor_limit_c - floor_temp
+        full_surge = max(2.0, expected_floor_surge_c)
+        if headroom >= full_surge:
+            return base_max_run_min
+        if headroom <= 0.5:
+            return 3.0
+        ratio = max(0.25, (headroom / full_surge) * 0.75)
+        return round(max(3.0, min(base_max_run_min, base_max_run_min * ratio)), 1)
+
     def _build_predictor(self) -> ThermalPredictor:
         """Instantiate the configured P200 predictor (Linear v1.2 or Adaptive RC)."""
         if self.settings.get("predictorModel") == MODEL_ADAPTIVE_RC:
@@ -551,6 +585,7 @@ class ItssEngine:
         is_critical = reason_code in (
             "P000_OVERHEAT_CUTOFF",
             "P000_FLOOR_LIMIT_OFF",
+            "P000_FLOOR_PREDICTED_LIMIT",
             "P000_MAX_RUN_CUTOFF",
             "P000_WINDOW_OPEN",
             "P000_VENTILATION_PROTECT",
@@ -663,15 +698,15 @@ class ItssEngine:
                 if eff_floor is not None:
                     tm["prevFloorTemp"] = eff_floor
 
-            # 5-minute sliding window for air-only drop detection (cross-checked against floor)
+            # 16-minute sliding window for 5m ventilation drop, 10-15m residual trend, & smoothed P200 slopes
             samples: list[dict[str, Any]] = list(tm.get("recentSamples") or [])
             if r_temp is not None:
                 samples.append({"ts": now.isoformat(timespec="seconds"), "r": r_temp, "f": eff_floor})
             kept_samples: list[dict[str, Any]] = []
-            for s in samples[-15:]:
+            for s in samples[-25:]:
                 try:
                     age_m = (now - datetime.fromisoformat(str(s["ts"]))).total_seconds() / 60.0
-                    if 0.0 <= age_m <= 7.0:
+                    if 0.0 <= age_m <= 16.0:
                         kept_samples.append(s)
                 except ValueError:
                     pass
@@ -679,14 +714,42 @@ class ItssEngine:
 
             drop_5m_room: float | None = None
             drop_5m_floor: float | None = None
+            trend_10m_room: float | None = None
+            trend_10m_floor: float | None = None
+            v_room_smooth = v_room
+            v_floor_smooth = v_floor
+
             if r_temp is not None and len(kept_samples) >= 2:
-                oldest = kept_samples[0]
+                # 5-minute sub-window (samples within <= 7 min) for ventilation drop detection
+                win_5m = []
+                for s in kept_samples:
+                    try:
+                        age_m = (now - datetime.fromisoformat(str(s["ts"]))).total_seconds() / 60.0
+                        if 0.0 <= age_m <= 7.0:
+                            win_5m.append(s)
+                    except ValueError:
+                        pass
+                if len(win_5m) >= 2:
+                    oldest_5 = win_5m[0]
+                    try:
+                        span_5 = (now - datetime.fromisoformat(str(oldest_5["ts"]))).total_seconds() / 60.0
+                        if span_5 >= 1.0:
+                            drop_5m_room = round(r_temp - float(oldest_5["r"]), 2)
+                            if eff_floor is not None and oldest_5.get("f") is not None:
+                                drop_5m_floor = round(eff_floor - float(oldest_5["f"]), 2)
+                    except (ValueError, TypeError):
+                        pass
+
+                # 10-15 minute full window for residual heat soak trend & smoothed P200 slopes
+                oldest_15 = kept_samples[0]
                 try:
-                    span_m = (now - datetime.fromisoformat(str(oldest["ts"]))).total_seconds() / 60.0
-                    if span_m >= 1.0:
-                        drop_5m_room = round(r_temp - float(oldest["r"]), 2)
-                        if eff_floor is not None and oldest.get("f") is not None:
-                            drop_5m_floor = round(eff_floor - float(oldest["f"]), 2)
+                    span_15 = (now - datetime.fromisoformat(str(oldest_15["ts"]))).total_seconds() / 60.0
+                    if span_15 >= 3.0:
+                        trend_10m_room = round(r_temp - float(oldest_15["r"]), 2)
+                        v_room_smooth = (r_temp - float(oldest_15["r"])) / span_15
+                        if eff_floor is not None and oldest_15.get("f") is not None:
+                            trend_10m_floor = round(eff_floor - float(oldest_15["f"]), 2)
+                            v_floor_smooth = (eff_floor - float(oldest_15["f"])) / span_15
                 except (ValueError, TypeError):
                     pass
 
@@ -730,8 +793,8 @@ class ItssEngine:
                         floor_temp=eff_floor,
                         target_temp=rm["targetTemp"],
                         is_heating=is_heating,
-                        v_floor_per_min=v_floor,
-                        v_room_per_min=v_room,
+                        v_floor_per_min=v_floor_smooth,
+                        v_room_per_min=v_room_smooth,
                         outdoor_temp=outdoor_temp,
                         atmos_loss_offset_c=atmos_offset,
                         circadia_target_offset_c=schedule_offset + preset_offset,
@@ -748,6 +811,7 @@ class ItssEngine:
                 "effFloor": eff_floor,
                 "floorSrc": floor_src,
                 "vRoom": v_room,
+                "vFloor": v_floor_smooth,
                 "hvacMode": hvac_mode,
                 "isHeating": is_heating,
                 "combustion": combustion,
@@ -758,6 +822,8 @@ class ItssEngine:
                 "windowOpen": window_open,
                 "drop5mRoom": drop_5m_room,
                 "drop5mFloor": drop_5m_floor,
+                "trend10mRoom": trend_10m_room,
+                "trend10mFloor": trend_10m_floor,
             }
 
             if rm["controlMode"] == "AUTO" and r_temp is not None:
@@ -839,11 +905,20 @@ class ItssEngine:
                 or (eff_floor is not None and eff_floor >= 29.0)
             )
             lag_prof = self.lag_profiles.get(r_name) or {}
-            room_max_run_min = max(
+            eff_floor_limit = self._compute_effective_floor_limit(t["effTarget"], outdoor_temp)
+            learned_floor_surge = max(1.2, min(4.0, float(lag_prof.get("floorResidualRiseC", 1.2))))
+            base_room_max_run = max(
                 5.0,
                 min(15.0, max_run_min - float(lag_prof.get("recommendedRunTrimMin", 0.0))),
             )
+            room_max_run_min = self._compute_floor_scaled_max_run(
+                base_max_run_min=base_room_max_run,
+                floor_temp=eff_floor,
+                effective_floor_limit_c=eff_floor_limit,
+                expected_floor_surge_c=learned_floor_surge,
+            )
             room_cooldown_min = int(lag_prof.get("recommendedCooldownMin", self.settings["cooldownMin"]))
+            poll_interval_min = max(0.5, float(self.settings["updateIntervalSec"]) / 60.0)
             tm = self.room_timers.setdefault(r_name, {"heatingStartedAt": None, "cooldownUntil": None})
             decision_reason = "P000_OK"
 
@@ -866,24 +941,35 @@ class ItssEngine:
                     snapshot,
                     is_heating=t["isHeating"],
                     v_room_per_min=t["vRoom"],
+                    v_floor_per_min=t["vFloor"],
                     continuous_run_min=t["runMin"],
                     max_run_min=room_max_run_min,
+                    poll_interval_min=poll_interval_min,
                     cooldown_remaining_min=t["cdMin"],
                     window_open=t["windowOpen"],
                     drop_5m_room_c=t["drop5mRoom"],
                     drop_5m_floor_c=t["drop5mFloor"],
                     ventilation_remaining_min=t["ventMin"],
+                    effective_floor_limit_c=eff_floor_limit,
+                    expected_floor_surge_c=learned_floor_surge,
+                    trend_10m_room_c=t["trend10mRoom"],
+                    trend_10m_floor_c=t["trend10mFloor"],
                 )
                 record.safety_reason = verdict.reason_code
                 if verdict.force_off:
                     decision_reason = verdict.reason_code
                     record.command_action = "OFF"
                     record.execution_status = "SKIPPED_SAFETY"
-                    if verdict.reason_code in ("P000_MAX_RUN_CUTOFF", "P000_FLOOR_LIMIT_OFF"):
+                    if verdict.reason_code in (
+                        "P000_MAX_RUN_CUTOFF",
+                        "P000_FLOOR_LIMIT_OFF",
+                        "P000_FLOOR_PREDICTED_LIMIT",
+                    ):
+                        if t["isHeating"] or verdict.reason_code == "P000_FLOOR_LIMIT_OFF":
+                            tm["cooldownUntil"] = (
+                                now + timedelta(minutes=room_cooldown_min)
+                            ).isoformat(timespec="seconds")
                         tm["heatingStartedAt"] = None
-                        tm["cooldownUntil"] = (
-                            now + timedelta(minutes=room_cooldown_min)
-                        ).isoformat(timespec="seconds")
                     elif verdict.reason_code == "P000_VENTILATION_PROTECT":
                         tm["heatingStartedAt"] = None
                         tm["ventilationUntil"] = (
@@ -1058,6 +1144,7 @@ def create_app(
                 latest_by_room[c["roomName"]] = c
 
         now_kst = datetime.now(tz=KST)
+        sched_offset, sched_label = engine.db.active_schedule_offset(now_kst.hour)
         master_floor, _, _ = await engine.ha.get_numeric_state(engine.settings["masterFloorEntity"])
         outdoor_temp, _, outdoor_source = await engine._read_outdoor_weather()
         active_max_run = engine.atmos.compute_max_run_minutes(
@@ -1084,6 +1171,16 @@ def create_app(
                 w_raw = await engine.ha.get_state(win_ent)
                 if w_raw:
                     win_open = str(w_raw.get("state") or "").lower() in ("on", "open")
+            eff_target_live = round(rm["targetTemp"] + sched_offset + PRESET_OFFSETS.get(engine.active_preset, 0.0), 2)
+            eff_floor_cap = engine._compute_effective_floor_limit(eff_target_live, outdoor_temp)
+            lag_p = engine.lag_profiles.get(r_name) or {}
+            surge_est = max(1.2, min(4.0, float(lag_p.get("floorResidualRiseC", 1.2))))
+            eff_max_run = engine._compute_floor_scaled_max_run(
+                base_max_run_min=max(5.0, min(15.0, active_max_run - float(lag_p.get("recommendedRunTrimMin", 0.0)))),
+                floor_temp=eff_floor,
+                effective_floor_limit_c=eff_floor_cap,
+                expected_floor_surge_c=surge_est,
+            )
             live_by_room[r_name] = {
                 "roomTemp": r_temp,
                 "floorTemp": eff_floor,
@@ -1092,12 +1189,12 @@ def create_app(
                 "climateCurrentTemp": c_attrs.get("current_temperature"),
                 "boilerRunning": boiler_running,
                 "runtimeMin": run_min,
+                "effectiveMaxRunMin": eff_max_run,
+                "effectiveFloorLimitC": eff_floor_cap,
                 "cooldownRemainMin": cd_min,
                 "ventilationRemainMin": vent_min,
                 "windowOpen": win_open,
             }
-
-        sched_offset, sched_label = engine.db.active_schedule_offset(now_kst.hour)
 
         return {
             "timeKst": now_kst_iso(),

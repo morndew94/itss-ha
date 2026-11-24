@@ -170,3 +170,74 @@ def test_ventilation_5m_window_latch_and_contact_sensor(tmp_path: Path):
         assert r2["records"][0]["safetyReason"] == "P000_VENTILATION_HOLD"
         assert r2["records"][0]["commandAction"] == "OFF"
 
+
+def test_double_run_floor_overshoot_prevention(tmp_path: Path):
+    """Reproduce the exact chart scenario: warm rising floor & rebounding room must NOT fire a full 2nd run."""
+    from itss_scada.app.models.schema import SensorSnapshot
+    from itss_scada.app.protocols.p000_sentinel import SentinelConfig, SentinelProtocol
+
+    sentinel = SentinelProtocol(SentinelConfig(general_off_floor_c=26.5))
+
+    # 1. Floor still releasing residual heat (21.6 -> 22.4C, +0.8C) & room rebounding (19.7 -> 20.5C, +0.8C)
+    # Even if 1-step room slope is 0.0 (20.5 -> 20.5C flat quantization), 2nd ignition MUST be blocked!
+    snap_rebound = SensorSnapshot("방3", room_temp=20.5, floor_temp=22.4)
+    v_res = sentinel.evaluate(
+        snap_rebound,
+        is_heating=False,
+        v_room_per_min=0.0,
+        effective_floor_limit_c=25.0,
+        expected_floor_surge_c=3.0,
+        trend_10m_room_c=0.8,
+        trend_10m_floor_c=0.8,
+    )
+    assert v_res.force_off is True
+    assert v_res.reason_code == "P000_FLOOR_RESIDUAL_ACTIVE"
+
+    # 2. While heating, projected floor peak (22.4 + 3.0 = 25.4 >= 25.0 dynamic cap) cuts off early
+    v_pred = sentinel.evaluate(
+        snap_rebound,
+        is_heating=True,
+        effective_floor_limit_c=25.0,
+        expected_floor_surge_c=3.0,
+    )
+    assert v_pred.force_off is True
+    assert v_pred.reason_code == "P000_FLOOR_PREDICTED_LIMIT"
+
+    # 3. Step-aware max-run cutoff: with 5-min polling & 11-min cap, cut off at 10m instead of overrunning to 15m
+    v_step = sentinel.evaluate(
+        SensorSnapshot("방3", room_temp=21.2, floor_temp=20.5),
+        is_heating=True,
+        continuous_run_min=10.0,
+        max_run_min=11.0,
+        poll_interval_min=5.0,
+    )
+    assert v_step.force_off is True
+    assert v_step.reason_code == "P000_MAX_RUN_CUTOFF"
+
+    # 4. Severe 5m room drop (-1.0C) still triggers ventilation even if floor cooled post-peak (-0.6C)
+    v_sev = sentinel.evaluate(
+        SensorSnapshot("방3", room_temp=20.2, floor_temp=22.0),
+        is_heating=False,
+        v_room_per_min=-0.10,
+        drop_5m_room_c=-1.0,
+        drop_5m_floor_c=-0.6,
+    )
+    assert v_sev.force_off is True
+    assert v_sev.reason_code == "P000_VENTILATION_PROTECT"
+
+    # 5. End-to-end engine scaling: cold floor (19.4C) gets full pulse; pre-warmed floor (22.4C) gets shortened pulse
+    ha = StaticFakeHA(room_temp=20.5, floor_temp=22.4, heating=False)
+    app = create_app(db_path=str(tmp_path / "scale.db"), ha_client=ha)
+    eng = app.state.engine
+    eff_cap = eng._compute_effective_floor_limit(21.5, outdoor_temp=3.0)
+    assert eff_cap == 25.0
+    cold_run = eng._compute_floor_scaled_max_run(
+        base_max_run_min=11.0, floor_temp=19.4, effective_floor_limit_c=eff_cap, expected_floor_surge_c=3.4
+    )
+    warm_run = eng._compute_floor_scaled_max_run(
+        base_max_run_min=11.0, floor_temp=22.4, effective_floor_limit_c=eff_cap, expected_floor_surge_c=3.4
+    )
+    assert cold_run == 11.0
+    assert warm_run <= 6.5
+
+

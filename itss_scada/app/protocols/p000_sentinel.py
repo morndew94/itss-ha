@@ -41,14 +41,20 @@ class SentinelProtocol:
         *,
         is_heating: bool,
         v_room_per_min: float = 0.0,
+        v_floor_per_min: float = 0.0,
         seconds_since_last_switch: float | None = None,
         continuous_run_min: float | None = None,
         max_run_min: float | None = None,
+        poll_interval_min: float = 1.0,
         cooldown_remaining_min: float | None = None,
         window_open: bool = False,
         drop_5m_room_c: float | None = None,
         drop_5m_floor_c: float | None = None,
         ventilation_remaining_min: float | None = None,
+        effective_floor_limit_c: float | None = None,
+        expected_floor_surge_c: float = 0.0,
+        trend_10m_room_c: float | None = None,
+        trend_10m_floor_c: float | None = None,
     ) -> SafetyVerdict:
         """Run prioritized safety checks.
 
@@ -56,10 +62,11 @@ class SentinelProtocol:
           1. Manual override priority
           2. Sensor validity and staleness
           3. Hard overheat cutoff (room >= 27C or floor >= 29C)
-          4. General floor upper limit (configurable, e.g. floor >= 26.5C)
-          5. Maximum single-run pulse duration cap (<= 15 min) & residual-heat cooldown
-          6. Ventilation rapid-drop protection
-          7. Anti-chattering (minimum ON/OFF dwell time)
+          4. General & dynamic/predicted floor upper limit
+          5. Maximum single-run pulse duration cap (step-aware, <= 15 min) & residual cooldown
+          6. Active floor residual soak / room rebound guard (blocks premature 2nd run)
+          7. Ventilation rapid-drop & window-open protection
+          8. Anti-chattering (minimum ON/OFF dwell time)
         """
         # 1. Respect manual user intervention above automated control
         if snapshot.manual_override_active:
@@ -112,33 +119,58 @@ class SentinelProtocol:
                 ),
             )
 
-        # 4. General floor OFF upper limit
-        if snapshot.floor_temp >= self.config.general_off_floor_c:
+        # 4a. Hard configured floor OFF upper limit (and dynamic target-linked limit while heating)
+        floor_cap = (
+            min(self.config.general_off_floor_c, effective_floor_limit_c)
+            if effective_floor_limit_c is not None
+            else self.config.general_off_floor_c
+        )
+        active_cap = floor_cap if is_heating else self.config.general_off_floor_c
+        if snapshot.floor_temp >= active_cap:
             return SafetyVerdict(
                 allow_heating=False,
                 force_off=True,
                 hold_current_state=False,
                 reason_code="P000_FLOOR_LIMIT_OFF",
-                message=f"Floor temperature reached {snapshot.floor_temp:.1f}C general OFF limit.",
+                message=f"Floor temperature reached {snapshot.floor_temp:.1f}C >= {active_cap:.1f}C limit.",
             )
 
-        # 5a. Max single-run heating pulse cap (outdoor-adaptive, hard-capped <= 15 min)
+        # 4b. Predicted post-OFF floor peak guard while actively heating (prevents slab surge past floor_cap)
+        if effective_floor_limit_c is not None and is_heating:
+            projected_floor = max(
+                snapshot.floor_temp + max(0.0, expected_floor_surge_c),
+                snapshot.floor_temp + max(0.0, v_floor_per_min) * 10.0,
+            )
+            if projected_floor >= floor_cap:
+                return SafetyVerdict(
+                    allow_heating=False,
+                    force_off=True,
+                    hold_current_state=False,
+                    reason_code="P000_FLOOR_PREDICTED_LIMIT",
+                    message=(
+                        f"Projected floor peak {projected_floor:.1f}C >= {floor_cap:.1f}C "
+                        f"(now={snapshot.floor_temp:.1f}C, surge=+{expected_floor_surge_c:.1f}C)."
+                    ),
+                )
+
+        # 5a. Max single-run heating pulse cap (step-aware so 5-min polling never overruns cap)
         if (
             is_heating
             and continuous_run_min is not None
             and max_run_min is not None
-            and continuous_run_min >= max_run_min
         ):
-            return SafetyVerdict(
-                allow_heating=False,
-                force_off=True,
-                hold_current_state=False,
-                reason_code="P000_MAX_RUN_CUTOFF",
-                message=(
-                    f"Single run reached {continuous_run_min:.1f}m >= {max_run_min:.1f}m cap; "
-                    "cutting off for residual heat soak."
-                ),
-            )
+            lookahead_min = max(0.0, (poll_interval_min - 1.0) * 0.5)
+            if continuous_run_min + lookahead_min >= max_run_min:
+                return SafetyVerdict(
+                    allow_heating=False,
+                    force_off=True,
+                    hold_current_state=False,
+                    reason_code="P000_MAX_RUN_CUTOFF",
+                    message=(
+                        f"Single run reached {continuous_run_min:.1f}m (cap {max_run_min:.1f}m); "
+                        "cutting off for residual heat soak."
+                    ),
+                )
 
         # 5b. Post-cutoff residual heat soak cooldown
         if cooldown_remaining_min is not None and cooldown_remaining_min > 0:
@@ -148,6 +180,19 @@ class SentinelProtocol:
                 hold_current_state=False,
                 reason_code="P000_RESIDUAL_COOLDOWN",
                 message=f"Residual heat soak cooldown active ({cooldown_remaining_min:.1f}m remaining).",
+            )
+
+        # 5c. Pre-start floor headroom guard (blocks starting a new pulse when floor is already near cap)
+        if effective_floor_limit_c is not None and not is_heating and snapshot.floor_temp >= floor_cap - 0.5:
+            return SafetyVerdict(
+                allow_heating=False,
+                force_off=True,
+                hold_current_state=False,
+                reason_code="P000_FLOOR_PREDICTED_LIMIT",
+                message=(
+                    f"Floor {snapshot.floor_temp:.1f}C already within 0.5C of {floor_cap:.1f}C limit; "
+                    "blocking new heating pulse."
+                ),
             )
 
         # 6a. Physical window contact sensor open (0-second immediate cutoff)
@@ -160,13 +205,21 @@ class SentinelProtocol:
                 message="Window open sensor active; pausing heating immediately.",
             )
 
-        # 6b. Ventilation rapid drop detection (1-min slope OR 5-min air-only drop cross-checked with floor)
+        # 6b. Ventilation rapid drop detection:
+        #     - 1-min rapid slope (<= -0.15 C/min)
+        #     - 5-min air-only drop (<= -0.5 C room while floor > -0.2 C)
+        #     - severe 5-min drop (<= -0.8 C room regardless of simultaneous post-peak floor cooling)
         air_only_5m_drop = (
             drop_5m_room_c is not None
             and drop_5m_room_c <= -0.5
             and (drop_5m_floor_c is None or drop_5m_floor_c > -0.2)
         )
-        if v_room_per_min <= self.config.ventilation_drop_rate_per_min or air_only_5m_drop:
+        severe_5m_drop = drop_5m_room_c is not None and drop_5m_room_c <= -0.8
+        if (
+            v_room_per_min <= self.config.ventilation_drop_rate_per_min
+            or air_only_5m_drop
+            or severe_5m_drop
+        ):
             return SafetyVerdict(
                 allow_heating=False,
                 force_off=True,
@@ -188,7 +241,33 @@ class SentinelProtocol:
                 message=f"Ventilation recovery hold active ({ventilation_remaining_min:.1f}m remaining).",
             )
 
-        # 6. Anti-chattering minimum dwell time
+        # 6d. Active floor residual release / room rebound guard (blocks double-run stacking)
+        if not is_heating:
+            floor_warmer_than_room = snapshot.floor_temp - snapshot.room_temp
+            floor_still_rising = (
+                trend_10m_floor_c is not None
+                and trend_10m_floor_c >= 0.2
+                and floor_warmer_than_room >= 0.5
+            )
+            room_actively_rebounding = (
+                trend_10m_room_c is not None
+                and trend_10m_room_c >= 0.2
+                and floor_warmer_than_room >= 0.8
+            )
+            if floor_still_rising or room_actively_rebounding:
+                return SafetyVerdict(
+                    allow_heating=False,
+                    force_off=True,
+                    hold_current_state=False,
+                    reason_code="P000_FLOOR_RESIDUAL_ACTIVE",
+                    message=(
+                        f"Warm floor ({snapshot.floor_temp:.1f}C vs room {snapshot.room_temp:.1f}C) "
+                        f"still releasing residual heat (10m floor={trend_10m_floor_c}, room={trend_10m_room_c}); "
+                        "waiting before next pulse."
+                    ),
+                )
+
+        # 7. Anti-chattering minimum dwell time
         if seconds_since_last_switch is not None:
             min_dwell = self.config.min_on_sec if is_heating else self.config.min_off_sec
             if seconds_since_last_switch < min_dwell:

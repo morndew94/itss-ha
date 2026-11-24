@@ -22,7 +22,7 @@ DEFAULT_FLOOR_ON_DEADTIME_MIN = 5.0
 DEFAULT_ROOM_ON_DEADTIME_MIN = 15.0
 DEFAULT_FLOOR_POST_OFF_PEAK_MIN = 10.0
 DEFAULT_ROOM_POST_OFF_PEAK_MIN = 20.0
-DEFAULT_FLOOR_RESIDUAL_RISE_C = 0.4
+DEFAULT_FLOOR_RESIDUAL_RISE_C = 1.2
 DEFAULT_ROOM_RESIDUAL_RISE_C = 0.2
 
 
@@ -214,10 +214,11 @@ def learn_room_lag_profile(
     r_rise = round(float(median(room_off_rises)), 2) if room_off_rises else DEFAULT_ROOM_RESIDUAL_RISE_C
 
     # Apply learned lag directly to cooldown, P200 prediction horizon, and pulse trimming
-    rec_cooldown = int(max(10, min(45, max(base_cooldown_min, round(r_peak)))))
+    # Cooldown must cover both room peak and floor peak + 10 min dissipation time
+    rec_cooldown = int(max(10, min(45, max(base_cooldown_min, round(r_peak), round(f_peak + 10.0)))))
     rec_horizon = int(max(15, min(45, round(max(r_peak, r_on)))))
-    rec_trim = 2.0 if (status != "INSUFFICIENT_SAMPLES" and r_rise >= 0.4) else (
-        1.0 if (status != "INSUFFICIENT_SAMPLES" and r_rise >= 0.25) else 0.0
+    rec_trim = 2.0 if (status != "INSUFFICIENT_SAMPLES" and (r_rise >= 0.4 or f_rise >= 2.5)) else (
+        1.0 if (status != "INSUFFICIENT_SAMPLES" and (r_rise >= 0.25 or f_rise >= 1.8)) else 0.0
     )
 
     return RoomLagProfile(

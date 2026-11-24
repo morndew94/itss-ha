@@ -419,7 +419,7 @@
     <header>
       <div class="title">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-          <h1>I.T.S.S. Thermal SCADA Dashboard v2.5.0</h1>
+          <h1>I.T.S.S. Thermal SCADA Dashboard v2.6.0</h1>
           <span id="globalBoilerPill" class="boiler-pill stopped">보일러 상태 확인중</span>
         </div>
         <p id="subInfo">로딩 중...</p>
@@ -685,7 +685,7 @@
         ? `${status.outdoorTemp}°C(${status.outdoorTempSource || "API"})`
         : "미수신(시간대기준)";
       document.getElementById("subInfo").textContent =
-        `KST ${status.timeKst} · HA: ${status.haConnected ? `연결됨` : "미연결"} · 외기: ${outStr} · 1회 최대가동: ${activeMaxRunMin}분(≤${currentSettings.maxRunCapMin}분) · 바닥상한: ${currentSettings.floorOffLimitC}°C · ON:${currentSettings.heatOnSetpoint}°C/OFF:${currentSettings.heatOffSetpoint}°C`;
+        `KST ${status.timeKst} · 주기: ${currentSettings.updateIntervalSec}초${currentSettings.updateIntervalSec > 60 ? " (⚠60초 권장)" : ""} · HA: ${status.haConnected ? `연결됨` : "미연결"} · 외기: ${outStr} · 1회 최대가동: ${activeMaxRunMin}분(≤${currentSettings.maxRunCapMin}분) · 바닥상한: ${currentSettings.floorOffLimitC}°C · ON:${currentSettings.heatOnSetpoint}°C/OFF:${currentSettings.heatOffSetpoint}°C`;
 
       document.getElementById("strategySel").value = currentSettings.zoneStrategy;
       document.getElementById("modelSel").value = currentSettings.predictorModel;
@@ -776,17 +776,22 @@
         const isRunning = live.boilerRunning === true;
         const isStopped = live.boilerRunning === false;
 
+        const roomCapMin = live.effectiveMaxRunMin ?? activeMaxRunMin;
         const boilerBadge = live.windowOpen
           ? `<span class="badge danger">창문열림 (정지)</span>`
           : (live.ventilationRemainMin > 0
             ? `<span class="badge" style="background:rgba(56,189,248,.22);color:#38bdf8;">환기정지 (${live.ventilationRemainMin}분 남음)</span>`
             : (isRunning
-              ? `<span class="boiler-pill running"><span class="boiler-dot"></span>가동중 (${live.runtimeMin ?? 0}/${activeMaxRunMin}분)</span>`
+              ? `<span class="boiler-pill running"><span class="boiler-dot"></span>가동중 (${live.runtimeMin ?? 0}/${roomCapMin}분)</span>`
               : (live.cooldownRemainMin > 0
                 ? `<span class="badge warn">잔열대기 (${live.cooldownRemainMin}분 남음)</span>`
-                : (isStopped
-                  ? `<span class="boiler-pill stopped">OFF</span>`
-                  : `<span class="badge warn">미확인</span>`))));
+                : (lat.safetyReason === "P000_FLOOR_RESIDUAL_ACTIVE"
+                  ? `<span class="badge warn">바닥잔열 방출중</span>`
+                  : (lat.safetyReason === "P000_FLOOR_PREDICTED_LIMIT"
+                    ? `<span class="badge warn">바닥예측 상한차단</span>`
+                    : (isStopped
+                      ? `<span class="boiler-pill stopped">OFF</span>`
+                      : `<span class="badge warn">미확인</span>`))))));
 
         const spStr = live.climateSetpoint != null ? `${live.climateSetpoint}°C` : "--";
         const curStr = live.climateCurrentTemp != null ? `${live.climateCurrentTemp}°C` : "--";
@@ -814,7 +819,7 @@
         </td>
         <td>
           <div class="temp-big">${ft}</div>
-          <div style="font-size:11px;color:var(--muted);">${fSrc}</div>
+          <div style="font-size:11px;color:var(--muted);">${fSrc}${live.effectiveFloorLimitC != null ? ` · 상한 ${live.effectiveFloorLimitC}°C` : ""}</div>
         </td>
         <td>
           <div class="inline-flex">
@@ -903,6 +908,20 @@
       drawLine("targetTemp", "#94a3b8", [4, 4]);
       drawLine("floorTemp", "#22c55e");
       drawLine("roomTemp", "#38bdf8");
+
+      // X-axis KST HH:MM labels so heating durations & gaps are clearly visible
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "11px sans-serif";
+      const tickCount = Math.min(6, pts.length);
+      for (let k = 0; k < tickCount; k++) {
+        const idx = Math.round((k / Math.max(tickCount - 1, 1)) * (pts.length - 1));
+        const ts = String(pts[idx].executionStartedAt || "");
+        const hhmm = ts.length >= 16 ? ts.slice(11, 16) : "";
+        if (hhmm) {
+          const x = xOf(idx);
+          ctx.fillText(hhmm, Math.min(W - padR - 32, Math.max(padL, x - 14)), H - 8);
+        }
+      }
     }
 
     function renderKpis(k, b) {
