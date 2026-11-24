@@ -1,12 +1,42 @@
-"""Google API alerts and reporting: Gemini TTS voice warnings & Google Sheets row export."""
+"""Google API alerts and reporting helpers (library only, not wired into the control loop).
+
+- GeminiTTSAlert: 치명 P000 이벤트용 한국어 음성 WAV 생성 (Gemini TTS)
+- format_cycle_for_sheets: CycleRecord -> Google Sheets 행 변환
+
+v2.7.0 기준 두 기능 모두 제어 루프/알림에 연결되어 있지 않은 보조 라이브러리이다.
+"""
 
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
-from typing import Any, Callable
 import urllib.request
+import wave
+from typing import Any, Callable
+
+# Gemini TTS 출력 형식: raw PCM s16le, 24 kHz, mono (공식 문서 기준)
+TTS_SAMPLE_RATE_HZ = 24000
+TTS_SAMPLE_WIDTH_BYTES = 2
+TTS_CHANNELS = 1
+
+
+def pcm_to_wav_bytes(
+    pcm: bytes,
+    *,
+    sample_rate: int = TTS_SAMPLE_RATE_HZ,
+    sample_width: int = TTS_SAMPLE_WIDTH_BYTES,
+    channels: int = TTS_CHANNELS,
+) -> bytes:
+    """raw PCM 바이트에 WAV(RIFF) 헤더를 붙인다."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
 
 
 class GeminiTTSAlert:
@@ -22,11 +52,13 @@ class GeminiTTSAlert:
         self,
         api_key: str,
         *,
-        model_name: str = "gemini-3.8-flash-tts",
+        model_name: str = "gemini-3.1-flash-tts-preview",
+        voice_name: str = "Kore",
         http_post: Callable[[str, dict], dict] | None = None,
     ) -> None:
         self.api_key = api_key
         self.model_name = model_name
+        self.voice_name = voice_name
         self._http_post = http_post or self._default_post
 
     def _default_post(self, url: str, payload: dict) -> dict:
@@ -34,7 +66,7 @@ class GeminiTTSAlert:
         req = urllib.request.Request(
             url,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -54,14 +86,24 @@ class GeminiTTSAlert:
         message = f"{room_name} 구역 {template}"
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.model_name}:generateContent?key={self.api_key}"
+            f"{self.model_name}:generateContent"
         )
-        payload = {"contents": [{"parts": [{"text": message}]}]}
+        # TTS 는 responseModalities=AUDIO 와 speechConfig 가 필요
+        payload = {
+            "contents": [{"parts": [{"text": message}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": self.voice_name}}},
+            },
+        }
 
         try:
             data = self._http_post(url, payload)
             part = data["candidates"][0]["content"]["parts"][0]
             audio_bytes = base64.b64decode(part["inlineData"]["data"])
+            # 응답은 raw PCM 이므로 WAV 헤더를 붙여 저장 (이미 RIFF 면 그대로 저장)
+            if not audio_bytes.startswith(b"RIFF"):
+                audio_bytes = pcm_to_wav_bytes(audio_bytes)
             parent = os.path.dirname(os.path.abspath(output_wav_path))
             if parent:
                 os.makedirs(parent, exist_ok=True)
@@ -88,4 +130,3 @@ def format_cycle_for_sheets(cycle_payload: dict[str, Any]) -> list[Any]:
         cycle_payload.get("combustionConfirmed"),
         cycle_payload.get("savedAt"),
     ]
-

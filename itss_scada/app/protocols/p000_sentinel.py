@@ -55,6 +55,9 @@ class SentinelProtocol:
         expected_floor_surge_c: float = 0.0,
         trend_10m_room_c: float | None = None,
         trend_10m_floor_c: float | None = None,
+        room_stale_after_sec: float | None = None,
+        floor_stale_after_sec: float | None = None,
+        floor_latency_c: float = 0.0,
     ) -> SafetyVerdict:
         """Run prioritized safety checks.
 
@@ -67,7 +70,16 @@ class SentinelProtocol:
           6. Active floor residual soak / room rebound guard (blocks premature 2nd run)
           7. Ventilation rapid-drop & window-open protection
           8. Anti-chattering (minimum ON/OFF dwell time)
+
+        v2.7.0:
+          - room/floor_stale_after_sec: 센서별 관측 보고 주기 기반 적응형 stale 임계 (None이면 기본값)
+          - floor_latency_c: 바닥 센서 보고 지연 동안의 추정 상승분. 바닥 상한/예측 판정에 가산
         """
+        room_stale_limit = room_stale_after_sec if room_stale_after_sec is not None else self.config.max_sensor_age_sec
+        floor_stale_limit = (
+            floor_stale_after_sec if floor_stale_after_sec is not None else self.config.max_sensor_age_sec
+        )
+        latency = max(0.0, float(floor_latency_c or 0.0))
         # 1. Respect manual user intervention above automated control
         if snapshot.manual_override_active:
             return SafetyVerdict(
@@ -90,10 +102,10 @@ class SentinelProtocol:
 
         if (
             snapshot.room_sensor_age_sec is not None
-            and snapshot.room_sensor_age_sec > self.config.max_sensor_age_sec
+            and snapshot.room_sensor_age_sec > room_stale_limit
         ) or (
             snapshot.floor_sensor_age_sec is not None
-            and snapshot.floor_sensor_age_sec > self.config.max_sensor_age_sec
+            and snapshot.floor_sensor_age_sec > floor_stale_limit
         ):
             return SafetyVerdict(
                 allow_heating=False,
@@ -126,20 +138,25 @@ class SentinelProtocol:
             else self.config.general_off_floor_c
         )
         active_cap = floor_cap if is_heating else self.config.general_off_floor_c
-        if snapshot.floor_temp >= active_cap:
+        # 보고 지연 보상: 가열 중에는 마지막 보고 이후 상승분을 더해 보수적으로 판정
+        floor_now_est = snapshot.floor_temp + (latency if is_heating else 0.0)
+        if floor_now_est >= active_cap:
             return SafetyVerdict(
                 allow_heating=False,
                 force_off=True,
                 hold_current_state=False,
                 reason_code="P000_FLOOR_LIMIT_OFF",
-                message=f"Floor temperature reached {snapshot.floor_temp:.1f}C >= {active_cap:.1f}C limit.",
+                message=(
+                    f"Floor temperature {snapshot.floor_temp:.1f}C (+latency {latency if is_heating else 0.0:.2f}C) "
+                    f">= {active_cap:.1f}C limit."
+                ),
             )
 
         # 4b. Predicted post-OFF floor peak guard while actively heating (prevents slab surge past floor_cap)
         if effective_floor_limit_c is not None and is_heating:
             projected_floor = max(
-                snapshot.floor_temp + max(0.0, expected_floor_surge_c),
-                snapshot.floor_temp + max(0.0, v_floor_per_min) * 10.0,
+                floor_now_est + max(0.0, expected_floor_surge_c),
+                floor_now_est + max(0.0, v_floor_per_min) * 10.0,
             )
             if projected_floor >= floor_cap:
                 return SafetyVerdict(

@@ -1,24 +1,20 @@
 name: "I.T.S.S. Thermal SCADA"
-version: "2.6.1"
+version: "2.7.0"
 slug: "itss_scada"
-description: "0.3C Ondol precision heating SCADA add-on with Ingress Web UI, 24h chart, presets, P400 scheduler, 1-click RC fitting, boiler cost stats, and HA/Telegram alerts."
+description: "0.3C Ondol precision heating SCADA add-on (Ingress-only Web UI) with sensor report-interval tracking, 24h chart, presets, P400 scheduler, RC fitting, boiler cost stats, and HA/Telegram alerts."
 url: "https://github.com/morndew94/itss-ha"
+# 빌드 이미지가 amd64 전용(amd64-base-python)이므로 amd64만 선언
 arch:
   - amd64
-  - aarch64
-  - armv7
 startup: services
 boot: auto
 init: false
 homeassistant_api: true
+# HA Ingress 전용: 외부 포트(ports)를 열지 않고 Supervisor(172.30.32.2) 경유 접속만 허용
 ingress: true
 ingress_port: 8099
 panel_icon: "mdi:thermometer-lines"
 panel_title: "I.T.S.S. SCADA"
-ports:
-  8099/tcp: 8099
-ports_description:
-  8099/tcp: "I.T.S.S. SCADA Web UI & REST API"
 options:
   db_path: "/data/itss_scada.db"
   update_interval_sec: 60
@@ -31,6 +27,7 @@ options:
   max_run_cap_min: 15
   cooldown_min: 20
   ventilation_hold_min: 20
+  history_retention_days: 30
   master_floor_entity: ""
   outdoor_temp_entity: ""
   gas_krw_per_hour: 1200
@@ -40,6 +37,8 @@ options:
   gemini_api_key: ""
   weather_location: "서울"
   log_level: "info"
+  debug_trace: true
+  debug_trace_days: 7
 schema:
   db_path: str
   update_interval_sec: int(30,3600)
@@ -52,6 +51,7 @@ schema:
   max_run_cap_min: int(3,15)
   cooldown_min: int(5,90)
   ventilation_hold_min: int(5,60)
+  history_retention_days: int(1,365)
   master_floor_entity: str?
   outdoor_temp_entity: str?
   gas_krw_per_hour: int(100,10000)
@@ -61,3 +61,5 @@ schema:
   gemini_api_key: password?
   weather_location: str?
   log_level: list(debug|info|warning|error)
+  debug_trace: bool
+  debug_trace_days: int(1,30)

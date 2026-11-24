@@ -3,7 +3,7 @@
 from datetime import timedelta, timezone
 
 DOMAIN = "itss"
-VERSION = "2.6.1"
+VERSION = "2.7.0"
 
 # Korea Standard Time (UTC+9)
 KST = timezone(timedelta(hours=9))
@@ -44,15 +44,39 @@ DEFAULT_UPDATE_INTERVAL_SEC = 300  # 5 minutes
 DEFAULT_DB_FILENAME = "itss_scada.db"
 
 # ITSS-P000 SENTINEL default safety limits
-DEFAULT_OVERHEAT_ROOM_C = 27.0
-DEFAULT_OVERHEAT_FLOOR_C = 29.0
-DEFAULT_GENERAL_OFF_FLOOR_C = 28.0
+DEFAULT_OVERHEAT_ROOM_C = 23.0
+DEFAULT_OVERHEAT_FLOOR_C = 24.0
+DEFAULT_GENERAL_OFF_FLOOR_C = 20.0
 DEFAULT_VENTILATION_DROP_RATE = -0.15  # degC per minute
-DEFAULT_MIN_ON_SEC = 600   # 10 minutes anti-chattering
-DEFAULT_MIN_OFF_SEC = 600  # 10 minutes anti-chattering
-DEFAULT_MAX_SENSOR_AGE_SEC = 7200  # 2 hours staleness threshold for Zigbee sensors
+DEFAULT_MIN_ON_SEC = 300   # 최소 가동 유지 5분 (예측 OFF 채터링 방지, 안전 OFF는 예외)
+DEFAULT_MIN_OFF_SEC = 600  # 최소 휴지 유지 10분
+DEFAULT_MAX_SENSOR_AGE_SEC = 7200  # 보고 주기 미학습 시 기본 stale 임계 (2시간)
+
+# 센서 보고 주기 기반 적응형 stale 판정 (sensor_tracker)
+SENSOR_STALE_MIN_SEC = 600         # 적응형 stale 임계 하한 10분
+SENSOR_STALE_FACTOR = 2.0          # 최근 최대 보고 간격 x 2.0
+SENSOR_MIN_INTERVALS_FOR_STALE = 6  # 보고 간격 6개 이상 관측 후 적응형 임계 사용
+SENSOR_ADAPT_MIN_SPAN_SEC = 6 * 3600  # 최소 6시간 관측 후에만 임계 축소 (이벤트형 센서 heartbeat 공백 학습)
+SENSOR_LONG_GAP_SEC = 120.0        # 24시간 최대 공백 이력에 저장할 최소 간격
+
+# 1회 최소 가동 펄스 (밸브 구동 시간 고려, 이보다 짧은 펄스는 만들지 않음)
+MIN_PULSE_MIN = 5.0
+
+# HA 서비스 재전송 (상태가 이미 목표와 같으면 생략, 단 이 주기마다 1회 재동기화)
+DISPATCH_RESEND_MIN = 30.0
+
+# 난방 부족(목표 미달 지속) 경보
+UNDERHEAT_MARGIN_C = 0.3
+UNDERHEAT_ALERT_MIN = 90.0
+
+# 제어 루프 연속 실패 경보 횟수
+LOOP_FAILURE_ALERT_COUNT = 3
+
+# HA Ingress 프록시(Supervisor) IP + 로컬 개발용 loopback
+DEFAULT_ALLOWED_CLIENT_IPS = ("172.30.32.2", "127.0.0.1", "::1")
 
 # ITSS-P100 CORE thermostat step
 THERMOSTAT_SETPOINT_STEP = 0.5
 SENSOR_RESOLUTION = 0.1
+HEAT_SETPOINT_MAX_BOOST_C = 3.0  # 조절기 현재온도 기준 동적 ON 설정온도 최대 상향폭
 

@@ -80,7 +80,7 @@ class CycleRecord:
 
     cycle_id: str
     room_name: str
-    protocol_version: str = "ITSS-v1.0"
+    protocol_version: str = "ITSS-v2.7"
 
     # Distinct KST timestamps to prevent null/ambiguous audit logs
     scheduled_at: str | None = None
@@ -112,7 +112,14 @@ class CycleRecord:
     command_action: str | None = None          # HEAT, OFF, HOLD
     command_setpoint: float | None = None      # Rounded to 0.5 degC
     device_mode_event: str | None = None       # Observed thermostat mode
-    combustion_confirmed: bool | None = None   # Actual boiler/valve confirmation
+    combustion_confirmed: bool | None = None   # 조절기 설정온도 > 현재온도 추정 (실연소 계측 아님)
+
+    # v2.7.0 감사/통계 확장 필드
+    dry_run: bool | None = None                # 시험 운전 회차 여부 (통계/학습에서 구분)
+    effective_target_temp: float | None = None  # 스케줄/프리셋/외기 보정이 반영된 실제 목표
+    outdoor_temp: float | None = None          # 회차 당시 외기 (RC 피팅 입력)
+    dispatch_result: str | None = None         # SENT, NO_CHANGE, DRY_RUN, FAILED, NONE
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
         """Serialize to camelCase JSON payload compatible with I.T.S.S. SCADA API."""
@@ -145,5 +152,10 @@ class CycleRecord:
             "commandSetpoint": raw["command_setpoint"],
             "deviceModeEvent": raw["device_mode_event"],
             "combustionConfirmed": raw["combustion_confirmed"],
+            "dryRun": raw["dry_run"],
+            "effectiveTargetTemp": raw["effective_target_temp"],
+            "outdoorTemp": raw["outdoor_temp"],
+            "dispatchResult": raw["dispatch_result"],
+            "diagnostics": raw["diagnostics"],
         }
 

@@ -23,7 +23,8 @@ def compute_daily_kpis(cycles: list[dict[str, Any]], band_half_c: float = DEFAUL
 
     for c in cycles:
         rt = c.get("roomTemp")
-        tt = c.get("targetTemp")
+        # 스케줄/프리셋 보정이 반영된 실제 목표가 있으면 그것을 기준으로 달성률 계산
+        tt = c.get("effectiveTargetTemp") if c.get("effectiveTargetTemp") is not None else c.get("targetTemp")
         if rt is not None and tt is not None:
             valid_temp += 1
             err = rt - tt
@@ -64,10 +65,11 @@ class GeminiThermalAdvisor:
 
     def _default_post(self, url: str, payload: dict) -> dict:
         body = json.dumps(payload).encode("utf-8")
+        # API 키는 x-goog-api-key 헤더로 전달
         req = urllib.request.Request(
             url,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -81,7 +83,7 @@ class GeminiThermalAdvisor:
 
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.model_name}:generateContent?key={self.api_key}"
+            f"{self.model_name}:generateContent"
         )
         prompt = (
             "다음은 I.T.S.S. 0.3°C 바닥 난방 제어 시스템의 일일 KPI 지표입니다.\n"

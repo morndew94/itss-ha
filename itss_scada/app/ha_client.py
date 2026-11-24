@@ -11,7 +11,7 @@ import httpx
 
 from .const import KST
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger("itss.ha")
 
 _S6_TOKEN_PATHS = (
     "/run/s6/container_environment/SUPERVISOR_TOKEN",
@@ -107,24 +107,53 @@ class HomeAssistantClient:
                 return None
         return None
 
-    async def get_numeric_state(self, entity_id: str) -> tuple[float | None, str | None, float | None]:
-        """Return (value_0p1, last_updated_kst_iso, age_sec) for a numeric sensor."""
-        raw = await self.get_state(entity_id)
+    @staticmethod
+    def parse_numeric_reading(
+        raw: dict[str, Any] | None,
+        now: datetime | None = None,
+    ) -> tuple[float | None, str | None, float | None, str | None]:
+        """HA state dict -> (값 0.1°C, 보고 시각 KST ISO, 경과초, 시각 출처).
+
+        보고 시각은 매 보고마다 갱신되는 ``last_reported``(HA 2024.3+)를 우선 사용하고,
+        없으면 값/속성 변경 시에만 갱신되는 ``last_updated``로 폴백한다.
+        """
         if not raw or raw.get("state") in (None, "unknown", "unavailable"):
-            return None, None, None
+            return None, None, None, None
         try:
             val = round(float(raw["state"]), 1)
         except (TypeError, ValueError):
-            return None, None, None
+            return None, None, None, None
 
-        ts_str = raw.get("last_updated")
-        updated_iso = None
+        ts_source = None
+        ts_str = raw.get("last_reported")
+        if ts_str:
+            ts_source = "last_reported"
+        else:
+            ts_str = raw.get("last_updated")
+            ts_source = "last_updated" if ts_str else None
+
+        reported_iso = None
         age_sec = None
         if ts_str:
-            dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00")).astimezone(KST)
-            updated_iso = dt.isoformat(timespec="seconds")
-            age_sec = round((datetime.now(tz=KST) - dt).total_seconds(), 1)
-        return val, updated_iso, age_sec
+            try:
+                dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00")).astimezone(KST)
+                reported_iso = dt.isoformat(timespec="seconds")
+                age_sec = round(((now or datetime.now(tz=KST)) - dt).total_seconds(), 1)
+            except ValueError:
+                ts_source = None
+        return val, reported_iso, age_sec, ts_source
+
+    async def get_numeric_reading(
+        self, entity_id: str
+    ) -> tuple[float | None, str | None, float | None, str | None]:
+        """숫자 센서의 (값, 보고 시각, 경과초, 시각 출처)를 반환."""
+        raw = await self.get_state(entity_id)
+        return self.parse_numeric_reading(raw)
+
+    async def get_numeric_state(self, entity_id: str) -> tuple[float | None, str | None, float | None]:
+        """Return (value_0p1, last_reported_kst_iso, age_sec) for a numeric sensor (호환용)."""
+        val, ts_iso, age, _ = await self.get_numeric_reading(entity_id)
+        return val, ts_iso, age
 
     async def list_entities(self) -> dict[str, list[dict[str, Any]]]:
         """Return temperature sensors, all sensors, climate, window binary_sensors, and notify entities."""

@@ -57,22 +57,32 @@ class PushNotifier:
                 if available_notify_svcs:
                     results["availableNotifyServices"] = available_notify_svcs
 
-        # 2. Home Assistant built-in telegram_bot.send_message (chat_id only, plain text)
+        # 2. Home Assistant built-in telegram_bot.send_message
+        #    v2.7.0: deprecated 된 `target` 대신 `chat_id` 사용, 구형 HA 는 `target` 으로 1회 재시도
         if self.telegram_chat_id:
             target: int | str = (
                 int(self.telegram_chat_id)
                 if self.telegram_chat_id.lstrip("-").isdigit()
                 else self.telegram_chat_id
             )
+            text = f"[{title}]\n{message}"
             try:
                 await self.ha_client.call_service(
                     "telegram_bot",
                     "send_message",
-                    {"target": target, "message": f"[{title}]\n{message}"},
+                    {"chat_id": target, "message": text},
                 )
                 results["telegram"] = f"sent_to:{target}"
             except Exception as err:  # noqa: BLE001
-                results["telegram"] = f"error:{err}"
+                try:
+                    await self.ha_client.call_service(
+                        "telegram_bot",
+                        "send_message",
+                        {"target": target, "message": text},
+                    )
+                    results["telegram"] = f"sent_to:{target}(legacy_target)"
+                except Exception:  # noqa: BLE001
+                    results["telegram"] = f"error:{err}"
 
         if not results:
             results["status"] = "no_channel_configured"

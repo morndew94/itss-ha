@@ -419,7 +419,7 @@
     <header>
       <div class="title">
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-          <h1>I.T.S.S. Thermal SCADA Dashboard <span id="appVer">v2.6.1</span></h1>
+          <h1>I.T.S.S. Thermal SCADA Dashboard <span id="appVer">v2.7.0</span></h1>
           <span id="globalBoilerPill" class="boiler-pill stopped">보일러 상태 확인중</span>
         </div>
         <p id="subInfo">로딩 중...</p>
@@ -446,6 +446,13 @@
       ⚠ 현재 <b>시험 운전(Dry-Run) 모드</b>가 켜져 있어 실제 보일러로 명령을 보내지 않습니다. 실제 난방을 가동하려면 우측 상단의 <b>시험 운전(Dry-Run): ON</b> 버튼을 눌러
       <b>LIVE</b>로 전환하세요.
     </section>
+    <section id="floorWarnBox" class="panel"
+      style="display:none;border-color:var(--danger);color:#fecaca;font-size:13px;">
+      ⚠ <b>마스터 바닥 온도 센서가 설정되지 않았습니다.</b> 바닥 과열·상한 보호가 불가능하므로 AUTO 난방이 차단되고
+      LIVE 전환이 거부됩니다. 아래 설정 패널에서 바닥 온도 센서를 선택해 저장하세요.
+    </section>
+    <section id="loopWarnBox" class="panel"
+      style="display:none;border-color:var(--warn);color:#fef08a;font-size:13px;white-space:pre-wrap;"></section>
 
     <!-- One-Touch Presets -->
     <section class="preset-bar">
@@ -462,6 +469,8 @@
         <button onclick="runAutoCalibrate()">1-클릭 RC 피팅 &amp; 바닥 오프셋 보정</button>
         <button onclick="sendTestNotify()">모바일 알림 테스트</button>
         <button onclick="runDiagnose()">HA 연동 진단</button>
+        <button onclick="showDebugLogs()">디버그 로그 보기</button>
+        <a href="./api/v1/debug/trace?date=today" download><button type="button">오늘 판단 트레이스(JSONL)</button></a>
       </div>
     </section>
 
@@ -493,7 +502,7 @@
     <!-- 24h Time-Series Chart -->
     <section class="panel">
       <h2>
-        <span>24시간 실시간 온도 · 밸브 ON/OFF 시계열 차트</span>
+        <span>최근 24시간 온도 · 밸브 ON/OFF 시계열 차트</span>
         <div style="display:flex;gap:8px;align-items:center;">
           <select id="chartRoomSel" onchange="drawChart()"></select>
           <span style="font-size:11px;color:var(--muted);">파랑: 실내 · 초록: 바닥 · 점선: 목표(±0.15°C) · 주황바: 보일러 ON</span>
@@ -505,7 +514,8 @@
     <!-- Boiler Runtime, Gas Cost & Daily KPIs -->
     <section class="panel">
       <h2>
-        <span>보일러 일일 가동 통계 · 가스비 추정 · 0.3°C 제어 KPI</span>
+        <span>보일러 최근 24시간 가동 통계 · 가스비 추정 · 0.3°C 제어 KPI <span id="kpiCoverage"
+            style="font-size:11px;color:var(--muted);font-weight:400;"></span></span>
         <button onclick="requestReport()">Gemini 진단 리포트 생성</button>
       </h2>
       <div class="kpi-grid" id="kpiGrid"></div>
@@ -533,6 +543,30 @@
             </tr>
           </thead>
           <tbody id="lagBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Sensor Report Interval Tracking Panel -->
+    <section class="panel">
+      <h2>
+        <span>센서 보고 주기 감지 현황 (바닥 센서 우선 · 보고 주기 기반 stale 판정 · 지연 보상)</span>
+      </h2>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>역할</th>
+              <th>엔티티</th>
+              <th>마지막 보고(KST)</th>
+              <th>경과</th>
+              <th>관측 보고 주기(중앙값)</th>
+              <th>최근 최대 간격</th>
+              <th>stale 임계</th>
+              <th>시각 출처</th>
+            </tr>
+          </thead>
+          <tbody id="sensorBody"></tbody>
         </table>
       </div>
     </section>
@@ -567,10 +601,11 @@
         <div><label>ON 설정온도 (°C)</label><input id="onSetpoint" type="number" step="0.5" value="24.0" /></div>
         <div><label>OFF 설정온도 (°C)</label><input id="offSetpoint" type="number" step="0.5" value="15.0" /></div>
         <div><label>바닥 OFF 상한 (°C)</label><input id="floorOffLimit" type="number" step="0.1" value="26.5" /></div>
-        <div><label>1회 최대 가동 상한 (분, ≤15)</label><input id="maxRunCap" type="number" min="3" max="15" value="15" /></div>
+        <div><label>1회 최대 가동 상한 (분, 5~15)</label><input id="maxRunCap" type="number" min="5" max="15" value="15" /></div>
         <div><label>차단 후 잔열 휴지 (분)</label><input id="cooldownMin" type="number" min="5" max="90" value="20" /></div>
         <div><label>환기 보호 유지 (분)</label><input id="ventHoldMin" type="number" min="5" max="60" value="20" /></div>
         <div><label>시간당 가스비 (원)</label><input id="gasRate" type="number" step="50" value="1200" /></div>
+        <div><label>회차 이력 보존 (일)</label><input id="retentionDays" type="number" min="1" max="365" value="30" /></div>
         <div><label>마스터 바닥 온도 센서</label><select id="masterFloorSel"></select></div>
         <div><label>외기 센서 (네이버 날씨 등)</label><select id="outdoorTempSel"></select></div>
         <div><label>외기 오류 시 API 지역명</label><input id="weatherLoc" placeholder="예: 서울, 수원, 분당" value="서울" /></div>
@@ -611,7 +646,8 @@
               <th>모드/안전</th>
               <th>명령</th>
               <th>설정온도</th>
-              <th>연소확인</th>
+              <th>전송</th>
+              <th>가동추정</th>
             </tr>
           </thead>
           <tbody id="cycleBody"></tbody>
@@ -621,17 +657,46 @@
   </div>
 
   <script>
+    // v2.7.0: 모든 동적 값은 esc()로 escape 하고, 방 버튼은 data-* 속성 + 이벤트 위임으로 처리 (XSS 방지)
     let currentSettings = {};
-    let allCycles = [];
     let currentSchedules = [];
-    let cachedEntities = { tempSensors: [], sensors: [], climates: [] };
+    let schedDirty = false;
+    let cachedEntities = { tempSensors: [], sensors: [], climates: [], windowSensors: [] };
+    let activeMaxRunMin = 15;
+
+    function esc(v) {
+      return String(v ?? "").replace(/[&<>"'`]/g, c => (
+        { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;", "`": "&#96;" }[c]
+      ));
+    }
+
+    function fmtNum(v, digits = 1) {
+      const n = Number(v);
+      return v != null && Number.isFinite(n) ? n.toFixed(digits) : "--";
+    }
+
+    function fmtSec(s) {
+      if (s == null) return "--";
+      const n = Number(s);
+      if (!Number.isFinite(n)) return "--";
+      if (n < 90) return `${Math.round(n)}초`;
+      if (n < 5400) return `${(n / 60).toFixed(1)}분`;
+      return `${(n / 3600).toFixed(1)}시간`;
+    }
 
     async function api(path, options = {}) {
       const res = await fetch(`./api/v1${path}`, {
         headers: { "Content-Type": "application/json" },
         ...options,
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        let detail = "";
+        try {
+          const j = await res.json();
+          detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+        } catch (e) { }
+        throw new Error(`HTTP ${res.status}${detail ? " - " + detail : ""}`);
+      }
       return res.json();
     }
 
@@ -641,78 +706,101 @@
       box.textContent = text;
     }
 
+    async function guarded(fn) {
+      try {
+        await fn();
+      } catch (e) {
+        showMsg(`오류: ${e.message}`);
+      }
+    }
+
+    function optionHtml(value, label) {
+      return `<option value="${esc(value)}">${esc(label)}</option>`;
+    }
+
+    function fillSelect(sel, baseOptions, list, current, labelFn) {
+      const inList = list.some(x => x.entityId === current);
+      sel.innerHTML = baseOptions
+        + list.map(x => optionHtml(x.entityId, labelFn(x))).join("")
+        + (current && !inList ? optionHtml(current, current) : "");
+      sel.value = current || "";
+    }
+
     async function loadEntities() {
       try {
         cachedEntities = await api("/ha/entities");
-        const tempOpts = (cachedEntities.tempSensors.length ? cachedEntities.tempSensors : cachedEntities.sensors)
-          .map(s => `<option value="${s.entityId}">${s.name} (${s.state}${s.unit}) — ${s.entityId}</option>`).join("");
-        const climOpts = cachedEntities.climates
-          .map(c => `<option value="${c.entityId}">${c.name} (${c.state}) — ${c.entityId}</option>`).join("");
-        const winOpts = (cachedEntities.windowSensors || [])
-          .map(w => `<option value="${w.entityId}">${w.name} (${w.state}) — ${w.entityId}</option>`).join("");
+      } catch (e) {
+        showMsg(`HA 엔티티 목록 조회 실패: ${e.message}`);
+        return;
+      }
+      const temps = cachedEntities.tempSensors.length ? cachedEntities.tempSensors : cachedEntities.sensors;
+      const tempLabel = s => `${s.name} (${s.state}${s.unit}) — ${s.entityId}`;
+      const stateLabel = c => `${c.name} (${c.state}) — ${c.entityId}`;
+      const emptyOpt = optionHtml("", "-- HA 엔티티 선택 --");
 
-        const emptyOpt = `<option value="">-- HA 엔티티 선택 --</option>`;
-        document.getElementById("newRoomTempSel").innerHTML = emptyOpt + tempOpts;
-        document.getElementById("newClimateSel").innerHTML = emptyOpt + climOpts;
-        document.getElementById("newWindowSel").innerHTML = `<option value="">-- 미지정 (온도 급감 자동감지) --</option>` + winOpts;
-
-        const mfSel = document.getElementById("masterFloorSel");
-        const curMf = currentSettings.masterFloorEntity || "";
-        mfSel.innerHTML = emptyOpt + tempOpts + (curMf && !tempOpts.includes(curMf) ? `<option value="${curMf}">${curMf}</option>` : "");
-        mfSel.value = curMf;
-
-        const outSel = document.getElementById("outdoorTempSel");
-        const curOut = currentSettings.outdoorTempEntity || "";
-        outSel.innerHTML = `<option value="">-- 미지정 (시간대/Gemini 폴백) --</option>` + tempOpts + (curOut && !tempOpts.includes(curOut) ? `<option value="${curOut}">${curOut}</option>` : "");
-        outSel.value = curOut;
-      } catch (e) { }
+      fillSelect(document.getElementById("newRoomTempSel"), emptyOpt, temps, "", tempLabel);
+      fillSelect(document.getElementById("newClimateSel"), emptyOpt, cachedEntities.climates, "", stateLabel);
+      fillSelect(document.getElementById("newWindowSel"), optionHtml("", "-- 미지정 (온도 급감 자동감지) --"),
+        cachedEntities.windowSensors || [], "", stateLabel);
+      fillSelect(document.getElementById("masterFloorSel"), emptyOpt, temps,
+        currentSettings.masterFloorEntity || "", tempLabel);
+      fillSelect(document.getElementById("outdoorTempSel"), optionHtml("", "-- 미지정 (Open-Meteo/Gemini 폴백) --"),
+        temps, currentSettings.outdoorTempEntity || "", tempLabel);
     }
 
-    let activeMaxRunMin = 15;
+    function setIfIdle(id, value) {
+      const el = document.getElementById(id);
+      if (el && document.activeElement !== el) el.value = value;
+    }
 
     async function refresh() {
-      const [status, cycles, schedules] = await Promise.all([
-        api("/status"),
-        api("/cycles?limit=288"),
-        api("/schedules"),
-      ]);
+      let status, cycles, schedules;
+      const errBox = document.getElementById("haErrorBox");
+      try {
+        [status, cycles, schedules] = await Promise.all([
+          api("/status"),
+          api("/cycles?limit=30"),
+          api("/schedules"),
+        ]);
+      } catch (e) {
+        errBox.style.display = "block";
+        errBox.textContent = `SCADA 서버 응답 오류: ${e.message}`;
+        return;
+      }
       currentSettings = status.settings;
       if (status.appVersion) document.getElementById("appVer").textContent = `v${status.appVersion}`;
       activeMaxRunMin = status.activeMaxRunMin ?? currentSettings.maxRunCapMin ?? 15;
-      allCycles = cycles.items || [];
       currentSchedules = schedules;
 
       const outStr = status.outdoorTemp != null
         ? `${status.outdoorTemp}°C(${status.outdoorTempSource || "API"})`
         : "미수신(시간대기준)";
       document.getElementById("subInfo").textContent =
-        `KST ${status.timeKst} · 주기: ${currentSettings.updateIntervalSec}초${currentSettings.updateIntervalSec > 60 ? " (⚠60초 권장)" : ""} · HA: ${status.haConnected ? `연결됨` : "미연결"} · 외기: ${outStr} · 1회 최대가동: ${activeMaxRunMin}분(≤${currentSettings.maxRunCapMin}분) · 바닥상한: ${currentSettings.floorOffLimitC}°C · ON:${currentSettings.heatOnSetpoint}°C/OFF:${currentSettings.heatOffSetpoint}°C`;
+        `KST ${status.timeKst} · 주기: ${currentSettings.updateIntervalSec}초${currentSettings.updateIntervalSec > 60 ? " (⚠60초 권장)" : ""} · HA: ${status.haConnected ? "연결됨" : "미연결"} · 외기: ${outStr} · 1회 최대가동: ${activeMaxRunMin}분(≤${currentSettings.maxRunCapMin}분) · 바닥상한: ${currentSettings.floorOffLimitC}°C · ON:${currentSettings.heatOnSetpoint}°C/OFF:${currentSettings.heatOffSetpoint}°C`;
 
       document.getElementById("strategySel").value = currentSettings.zoneStrategy;
       document.getElementById("modelSel").value = currentSettings.predictorModel;
-      if (document.activeElement.id !== "onSetpoint") document.getElementById("onSetpoint").value = currentSettings.heatOnSetpoint;
-      if (document.activeElement.id !== "offSetpoint") document.getElementById("offSetpoint").value = currentSettings.heatOffSetpoint;
-      if (document.activeElement.id !== "floorOffLimit") document.getElementById("floorOffLimit").value = currentSettings.floorOffLimitC;
-      if (document.activeElement.id !== "maxRunCap") document.getElementById("maxRunCap").value = currentSettings.maxRunCapMin;
-      if (document.activeElement.id !== "cooldownMin") document.getElementById("cooldownMin").value = currentSettings.cooldownMin;
-      if (document.activeElement.id !== "ventHoldMin") document.getElementById("ventHoldMin").value = currentSettings.ventilationHoldMin ?? 20;
-      if (document.activeElement.id !== "gasRate") document.getElementById("gasRate").value = currentSettings.gasKrwPerHour;
-      if (document.activeElement.id !== "weatherLoc") document.getElementById("weatherLoc").value = currentSettings.weatherLocation || "서울";
+      setIfIdle("onSetpoint", currentSettings.heatOnSetpoint);
+      setIfIdle("offSetpoint", currentSettings.heatOffSetpoint);
+      setIfIdle("floorOffLimit", currentSettings.floorOffLimitC);
+      setIfIdle("maxRunCap", currentSettings.maxRunCapMin);
+      setIfIdle("cooldownMin", currentSettings.cooldownMin);
+      setIfIdle("ventHoldMin", currentSettings.ventilationHoldMin ?? 20);
+      setIfIdle("gasRate", currentSettings.gasKrwPerHour);
+      setIfIdle("retentionDays", currentSettings.historyRetentionDays ?? 30);
+      setIfIdle("weatherLoc", currentSettings.weatherLocation || "서울");
       const ventBtn = document.getElementById("pre_VENTILATION");
       if (ventBtn) ventBtn.textContent = `환기 (${currentSettings.ventilationHoldMin ?? 20}분 정지)`;
-      if (document.getElementById("masterFloorSel").options.length > 1) {
-        document.getElementById("masterFloorSel").value = currentSettings.masterFloorEntity || "";
-      }
-      if (document.getElementById("outdoorTempSel").options.length > 1) {
-        document.getElementById("outdoorTempSel").value = currentSettings.outdoorTempEntity || "";
-      }
+      const mfSel = document.getElementById("masterFloorSel");
+      if (mfSel.options.length > 1 && document.activeElement !== mfSel) mfSel.value = currentSettings.masterFloorEntity || "";
+      const outSel = document.getElementById("outdoorTempSel");
+      if (outSel.options.length > 1 && document.activeElement !== outSel) outSel.value = currentSettings.outdoorTempEntity || "";
 
       ["AUTO_ALL", "AWAY", "SLEEP", "PREHEAT", "ALL_OFF"].forEach(p => {
         const btn = document.getElementById(`pre_${p}`);
         if (btn) btn.classList.toggle("active", status.activePreset === p);
       });
 
-      const errBox = document.getElementById("haErrorBox");
       if (!status.haConnected || status.haLastError) {
         errBox.style.display = "block";
         errBox.textContent = !status.haConnected
@@ -721,6 +809,14 @@
       } else {
         errBox.style.display = "none";
       }
+
+      document.getElementById("floorWarnBox").style.display = status.floorConfigured ? "none" : "block";
+      const loop = status.controlLoop || {};
+      const loopLines = [...(loop.problems || []).map(p => `⛔ ${p}`), ...(loop.warnings || []).map(w => `⚠ ${w}`)];
+      if (loop.lastError && (loop.consecutiveFailures || 0) > 0) loopLines.push(`최근 오류(${loop.lastErrorAt || "-"}): ${loop.lastError}`);
+      const loopBox = document.getElementById("loopWarnBox");
+      loopBox.style.display = loopLines.length ? "block" : "none";
+      loopBox.textContent = `제어 루프 상태: ${loop.status || "-"} · 마지막 정상 회차: ${loop.lastCycleOkAt || "-"}\n` + loopLines.join("\n");
 
       const dryBtn = document.getElementById("dryRunBtn");
       dryBtn.textContent = currentSettings.dryRun ? "시험 운전(Dry-Run): ON" : "실제 보일러 제어: LIVE";
@@ -732,16 +828,17 @@
       nBtn.className = currentSettings.notifyEvents !== false ? "primary" : "off";
 
       renderRooms(status.rooms, status.liveByRoom || {}, status.latestByRoom || {});
-      renderKpis(status.kpis, status.boilerStats);
+      renderKpis(status.kpis || {}, status.boilerStats, status.statsCoverageHours);
       renderLagProfiles(status.thermalLagProfiles || {});
-      renderSchedules(schedules);
-      renderCycles(allCycles.slice(0, 30));
+      renderSensors(status.sensorHealth || []);
+      if (!schedDirty) renderSchedules(schedules);
+      renderCycles(cycles.items || []);
 
       const chartSel = document.getElementById("chartRoomSel");
       const prevChoice = chartSel.value;
-      chartSel.innerHTML = status.rooms.map(r => `<option value="${r.roomName}">${r.roomName}</option>`).join("");
+      chartSel.innerHTML = status.rooms.map(r => optionHtml(r.roomName, r.roomName)).join("");
       if (prevChoice && status.rooms.some(r => r.roomName === prevChoice)) chartSel.value = prevChoice;
-      drawChart();
+      await drawChart();
     }
 
     function renderRooms(rooms, liveByRoom, latestByRoom) {
@@ -750,7 +847,7 @@
       const gPill = document.getElementById("globalBoilerPill");
       if (runningRooms.length > 0) {
         gPill.className = "boiler-pill running";
-        gPill.innerHTML = `<span class="boiler-dot"></span>보일러 가동중 (${runningRooms.join(", ")})`;
+        gPill.innerHTML = `<span class="boiler-dot"></span>보일러 가동중 (${esc(runningRooms.join(", "))})`;
       } else {
         gPill.className = "boiler-pill stopped";
         gPill.textContent = "보일러 대기 (전체 OFF)";
@@ -764,13 +861,15 @@
       }
 
       tbody.innerHTML = rooms.map(rm => {
+        const name = esc(rm.roomName);
         const live = liveByRoom[rm.roomName] || {};
         const lat = latestByRoom[rm.roomName] || {};
         const rVal = live.roomTemp != null ? live.roomTemp : lat.roomTemp;
         const fVal = live.floorTemp != null ? live.floorTemp : lat.floorTemp;
-        const rt = rVal != null ? `${Number(rVal).toFixed(1)}°C` : "--";
-        const ft = fVal != null ? `${Number(fVal).toFixed(1)}°C` : "--";
-        const fSrc = rm.hasFloorSensor ? "실측" : `추정(${rm.floorOffsetC >= 0 ? "+" : ""}${rm.floorOffsetC})`;
+        const rt = rVal != null ? `${fmtNum(rVal)}°C` : "--";
+        const ft = fVal != null ? `${fmtNum(fVal)}°C` : "--";
+        const off = Number(rm.floorOffsetC) || 0;
+        const fSrc = rm.hasFloorSensor ? "실측" : `추정(${off >= 0 ? "+" : ""}${fmtNum(off)})`;
         const isAuto = rm.controlMode === "AUTO";
         const isManHeat = !isAuto && rm.manualAction === "HEAT";
         const isManOff = !isAuto && rm.manualAction === "OFF";
@@ -778,36 +877,39 @@
         const isStopped = live.boilerRunning === false;
 
         const roomCapMin = live.effectiveMaxRunMin ?? activeMaxRunMin;
-        const boilerBadge = live.windowOpen
-          ? `<span class="badge danger">창문열림 (정지)</span>`
-          : (live.ventilationRemainMin > 0
-            ? `<span class="badge" style="background:rgba(56,189,248,.22);color:#38bdf8;">환기정지 (${live.ventilationRemainMin}분 남음)</span>`
-            : (isRunning
-              ? `<span class="boiler-pill running"><span class="boiler-dot"></span>가동중 (${live.runtimeMin ?? 0}/${roomCapMin}분)</span>`
-              : (live.cooldownRemainMin > 0
-                ? `<span class="badge warn">잔열대기 (${live.cooldownRemainMin}분 남음)</span>`
-                : (lat.safetyReason === "P000_FLOOR_RESIDUAL_ACTIVE"
-                  ? `<span class="badge warn">바닥잔열 방출중</span>`
-                  : (lat.safetyReason === "P000_FLOOR_PREDICTED_LIMIT"
-                    ? `<span class="badge warn">바닥예측 상한차단</span>`
-                    : (isStopped
-                      ? `<span class="boiler-pill stopped">OFF</span>`
-                      : `<span class="badge warn">미확인</span>`))))));
+        const reason = lat.safetyReason;
+        let boilerBadge;
+        if (live.windowOpen) boilerBadge = `<span class="badge danger">창문열림 (정지)</span>`;
+        else if (live.ventilationRemainMin > 0) boilerBadge = `<span class="badge" style="background:rgba(56,189,248,.22);color:#38bdf8;">환기정지 (${fmtNum(live.ventilationRemainMin)}분 남음)</span>`;
+        else if (isRunning) boilerBadge = `<span class="boiler-pill running"><span class="boiler-dot"></span>가동중 (${fmtNum(live.runtimeMin ?? 0)}/${fmtNum(roomCapMin)}분)</span>`;
+        else if (live.cooldownRemainMin > 0) boilerBadge = `<span class="badge warn">잔열대기 (${fmtNum(live.cooldownRemainMin)}분 남음)</span>`;
+        else if (reason === "P000_FLOOR_UNCONFIGURED") boilerBadge = `<span class="badge danger">바닥센서 미설정</span>`;
+        else if (reason === "P000_SENSOR_STALE" || reason === "P000_SENSOR_MISSING") boilerBadge = `<span class="badge danger">센서 이상 차단</span>`;
+        else if (reason === "P000_FLOOR_RESIDUAL_ACTIVE") boilerBadge = `<span class="badge warn">바닥잔열 방출중</span>`;
+        else if (reason === "P000_FLOOR_PREDICTED_LIMIT") boilerBadge = `<span class="badge warn">바닥예측 상한차단</span>`;
+        else if (reason === "P000_ANTI_CHATTER") boilerBadge = `<span class="badge warn">최소 가동/휴지 유지</span>`;
+        else if (isStopped) boilerBadge = `<span class="boiler-pill stopped">OFF</span>`;
+        else boilerBadge = `<span class="badge warn">미확인</span>`;
 
-        const spStr = live.climateSetpoint != null ? `${live.climateSetpoint}°C` : "--";
-        const curStr = live.climateCurrentTemp != null ? `${live.climateCurrentTemp}°C` : "--";
+        const spStr = live.climateSetpoint != null ? `${esc(live.climateSetpoint)}°C` : "--";
+        const curStr = live.climateCurrentTemp != null ? `${esc(live.climateCurrentTemp)}°C` : "--";
         const cmpText = live.climateState != null
-          ? `<div style="font-size:11px;color:${isRunning ? "#fdba74" : "var(--muted)"};margin-top:4px;">설정 ${spStr} ${isRunning ? "&gt;" : "&le;"} 조절기 ${curStr} (${live.climateState})</div>`
+          ? `<div style="font-size:11px;color:${isRunning ? "#fdba74" : "var(--muted)"};margin-top:4px;">설정 ${spStr} ${isRunning ? "&gt;" : "&le;"} 조절기 ${curStr} (${esc(live.climateState)})</div>`
           : `<div style="font-size:11px;color:var(--danger);margin-top:4px;">조절기 미수신</div>`;
 
-        const humWarn = rm.roomTempEntity.toLowerCase().includes("humidity")
+        const humWarn = String(rm.roomTempEntity).toLowerCase().includes("humidity")
           ? `<div style="font-size:11px;color:var(--warn);margin-top:2px;">⚠ 습도 센서입니다</div>` : "";
+        const underheat = live.underheatMin > 0
+          ? `<div style="font-size:11px;color:var(--warn);margin-top:2px;">목표 미달 지속 ${fmtNum(live.underheatMin)}분</div>` : "";
+        const effTarget = live.effectiveTargetTemp != null
+          ? `<div style="font-size:11px;color:var(--muted);text-align:center;">실효 목표 ${fmtNum(live.effectiveTargetTemp, 2)}°C</div>` : "";
+        const tTemp = Number(rm.targetTemp);
 
         return `
       <tr class="${isRunning ? "row-running" : ""}">
         <td>
-          <div class="room-name">${rm.roomName} <span class="badge ${isAuto ? "ok" : "warn"}" style="margin-left:4px;">${isAuto ? "AUTO" : "수동"}</span></div>
-          <div class="entity-sub">${rm.roomTempEntity}<br/>${rm.climateEntity}${rm.windowSensorEntity ? `<br/>창문: ${rm.windowSensorEntity}` : ""}</div>
+          <div class="room-name">${name} <span class="badge ${isAuto ? "ok" : "warn"}" style="margin-left:4px;">${isAuto ? "AUTO" : "수동"}</span></div>
+          <div class="entity-sub">${esc(rm.roomTempEntity)}<br/>${esc(rm.climateEntity)}${rm.windowSensorEntity ? `<br/>창문: ${esc(rm.windowSensorEntity)}` : ""}</div>
           ${humWarn}
         </td>
         <td>
@@ -816,60 +918,68 @@
         </td>
         <td>
           <div class="temp-big">${rt}</div>
-          <div style="font-size:11px;color:var(--muted);">30분 예측: ${lat.predictedRoom30m != null ? lat.predictedRoom30m + "°C" : "--"}</div>
+          <div style="font-size:11px;color:var(--muted);">30분 예측: ${lat.predictedRoom30m != null ? `${fmtNum(lat.predictedRoom30m, 2)}°C` : "--"}</div>
+          ${underheat}
         </td>
         <td>
           <div class="temp-big">${ft}</div>
-          <div style="font-size:11px;color:var(--muted);">${fSrc}${live.effectiveFloorLimitC != null ? ` · 상한 ${live.effectiveFloorLimitC}°C` : ""}</div>
+          <div style="font-size:11px;color:var(--muted);">${fSrc}${live.effectiveFloorLimitC != null ? ` · 상한 ${fmtNum(live.effectiveFloorLimitC)}°C` : ""}</div>
         </td>
         <td>
           <div class="inline-flex">
-            <button class="btn-sm" onclick="changeTarget('${rm.roomName}', ${(rm.targetTemp - 0.1).toFixed(1)})">-0.1</button>
-            <span style="font-size:16px;font-weight:700;min-width:52px;text-align:center;color:var(--accent);">${rm.targetTemp.toFixed(1)}°C</span>
-            <button class="btn-sm" onclick="changeTarget('${rm.roomName}', ${(rm.targetTemp + 0.1).toFixed(1)})">+0.1</button>
+            <button class="btn-sm" data-act="target" data-room="${name}" data-val="${(tTemp - 0.1).toFixed(1)}">-0.1</button>
+            <span style="font-size:16px;font-weight:700;min-width:52px;text-align:center;color:var(--accent);">${fmtNum(tTemp)}°C</span>
+            <button class="btn-sm" data-act="target" data-room="${name}" data-val="${(tTemp + 0.1).toFixed(1)}">+0.1</button>
+          </div>
+          ${effTarget}
+        </td>
+        <td>
+          <div class="inline-flex">
+            <button class="btn-sm ${isAuto ? "primary active" : ""}" data-act="mode" data-room="${name}" data-mode="AUTO" data-manual="HOLD">자동</button>
+            <button class="btn-sm ${isManHeat ? "heat active" : ""}" data-act="mode" data-room="${name}" data-mode="MANUAL" data-manual="HEAT">수동ON</button>
+            <button class="btn-sm ${isManOff ? "off active" : ""}" data-act="mode" data-room="${name}" data-mode="MANUAL" data-manual="OFF">수동OFF</button>
           </div>
         </td>
         <td>
           <div class="inline-flex">
-            <button class="btn-sm ${isAuto ? "primary active" : ""}" onclick="setMode('${rm.roomName}', 'AUTO', 'HOLD')">자동</button>
-            <button class="btn-sm ${isManHeat ? "heat active" : ""}" onclick="setMode('${rm.roomName}', 'MANUAL', 'HEAT')">수동ON</button>
-            <button class="btn-sm ${isManOff ? "off active" : ""}" onclick="setMode('${rm.roomName}', 'MANUAL', 'OFF')">수동OFF</button>
-          </div>
-        </td>
-        <td>
-          <div class="inline-flex">
-            <button class="btn-sm" onclick="testClimate('${rm.roomName}', 'HEAT')">ON(${currentSettings.heatOnSetpoint}°)</button>
-            <button class="btn-sm" onclick="testClimate('${rm.roomName}', 'OFF')">OFF(${currentSettings.heatOffSetpoint}°)</button>
-            <button class="btn-del" onclick="deleteRoom('${rm.roomName}')">삭제</button>
+            <button class="btn-sm" data-act="test" data-room="${name}" data-action="HEAT">ON(${esc(currentSettings.heatOnSetpoint)}°)</button>
+            <button class="btn-sm" data-act="test" data-room="${name}" data-action="OFF">OFF(${esc(currentSettings.heatOffSetpoint)}°)</button>
+            <button class="btn-del" data-act="delete" data-room="${name}">삭제</button>
           </div>
         </td>
       </tr>`;
       }).join("");
     }
 
-    function drawChart() {
+    async function drawChart() {
       const canvas = document.getElementById("tempChart");
       const ctx = canvas.getContext("2d");
       const W = canvas.width, H = canvas.height;
-      ctx.clearRect(0, 0, W, H);
-
       const roomName = document.getElementById("chartRoomSel").value;
-      const pts = allCycles.filter(c => c.roomName === roomName && c.roomTemp != null).reverse().slice(-144);
+      let pts = [];
+      if (roomName) {
+        try {
+          const res = await api(`/chart?room_name=${encodeURIComponent(roomName)}&hours=24`);
+          pts = (res.points || []).filter(p => p.room != null);
+        } catch (e) {
+          pts = [];
+        }
+      }
+      ctx.clearRect(0, 0, W, H);
       if (pts.length < 2) {
         ctx.fillStyle = "#94a3b8";
         ctx.font = "14px sans-serif";
-        ctx.fillText("시계열 데이터가 2건 이상 쌓이면 24시간 온도·밸브 그래프가 표시됩니다.", 24, H / 2);
+        ctx.fillText("시계열 데이터가 2건 이상 쌓이면 최근 24시간 온도·밸브 그래프가 표시됩니다.", 24, H / 2);
         return;
       }
 
-      const temps = pts.flatMap(p => [p.roomTemp, p.floorTemp, p.targetTemp].filter(v => v != null));
+      const temps = pts.flatMap(p => [p.room, p.floor, p.target].filter(v => v != null));
       const minT = Math.floor(Math.min(...temps) - 1);
       const maxT = Math.ceil(Math.max(...temps) + 1);
       const padL = 46, padR = 16, padT = 16, padB = 28;
       const xOf = i => padL + (i / (pts.length - 1)) * (W - padL - padR);
       const yOf = t => padT + ((maxT - t) / Math.max(maxT - minT, 1)) * (H - padT - padB);
 
-      // Horizontal grid lines
       ctx.strokeStyle = "#1e293b";
       ctx.fillStyle = "#94a3b8";
       ctx.font = "11px sans-serif";
@@ -879,19 +989,18 @@
         ctx.fillText(`${t}°C`, 6, y + 4);
       }
 
-      // Boiler ON bars at bottom
-      const barW = Math.max(3, (W - padL - padR) / pts.length);
+      const barW = Math.max(2, (W - padL - padR) / pts.length);
       ctx.fillStyle = "rgba(249, 115, 22, 0.35)";
       pts.forEach((p, i) => {
-        if (p.commandAction === "HEAT") ctx.fillRect(xOf(i) - barW / 2, H - padB - 18, barW, 18);
+        if (p.heat) ctx.fillRect(xOf(i) - barW / 2, H - padB - 18, barW, 18);
       });
 
-      // Target +/- 0.15C band
-      if (pts[0].targetTemp != null) {
+      const withTarget = pts.map((p, i) => [p, i]).filter(([p]) => p.target != null);
+      if (withTarget.length > 1) {
         ctx.fillStyle = "rgba(56, 189, 248, 0.12)";
         ctx.beginPath();
-        pts.forEach((p, i) => { const x = xOf(i), y = yOf(p.targetTemp + 0.15); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
-        for (let i = pts.length - 1; i >= 0; i--) ctx.lineTo(xOf(i), yOf(pts[i].targetTemp - 0.15));
+        withTarget.forEach(([p, i], k) => { const x = xOf(i), y = yOf(p.target + 0.15); k ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+        for (let k = withTarget.length - 1; k >= 0; k--) { const [p, i] = withTarget[k]; ctx.lineTo(xOf(i), yOf(p.target - 0.15)); }
         ctx.closePath(); ctx.fill();
       }
 
@@ -906,17 +1015,16 @@
         ctx.stroke(); ctx.setLineDash([]);
       };
 
-      drawLine("targetTemp", "#94a3b8", [4, 4]);
-      drawLine("floorTemp", "#22c55e");
-      drawLine("roomTemp", "#38bdf8");
+      drawLine("target", "#94a3b8", [4, 4]);
+      drawLine("floor", "#22c55e");
+      drawLine("room", "#38bdf8");
 
-      // X-axis KST HH:MM labels so heating durations & gaps are clearly visible
       ctx.fillStyle = "#94a3b8";
       ctx.font = "11px sans-serif";
       const tickCount = Math.min(6, pts.length);
       for (let k = 0; k < tickCount; k++) {
         const idx = Math.round((k / Math.max(tickCount - 1, 1)) * (pts.length - 1));
-        const ts = String(pts[idx].executionStartedAt || "");
+        const ts = String(pts[idx].t || "");
         const hhmm = ts.length >= 16 ? ts.slice(11, 16) : "";
         if (hhmm) {
           const x = xOf(idx);
@@ -925,15 +1033,17 @@
       }
     }
 
-    function renderKpis(k, b) {
+    function renderKpis(k, b, coverageHours) {
+      document.getElementById("kpiCoverage").textContent =
+        `(집계 구간: 최근 24시간 · 데이터 ${fmtNum(coverageHours ?? 0)}시간)`;
       document.getElementById("kpiGrid").innerHTML = `
-    <div class="metric"><label>보일러 가동 시간</label><div class="val">${b?.heatingMinutes ?? 0}분</div></div>
-    <div class="metric"><label>보일러 가동률</label><div class="val">${b?.dutyCyclePct ?? 0}%</div></div>
-    <div class="metric"><label>추정 일일 가스비</label><div class="val">${(b?.estimatedGasKrw ?? 0).toLocaleString()}원</div></div>
-    <div class="metric"><label>단펄스(&lt;10분)</label><div class="val">${b?.shortCycles ?? 0}회</div></div>
-    <div class="metric"><label>0.3°C 밴드 달성률</label><div class="val">${k.bandCompliancePct != null ? k.bandCompliancePct + "%" : "--"}</div></div>
-    <div class="metric"><label>최대 오버슈트</label><div class="val">${k.maxOvershootC != null ? k.maxOvershootC + "°C" : "--"}</div></div>
-    <div class="metric"><label>P000 안전 개입</label><div class="val">${k.safetyInterventions ?? 0}회</div></div>
+    <div class="metric"><label>보일러 가동 시간</label><div class="val">${fmtNum(b?.heatingMinutes ?? 0)}분</div></div>
+    <div class="metric"><label>보일러 가동률</label><div class="val">${fmtNum(b?.dutyCyclePct ?? 0)}%</div></div>
+    <div class="metric"><label>추정 가스비(24h)</label><div class="val">${Number(b?.estimatedGasKrw ?? 0).toLocaleString()}원</div></div>
+    <div class="metric"><label>단펄스(&lt;10분)</label><div class="val">${esc(b?.shortCycles ?? 0)}회</div></div>
+    <div class="metric"><label>0.3°C 밴드 달성률</label><div class="val">${k.bandCompliancePct != null ? `${fmtNum(k.bandCompliancePct)}%` : "--"}</div></div>
+    <div class="metric"><label>최대 오버슈트</label><div class="val">${k.maxOvershootC != null ? `${fmtNum(k.maxOvershootC, 2)}°C` : "--"}</div></div>
+    <div class="metric"><label>P000 안전 개입</label><div class="val">${esc(k.safetyInterventions ?? 0)}회</div></div>
   `;
     }
 
@@ -946,24 +1056,53 @@
       }
       body.innerHTML = list.map(p => `
     <tr>
-      <td><b>${p.roomName}</b></td>
-      <td><span class="badge ${p.status === "READY" ? "ok" : "warn"}">${p.status} (${p.sampleCount}회)</span></td>
-      <td>${p.floorOnDeadtimeMin}분</td>
-      <td>${p.floorPostOffPeakMin}분 (+${p.floorResidualRiseC}°C)</td>
-      <td>${p.roomOnDeadtimeMin}분</td>
-      <td>${p.roomPostOffPeakMin}분 (+${p.roomResidualRiseC}°C)</td>
-      <td><b>${p.recommendedCooldownMin}분</b></td>
-      <td>${p.recommendedHorizonMin}분 (단축 -${p.recommendedRunTrimMin}분)</td>
+      <td><b>${esc(p.roomName)}</b></td>
+      <td><span class="badge ${p.status === "READY" ? "ok" : "warn"}">${esc(p.status)} (${esc(p.sampleCount)}회)</span></td>
+      <td>${esc(p.floorOnDeadtimeMin)}분</td>
+      <td>${esc(p.floorPostOffPeakMin)}분 (+${esc(p.floorResidualRiseC)}°C)</td>
+      <td>${esc(p.roomOnDeadtimeMin)}분</td>
+      <td>${esc(p.roomPostOffPeakMin)}분 (+${esc(p.roomResidualRiseC)}°C)</td>
+      <td><b>${esc(p.recommendedCooldownMin)}분</b></td>
+      <td>${esc(p.recommendedHorizonMin)}분 (단축 -${esc(p.recommendedRunTrimMin)}분)</td>
     </tr>`).join("");
+    }
+
+    function renderSensors(list) {
+      const body = document.getElementById("sensorBody");
+      if (!list.length) {
+        body.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--muted);">바닥/실내 센서를 등록하면 보고 주기를 자동으로 학습합니다.</td></tr>`;
+        return;
+      }
+      body.innerHTML = list.map(s => {
+        const role = s.role === "FLOOR_MASTER" ? "바닥(마스터)" : `실내 · ${esc(s.roomName)}`;
+        const stale = s.ageSec != null && s.staleThresholdSec != null && s.ageSec > s.staleThresholdSec;
+        const adaptive = s.tsSource === "last_reported" && (s.intervalSamples || 0) >= 6 && (s.observedSpanHours || 0) >= 6;
+        const src = s.tsSource === "last_reported"
+          ? "last_reported"
+          : (s.tsSource ? `${esc(s.tsSource)} <span class="badge warn">적응 불가</span>` : "--");
+        const typical = (s.typicalIntervalSec != null ? fmtSec(s.typicalIntervalSec) : `학습중 (${esc(s.intervalSamples || 0)}/3)`)
+          + ` · 관측 ${fmtNum(s.observedSpanHours ?? 0)}h${adaptive ? "" : " (6h 후 적응)"}`;
+        return `
+    <tr>
+      <td><b>${role}</b></td>
+      <td>${esc(s.entityId)}</td>
+      <td>${esc(s.lastReportAt || "--")}</td>
+      <td>${stale ? `<span class="badge danger">${fmtSec(s.ageSec)}</span>` : fmtSec(s.ageSec)}</td>
+      <td>${typical}</td>
+      <td>${fmtSec(s.maxIntervalSec)}</td>
+      <td>${fmtSec(s.staleThresholdSec)} ${adaptive ? `<span class="badge ok">적응</span>` : `<span class="badge warn">기본</span>`}</td>
+      <td>${src}</td>
+    </tr>`;
+      }).join("");
     }
 
     function renderSchedules(slots) {
       document.getElementById("schedBody").innerHTML = slots.map((s, idx) => `
     <tr>
-      <td><input id="sc_label_${idx}" value="${s.label}" style="width:110px;" /></td>
-      <td><input id="sc_sh_${idx}" type="number" min="0" max="23" value="${s.startHour}" style="width:70px;" /></td>
-      <td><input id="sc_eh_${idx}" type="number" min="0" max="23" value="${s.endHour}" style="width:70px;" /></td>
-      <td><input id="sc_off_${idx}" type="number" step="0.1" value="${s.offsetC}" style="width:80px;" /></td>
+      <td><input id="sc_label_${idx}" value="${esc(s.label)}" maxlength="30" style="width:110px;" /></td>
+      <td><input id="sc_sh_${idx}" type="number" min="0" max="23" value="${esc(s.startHour)}" style="width:70px;" /></td>
+      <td><input id="sc_eh_${idx}" type="number" min="0" max="23" value="${esc(s.endHour)}" style="width:70px;" /></td>
+      <td><input id="sc_off_${idx}" type="number" step="0.1" value="${esc(s.offsetC)}" style="width:80px;" /></td>
       <td><input id="sc_en_${idx}" type="checkbox" ${s.enabled ? "checked" : ""} /></td>
     </tr>`).join("");
     }
@@ -971,154 +1110,228 @@
     function renderCycles(items) {
       document.getElementById("cycleBody").innerHTML = items.map(c => `
     <tr>
-      <td>${c.executionStartedAt || "-"}</td><td>${c.roomName}</td>
-      <td>${c.roomTemp ?? "-"}</td><td>${c.floorTemp ?? "-"} (${c.floorSensorSource || "-"})</td>
-      <td>${c.targetTemp ?? "-"}</td><td>${c.safetyReason || "-"}</td>
-      <td>${c.commandAction || "-"}</td><td>${c.commandSetpoint ?? "-"}</td>
-      <td>${c.combustionConfirmed === true ? "연소중" : (c.combustionConfirmed === false ? "정지" : "미확인")}</td>
+      <td>${esc(c.executionStartedAt || "-")}</td><td>${esc(c.roomName)}</td>
+      <td>${esc(c.roomTemp ?? "-")}</td><td>${esc(c.floorTemp ?? "-")} (${esc(c.floorSensorSource || "-")})</td>
+      <td>${esc(c.effectiveTargetTemp ?? c.targetTemp ?? "-")}</td><td>${esc(c.safetyReason || "-")}</td>
+      <td>${esc(c.commandAction || "-")}</td><td>${esc(c.commandSetpoint ?? "-")}</td>
+      <td>${esc(c.dispatchResult || "-")}</td>
+      <td>${c.combustionConfirmed === true ? "가동" : (c.combustionConfirmed === false ? "정지" : "미확인")}</td>
     </tr>`).join("");
     }
 
-    async function applyPreset(preset) {
-      const res = await api("/preset", { method: "POST", body: JSON.stringify({ preset }) });
-      showMsg(`프리셋 적용 완료: ${res.activePreset} (목표 오프셋 ${res.offsetC}°C)`);
-      await refresh();
-    }
-
-    async function saveSchedules() {
-      const slots = currentSchedules.map((s, idx) => ({
-        slotId: s.slotId,
-        label: document.getElementById(`sc_label_${idx}`).value,
-        startHour: Number(document.getElementById(`sc_sh_${idx}`).value),
-        endHour: Number(document.getElementById(`sc_eh_${idx}`).value),
-        offsetC: Number(document.getElementById(`sc_off_${idx}`).value),
-        enabled: document.getElementById(`sc_en_${idx}`).checked,
-      }));
-      await api("/schedules", { method: "PUT", body: JSON.stringify({ slots }) });
-      showMsg("P400 시간대별 스케줄이 저장되었습니다.");
-      await refresh();
-    }
-
-    async function runAutoCalibrate() {
-      const res = await api("/calibrate/auto", { method: "POST" });
-      showMsg(`RC 피팅 결과: ${JSON.stringify(res.rcFit)}\n바닥 오프셋 자동 보정: ${JSON.stringify(res.updatedFloorOffsets)}`);
-      await refresh();
-    }
-
-    async function sendTestNotify() {
-      const res = await api("/notify/test", { method: "POST" });
-      showMsg(`모바일 푸시 알림 테스트 결과:\n${JSON.stringify(res, null, 2)}`);
-    }
-
-    async function runDiagnose() {
-      showMsg("HA 엔티티 및 서비스 진단 중...");
-      const res = await api("/ha/diagnose");
-      showMsg(`HA 연동 진단 결과:\n${JSON.stringify(res, null, 2)}`);
-    }
-
-    async function testClimate(roomName, action) {
-      showMsg(`${roomName} 조절기 직접 제어 테스트(${action}) 전송 중...`);
-      const res = await api(`/rooms/${encodeURIComponent(roomName)}/test-climate`, {
-        method: "POST",
-        body: JSON.stringify({ action }),
+    function applyPreset(preset) {
+      return guarded(async () => {
+        const res = await api("/preset", { method: "POST", body: JSON.stringify({ preset }) });
+        showMsg(`프리셋 적용 완료: ${res.activePreset} (목표 오프셋 ${res.offsetC}°C)`);
+        await refresh();
       });
-      showMsg(`조절기 직접 테스트 결과 (${roomName}):\n${JSON.stringify(res, null, 2)}`);
-      await refresh();
     }
 
-    async function changeTarget(roomName, newTemp) {
-      await api(`/rooms/${encodeURIComponent(roomName)}`, { method: "PATCH", body: JSON.stringify({ targetTemp: Number(newTemp) }) });
-      await refresh();
-    }
-
-    async function setMode(roomName, controlMode, manualAction) {
-      await api(`/rooms/${encodeURIComponent(roomName)}`, { method: "PATCH", body: JSON.stringify({ controlMode, manualAction }) });
-      await refresh();
-    }
-
-    async function toggleNotifyEvents() {
-      await api("/settings", { method: "PATCH", body: JSON.stringify({ notifyEvents: currentSettings.notifyEvents === false }) });
-      await refresh();
-    }
-
-    async function toggleDryRun() {
-      await api("/settings", { method: "PATCH", body: JSON.stringify({ dryRun: !currentSettings.dryRun }) });
-      await refresh();
-    }
-
-    async function updateSettings() {
-      await api("/settings", {
-        method: "PATCH",
-        body: JSON.stringify({
-          zoneStrategy: document.getElementById("strategySel").value,
-          predictorModel: document.getElementById("modelSel").value,
-        }),
+    function saveSchedules() {
+      return guarded(async () => {
+        const slots = currentSchedules.map((s, idx) => ({
+          slotId: s.slotId,
+          label: document.getElementById(`sc_label_${idx}`).value,
+          startHour: Number(document.getElementById(`sc_sh_${idx}`).value),
+          endHour: Number(document.getElementById(`sc_eh_${idx}`).value),
+          offsetC: Number(document.getElementById(`sc_off_${idx}`).value),
+          enabled: document.getElementById(`sc_en_${idx}`).checked,
+        }));
+        await api("/schedules", { method: "PUT", body: JSON.stringify({ slots }) });
+        schedDirty = false;
+        showMsg("P400 시간대별 스케줄이 저장되었습니다.");
+        await refresh();
       });
-      await refresh();
     }
 
-    async function saveSwingSettings() {
-      await api("/settings", {
-        method: "PATCH",
-        body: JSON.stringify({
-          heatOnSetpoint: Number(document.getElementById("onSetpoint").value),
-          heatOffSetpoint: Number(document.getElementById("offSetpoint").value),
-          floorOffLimitC: Number(document.getElementById("floorOffLimit").value),
-          maxRunCapMin: Math.min(15, Number(document.getElementById("maxRunCap").value)),
-          cooldownMin: Number(document.getElementById("cooldownMin").value),
-          ventilationHoldMin: Number(document.getElementById("ventHoldMin").value),
-          gasKrwPerHour: Number(document.getElementById("gasRate").value),
-          masterFloorEntity: document.getElementById("masterFloorSel").value,
-          outdoorTempEntity: document.getElementById("outdoorTempSel").value,
-          weatherLocation: document.getElementById("weatherLoc").value.trim() || "서울",
-        }),
+    function runAutoCalibrate() {
+      return guarded(async () => {
+        showMsg("RC 피팅 및 열지연 재학습 중...");
+        const res = await api("/calibrate/auto", { method: "POST" });
+        showMsg(
+          `RC 피팅 결과: ${JSON.stringify(res.rcFit)}\n` +
+          `슬레이브 바닥 오프셋 제안값(자동 적용 안 함): ${JSON.stringify(res.suggestedFloorOffsets)}\n` +
+          "→ 적용하려면 방 등록 폼에서 바닥 오프셋을 입력해 같은 이름으로 재등록하세요."
+        );
+        await refresh();
       });
-      showMsg("보일러 스윙 온도, 1회 최대 가동 시간(≤15분), 바닥 상한 및 센서가 저장되었습니다.");
-      await refresh();
     }
 
-    async function runNow() {
-      await api("/control/run-now", { method: "POST" });
-      await refresh();
-    }
-
-    async function deleteRoom(roomName) {
-      if (!confirm(`'${roomName}' 방 설정을 삭제할까요?`)) return;
-      await api(`/rooms/${encodeURIComponent(roomName)}`, { method: "DELETE" });
-      await refresh();
-    }
-
-    async function addRoom() {
-      const roomName = document.getElementById("newRoomName").value.trim();
-      const roomTempEntity = document.getElementById("newRoomTempSel").value;
-      const climateEntity = document.getElementById("newClimateSel").value;
-      const windowSensorEntity = document.getElementById("newWindowSel").value || "";
-      if (!roomName || !roomTempEntity || !climateEntity) return alert("방 이름과 센서/온도조절기를 선택하세요.");
-      await api("/rooms", {
-        method: "POST",
-        body: JSON.stringify({
-          roomName, roomTempEntity, climateEntity, windowSensorEntity,
-          hasFloorSensor: document.getElementById("newHasFloor").value === "true",
-          targetTemp: Number(document.getElementById("newTarget").value),
-          floorOffsetC: Number(document.getElementById("newOffset").value),
-        }),
+    function sendTestNotify() {
+      return guarded(async () => {
+        const res = await api("/notify/test", { method: "POST" });
+        showMsg(`모바일 푸시 알림 테스트 결과:\n${JSON.stringify(res, null, 2)}`);
       });
-      document.getElementById("newRoomName").value = "";
-      await refresh();
     }
 
-    async function requestReport() {
-      const box = document.getElementById("reportBox");
-      box.style.display = "block";
-      box.textContent = "Gemini 일일 진단 리포트 생성 중...";
-      const res = await api("/report/daily", { method: "POST" });
-      box.textContent = res.report || `상태: ${res.status} (Gemini API 키 미설정 또는 이력 부족)`;
+    function runDiagnose() {
+      return guarded(async () => {
+        showMsg("HA 엔티티 및 서비스 진단 중...");
+        const res = await api("/ha/diagnose");
+        showMsg(`HA 연동 진단 결과:\n${JSON.stringify(res, null, 2)}`);
+      });
     }
+
+    function showDebugLogs() {
+      return guarded(async () => {
+        const res = await api("/debug/logs?lines=300");
+        showMsg(`로그 파일: ${res.logPath || "(파일 로그 없음)"}\n` + (res.lines || []).join("\n"));
+      });
+    }
+
+    function testClimate(roomName, action) {
+      return guarded(async () => {
+        if (!confirm(`'${roomName}' 조절기에 실제 ${action} 명령을 직접 전송합니다. 계속할까요?`)) return;
+        showMsg(`${roomName} 조절기 직접 제어 테스트(${action}) 전송 중...`);
+        const res = await api(`/rooms/${encodeURIComponent(roomName)}/test-climate`, {
+          method: "POST",
+          body: JSON.stringify({ action }),
+        });
+        showMsg(`조절기 직접 테스트 결과 (${roomName}):\n${JSON.stringify(res, null, 2)}`);
+        await refresh();
+      });
+    }
+
+    function changeTarget(roomName, newTemp) {
+      return guarded(async () => {
+        await api(`/rooms/${encodeURIComponent(roomName)}`, { method: "PATCH", body: JSON.stringify({ targetTemp: Number(newTemp) }) });
+        await refresh();
+      });
+    }
+
+    function setMode(roomName, controlMode, manualAction) {
+      return guarded(async () => {
+        await api(`/rooms/${encodeURIComponent(roomName)}`, { method: "PATCH", body: JSON.stringify({ controlMode, manualAction }) });
+        await refresh();
+      });
+    }
+
+    function toggleNotifyEvents() {
+      return guarded(async () => {
+        await api("/settings", { method: "PATCH", body: JSON.stringify({ notifyEvents: currentSettings.notifyEvents === false }) });
+        await refresh();
+      });
+    }
+
+    function toggleDryRun() {
+      return guarded(async () => {
+        const goLive = !!currentSettings.dryRun;
+        if (goLive && !confirm("실제 보일러 제어(LIVE)로 전환합니다. 조절기로 실제 명령이 전송됩니다. 계속할까요?")) return;
+        await api("/settings", { method: "PATCH", body: JSON.stringify({ dryRun: !currentSettings.dryRun }) });
+        showMsg(goLive ? "LIVE 모드로 전환되었습니다." : "시험 운전(Dry-Run) 모드로 전환되었습니다.");
+        await refresh();
+      });
+    }
+
+    function updateSettings() {
+      return guarded(async () => {
+        await api("/settings", {
+          method: "PATCH",
+          body: JSON.stringify({
+            zoneStrategy: document.getElementById("strategySel").value,
+            predictorModel: document.getElementById("modelSel").value,
+          }),
+        });
+        await refresh();
+      });
+    }
+
+    function saveSwingSettings() {
+      return guarded(async () => {
+        await api("/settings", {
+          method: "PATCH",
+          body: JSON.stringify({
+            heatOnSetpoint: Number(document.getElementById("onSetpoint").value),
+            heatOffSetpoint: Number(document.getElementById("offSetpoint").value),
+            floorOffLimitC: Number(document.getElementById("floorOffLimit").value),
+            maxRunCapMin: Math.max(5, Math.min(15, Number(document.getElementById("maxRunCap").value))),
+            cooldownMin: Number(document.getElementById("cooldownMin").value),
+            ventilationHoldMin: Number(document.getElementById("ventHoldMin").value),
+            gasKrwPerHour: Number(document.getElementById("gasRate").value),
+            historyRetentionDays: Number(document.getElementById("retentionDays").value),
+            masterFloorEntity: document.getElementById("masterFloorSel").value,
+            outdoorTempEntity: document.getElementById("outdoorTempSel").value,
+            weatherLocation: document.getElementById("weatherLoc").value.trim() || "서울",
+          }),
+        });
+        showMsg("보일러 스윙 온도, 1회 최대 가동 시간(5~15분), 바닥 상한, 센서, 이력 보존 기간이 저장되었습니다.");
+        await refresh();
+      });
+    }
+
+    function runNow() {
+      return guarded(async () => {
+        await api("/control/run-now", { method: "POST" });
+        await refresh();
+      });
+    }
+
+    function deleteRoom(roomName) {
+      return guarded(async () => {
+        if (!confirm(`'${roomName}' 방 설정을 삭제할까요?`)) return;
+        await api(`/rooms/${encodeURIComponent(roomName)}`, { method: "DELETE" });
+        await refresh();
+      });
+    }
+
+    function addRoom() {
+      return guarded(async () => {
+        const roomName = document.getElementById("newRoomName").value.trim();
+        const roomTempEntity = document.getElementById("newRoomTempSel").value;
+        const climateEntity = document.getElementById("newClimateSel").value;
+        const windowSensorEntity = document.getElementById("newWindowSel").value || "";
+        if (!roomName || !roomTempEntity || !climateEntity) {
+          alert("방 이름과 센서/온도조절기를 선택하세요.");
+          return;
+        }
+        if (/[<>"'&\/\\]/.test(roomName)) {
+          alert("방 이름에는 < > \" ' & / \\ 문자를 사용할 수 없습니다.");
+          return;
+        }
+        await api("/rooms", {
+          method: "POST",
+          body: JSON.stringify({
+            roomName, roomTempEntity, climateEntity, windowSensorEntity,
+            hasFloorSensor: document.getElementById("newHasFloor").value === "true",
+            targetTemp: Number(document.getElementById("newTarget").value),
+            floorOffsetC: Number(document.getElementById("newOffset").value),
+          }),
+        });
+        document.getElementById("newRoomName").value = "";
+        await refresh();
+      });
+    }
+
+    function requestReport() {
+      return guarded(async () => {
+        const box = document.getElementById("reportBox");
+        box.style.display = "block";
+        box.textContent = "Gemini 진단 리포트 생성 중...";
+        const res = await api("/report/daily", { method: "POST" });
+        box.textContent = res.report || `상태: ${res.status} (Gemini API 키 미설정 또는 이력 부족)`;
+      });
+    }
+
+    // 방 테이블 버튼: data-* 속성 기반 이벤트 위임 (인라인 onclick 문자열 조립 제거)
+    document.getElementById("roomTableBody").addEventListener("click", ev => {
+      const btn = ev.target.closest("button[data-act]");
+      if (!btn) return;
+      const room = btn.dataset.room;
+      switch (btn.dataset.act) {
+        case "target": changeTarget(room, Number(btn.dataset.val)); break;
+        case "mode": setMode(room, btn.dataset.mode, btn.dataset.manual); break;
+        case "test": testClimate(room, btn.dataset.action); break;
+        case "delete": deleteRoom(room); break;
+      }
+    });
+
+    // 스케줄 입력 중에는 15초 자동 새로고침이 입력값을 덮어쓰지 않도록 보호
+    document.getElementById("schedBody").addEventListener("input", () => { schedDirty = true; });
 
     (async () => {
       await refresh();
       await loadEntities();
-      setInterval(refresh, 15000);
+      setInterval(() => { refresh().catch(() => { }); }, 15000);
     })();
   </script>
 </body>

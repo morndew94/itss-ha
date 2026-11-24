@@ -33,7 +33,8 @@ def test_p000_overheat_cutoff():
 
 def test_p000_general_floor_limit():
     sentinel = SentinelProtocol()
-    snap = SensorSnapshot(room_name="living", room_temp=23.0, floor_temp=28.1)
+    # 기본 일반 바닥 상한(DEFAULT_GENERAL_OFF_FLOOR_C) 이상, 과열 기준 미만
+    snap = SensorSnapshot(room_name="living", room_temp=21.0, floor_temp=21.0)
     verdict = sentinel.evaluate(snap, is_heating=True)
     assert verdict.force_off is True
     assert verdict.reason_code == "P000_FLOOR_LIMIT_OFF"
@@ -41,7 +42,7 @@ def test_p000_general_floor_limit():
 
 def test_p000_anti_chattering_hold():
     sentinel = SentinelProtocol()
-    snap = SensorSnapshot(room_name="living", room_temp=22.5, floor_temp=24.0)
+    snap = SensorSnapshot(room_name="living", room_temp=22.5, floor_temp=19.5)
     verdict = sentinel.evaluate(snap, is_heating=True, seconds_since_last_switch=120.0)
     assert verdict.hold_current_state is True
     assert verdict.reason_code == "P000_ANTI_CHATTER"
@@ -88,18 +89,18 @@ def test_p300_and_p400_offsets():
     assert atmos.compute_max_run_minutes(outdoor_temp=-20.0, hard_cap_min=25.0) == 15.0
 
 
-def test_p000_max_run_cap_and_floor_26p5():
+def test_p000_max_run_cap_and_configured_floor_limit():
     from itss_scada.app.protocols.p000_sentinel import SentinelConfig
 
-    sentinel = SentinelProtocol(SentinelConfig(general_off_floor_c=26.5))
-    # Floor at 26.6C triggers floor limit OFF
-    v_floor = sentinel.evaluate(SensorSnapshot("living", 21.5, 26.6), is_heating=True)
+    sentinel = SentinelProtocol(SentinelConfig(general_off_floor_c=22.5))
+    # Floor at 22.6C (>= 22.5C configured limit, < overheat) triggers floor limit OFF
+    v_floor = sentinel.evaluate(SensorSnapshot("living", 21.5, 22.6), is_heating=True)
     assert v_floor.force_off is True
     assert v_floor.reason_code == "P000_FLOOR_LIMIT_OFF"
 
     # Continuous run reaching outdoor-adaptive cap triggers max-run cutoff
     v_run = sentinel.evaluate(
-        SensorSnapshot("living", 21.5, 25.0),
+        SensorSnapshot("living", 21.5, 21.0),
         is_heating=True,
         continuous_run_min=11.0,
         max_run_min=11.0,
@@ -109,7 +110,7 @@ def test_p000_max_run_cap_and_floor_26p5():
 
     # Residual heat cooldown keeps boiler OFF
     v_cd = sentinel.evaluate(
-        SensorSnapshot("living", 21.5, 25.0),
+        SensorSnapshot("living", 21.5, 21.0),
         is_heating=False,
         cooldown_remaining_min=14.0,
     )

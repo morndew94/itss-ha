@@ -14,6 +14,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install -r itss_scada/requirements.txt pytest
-      - name: Run unit and API tests
+        run: pip install -r requirements-dev.txt
+      - name: Static checks (syntax errors, undefined names, unused imports/variables)
+        run: ruff check --select E9,F63,F7,F82,F401,F841 itss_scada tests
+      - name: Run unit and API tests (network blocked by tests/conftest.py)
         run: pytest -v

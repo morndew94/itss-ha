@@ -18,9 +18,9 @@ class FakeHAClient:
         self.token_source = "mock"
         self.last_error = None
         self.states = {
-            "sensor.living_floor_temperature": 25.0,
+            "sensor.living_floor_temperature": 22.0,
             "sensor.living_temperature": 22.7,
-            "sensor.master_bedroom_temperature": 23.3,
+            "sensor.master_bedroom_temperature": 22.3,
         }
         self.calls: list[tuple[str, str, dict]] = []
 
@@ -61,10 +61,10 @@ def test_addon_v2_full_workflow(tmp_path: Path):
         assert "no-store" in r_html.headers.get("cache-control", "").lower()
         assert "no-cache" in r_html.headers.get("pragma", "").lower()
         health = client.get("/health").json()
-        assert health["appVersion"] == "2.6.1"
+        assert health["appVersion"] == "2.7.0"
         repo_root = Path(__file__).resolve().parents[1]
-        assert 'version: "2.6.1"' in (repo_root / "itss_scada" / "config.yaml").read_text(encoding="utf-8")
-        assert 'ITSS_BUILD_VERSION="2.6.1"' in (repo_root / "itss_scada" / "Dockerfile").read_text(encoding="utf-8")
+        assert 'version: "2.7.0"' in (repo_root / "itss_scada" / "config.yaml").read_text(encoding="utf-8")
+        assert 'ITSS_BUILD_VERSION="2.7.0"' in (repo_root / "itss_scada" / "Dockerfile").read_text(encoding="utf-8")
         assert len(client.get("/api/v1/ha/entities").json()["tempSensors"]) == 1
 
         # Verify physical boiler-running detection (setpoint > current_temperature)
@@ -119,7 +119,7 @@ def test_addon_v2_full_workflow(tmp_path: Path):
         assert n_res["ha_notify"].startswith("sent_via_service:")
         assert n_res["telegram"] == "sent_to:12345"
         tg_calls = [d for dom, svc, d in fake_ha.calls if dom == "telegram_bot" and svc == "send_message"]
-        assert len(tg_calls) >= 3 and tg_calls[-1]["target"] == 12345
+        assert len(tg_calls) >= 3 and tg_calls[-1]["chat_id"] == 12345
 
         # 6. Diagnose & direct climate test endpoints
         diag = client.get("/api/v1/ha/diagnose").json()

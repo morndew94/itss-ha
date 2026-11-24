@@ -15,6 +15,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ..const import (
+    DEFAULT_CONTROL_BAND_HALF,
+    DEFAULT_GENERAL_OFF_FLOOR_C,
+    DEFAULT_OVERHEAT_FLOOR_C,
+    DEFAULT_OVERHEAT_ROOM_C,
+)
+
 
 @dataclass(slots=True)
 class ZoneReading:
@@ -57,10 +64,10 @@ class MultiZoneController:
         self,
         *,
         strategy: str = "hybrid",
-        band_half_c: float = 0.15,
-        overheat_room_c: float = 27.0,
-        overheat_floor_c: float = 29.0,
-        general_off_floor_c: float = 28.0,
+        band_half_c: float = DEFAULT_CONTROL_BAND_HALF,
+        overheat_room_c: float = DEFAULT_OVERHEAT_ROOM_C,
+        overheat_floor_c: float = DEFAULT_OVERHEAT_FLOOR_C,
+        general_off_floor_c: float = DEFAULT_GENERAL_OFF_FLOOR_C,
         coheat_margin_c: float = 0.05,
     ) -> None:
         if strategy not in ("hybrid", "simultaneous"):

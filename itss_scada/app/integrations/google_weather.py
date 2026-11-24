@@ -17,6 +17,9 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
+# 실패 후 재시도 대기(초): 매 제어 주기/웹 폴링마다 실패 요청이 반복되지 않도록 함
+FAILURE_BACKOFF_SEC = 600
+
 # Built-in coordinates for major Korean cities/districts (used by Open-Meteo fallback)
 KOREA_COORDS: dict[str, tuple[float, float]] = {
     "서울": (37.5665, 126.9780),
@@ -81,18 +84,21 @@ class GoogleWeatherClient:
         self.cache_ttl_sec = cache_ttl_sec
         self._http_post = http_post or self._default_post
         self._cache: WeatherSnapshot | None = None
+        self._fail_until: float = 0.0
 
     def set_location(self, location: str) -> None:
         if location != self.location:
             self.location = location
             self._cache = None
+            self._fail_until = 0.0
 
     def _default_post(self, url: str, payload: dict) -> dict:
         body = json.dumps(payload).encode("utf-8")
+        # API 키는 URL query 대신 x-goog-api-key 헤더로 전달 (로그/예외 메시지 노출 방지)
         req = urllib.request.Request(
             url,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=20) as resp:
@@ -106,10 +112,12 @@ class GoogleWeatherClient:
 
         if not self.api_key:
             return WeatherSnapshot(None, None, "no_api_key", "FALLBACK", now)
+        if now < self._fail_until:
+            return self._cache or WeatherSnapshot(None, None, "backoff", "FALLBACK", now)
 
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.model_name}:generateContent?key={self.api_key}"
+            f"{self.model_name}:generateContent"
         )
         prompt = (
             f"현재 {self.location}의 최신 기상 정보(기온 °C, 풍속 m/s, 날씨 상태)를 검색하여 "
@@ -131,9 +139,13 @@ class GoogleWeatherClient:
                 source="GEMINI_SEARCH_GROUNDING",
                 fetched_at_epoch=now,
             )
+            # LLM 응답 값의 물리적 타당성 검증 (환각 방지)
+            if not (-40.0 <= snap.outdoor_temp_c <= 45.0) or not (0.0 <= (snap.wind_speed_ms or 0.0) <= 60.0):
+                raise ValueError(f"Implausible Gemini weather values: {snap}")
             self._cache = snap
             return snap
         except Exception:  # noqa: BLE001
+            self._fail_until = now + FAILURE_BACKOFF_SEC
             if self._cache is not None:
                 return self._cache
             return WeatherSnapshot(None, None, "fetch_error", "FALLBACK", now)
@@ -161,14 +173,16 @@ class OpenMeteoWeatherClient:
         self._http_get = http_get or self._default_get
         self._cache: WeatherSnapshot | None = None
         self._coords_cache: dict[str, tuple[float, float]] = {}
+        self._fail_until: float = 0.0
 
     def set_location(self, location: str) -> None:
         if location and location != self.location:
             self.location = location
             self._cache = None
+            self._fail_until = 0.0
 
     def _default_get(self, url: str) -> dict:
-        req = urllib.request.Request(url, headers={"User-Agent": "ITSS-SCADA/2.4"})
+        req = urllib.request.Request(url, headers={"User-Agent": "ITSS-SCADA/2.7"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
@@ -198,6 +212,8 @@ class OpenMeteoWeatherClient:
         now = now_epoch if now_epoch is not None else time.time()
         if self._cache and (now - self._cache.fetched_at_epoch) < self.cache_ttl_sec:
             return self._cache
+        if now < self._fail_until:
+            return self._cache or WeatherSnapshot(None, None, "backoff", "FALLBACK", now)
 
         try:
             lat, lon = self._resolve_coords()
@@ -221,13 +237,17 @@ class OpenMeteoWeatherClient:
             self._cache = snap
             return snap
         except Exception:  # noqa: BLE001
+            self._fail_until = now + FAILURE_BACKOFF_SEC
             if self._cache is not None:
                 return self._cache
             return WeatherSnapshot(None, None, "fetch_error", "FALLBACK", now)
 
 
 class FallbackWeatherProvider:
-    """Chains Gemini Search Grounding (if key set) -> Open-Meteo API for configured region."""
+    """Chains Open-Meteo API (deterministic) -> Gemini Search Grounding (if key set).
+
+    v2.7.0: 제어 입력에는 결정론적 기상 API를 우선 사용하고, LLM 기반 값은 최후 폴백으로만 사용.
+    """
 
     def __init__(
         self,
@@ -249,9 +269,12 @@ class FallbackWeatherProvider:
         self.open_meteo.set_location(clean)
 
     def get_weather(self, now_epoch: float | None = None) -> WeatherSnapshot:
-        """Try Gemini Search Grounding first (if configured), then Open-Meteo API."""
+        """Try Open-Meteo first, then Gemini Search Grounding (if configured)."""
+        om = self.open_meteo.get_weather(now_epoch=now_epoch)
+        if om.outdoor_temp_c is not None:
+            return om
         if self.gemini is not None:
             g = self.gemini.get_weather(now_epoch=now_epoch)
             if g.outdoor_temp_c is not None:
                 return g
-        return self.open_meteo.get_weather(now_epoch=now_epoch)
+        return om

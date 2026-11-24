@@ -27,11 +27,11 @@ from itss_scada.app.protocols.multi_zone import MultiZoneController, ZoneReading
 def test_multizone_hybrid_synchronized_start_and_early_cutoff():
     ctrl = MultiZoneController(strategy="hybrid")
     zones = [
-        ZoneReading("living", room_temp=22.8, target_temp=23.0, is_heating=False, has_floor_sensor=True),
-        ZoneReading("bed1", room_temp=22.92, target_temp=23.0, is_heating=False, floor_offset_from_master_c=0.4),
-        ZoneReading("bed2", room_temp=23.2, target_temp=23.0, is_heating=True, floor_offset_from_master_c=0.2),
+        ZoneReading("living", room_temp=21.8, target_temp=22.0, is_heating=False, has_floor_sensor=True),
+        ZoneReading("bed1", room_temp=21.92, target_temp=22.0, is_heating=False, floor_offset_from_master_c=0.4),
+        ZoneReading("bed2", room_temp=22.2, target_temp=22.0, is_heating=True, floor_offset_from_master_c=0.2),
     ]
-    plan = ctrl.evaluate(zones, master_floor_temp=25.5)
+    plan = ctrl.evaluate(zones, master_floor_temp=19.5)
     by_room = {c.room_name: c for c in plan.commands}
 
     assert plan.boiler_demand is True
@@ -39,7 +39,7 @@ def test_multizone_hybrid_synchronized_start_and_early_cutoff():
     assert by_room["living"].floor_sensor_source == "MEASURED"
     assert by_room["bed1"].action == "HEAT"
     assert by_room["bed1"].floor_sensor_source == "ESTIMATED"
-    assert by_room["bed1"].effective_floor_temp == 25.9
+    assert by_room["bed1"].effective_floor_temp == 19.9
     assert by_room["bed2"].action == "OFF"
     assert by_room["bed2"].reason == "HYBRID_EARLY_CUTOFF"
 

@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from typing import Any
+from contextlib import closing, contextmanager
+from typing import Any, Iterator
 
 from ..models.schema import now_kst_iso
 
@@ -15,6 +16,15 @@ DEFAULT_SCHEDULES = [
     {"slotId": "evening", "label": "저녁 귀가", "startHour": 18, "endHour": 23, "offsetC": 0.1, "enabled": True},
     {"slotId": "sleep", "label": "취침 절전", "startHour": 23, "endHour": 5, "offsetC": -0.3, "enabled": True},
 ]
+
+# v2.7.0 통계/학습 쿼리용 컬럼 (payload_json 파싱 없이 24시간 집계)
+_CYCLE_EXTRA_COLUMNS = {
+    "combustion_confirmed": "INTEGER",
+    "dry_run": "INTEGER",
+    "effective_target": "REAL",
+    "outdoor_temp": "REAL",
+    "floor_sensor_source": "TEXT",
+}
 
 
 class ScadaDatabase:
@@ -27,13 +37,18 @@ class ScadaDatabase:
             os.makedirs(parent, exist_ok=True)
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """트랜잭션 커밋/롤백 후 연결을 명시적으로 닫는다."""
+        with closing(sqlite3.connect(self.db_path, timeout=10.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            with conn:
+                yield conn
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
+            # 제어 루프와 웹 요청의 동시 읽기/쓰기를 위해 WAL 모드 사용
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS rooms (
@@ -96,10 +111,18 @@ class ScadaDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_cycles_room_time "
                 "ON cycles (room_name, execution_started_at DESC)"
             )
-            # Safe schema migration for existing DBs upgrading to v2.5.0
+            # 방 필터 없는 시간순 조회/보존기간 삭제용 인덱스
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_cycles_time ON cycles (execution_started_at)")
+
+            # 기존 DB 안전 마이그레이션
             cols = {r[1] for r in conn.execute("PRAGMA table_info(rooms)").fetchall()}
             if "window_sensor_entity" not in cols:
                 conn.execute("ALTER TABLE rooms ADD COLUMN window_sensor_entity TEXT NOT NULL DEFAULT ''")
+            cycle_cols = {r[1] for r in conn.execute("PRAGMA table_info(cycles)").fetchall()}
+            for col, col_type in _CYCLE_EXTRA_COLUMNS.items():
+                if col not in cycle_cols:
+                    conn.execute(f"ALTER TABLE cycles ADD COLUMN {col} {col_type}")
+
             # Initialize default P400 schedule slots once
             cnt = conn.execute("SELECT COUNT(*) FROM schedules").fetchone()[0]
             if cnt == 0:
@@ -264,6 +287,7 @@ class ScadaDatabase:
 
     # --- Cycles ---
     def insert_cycle(self, payload: dict[str, Any]) -> None:
+        comb = payload.get("combustionConfirmed")
         with self._connect() as conn:
             conn.execute(
                 """
@@ -271,8 +295,9 @@ class ScadaDatabase:
                     cycle_id, room_name, scheduled_at, execution_started_at,
                     control_issued_at, control_confirmed_at, observed_at, saved_at,
                     execution_status, command_action, safety_reason,
-                    room_temp, floor_temp, target_temp, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    room_temp, floor_temp, target_temp, payload_json,
+                    combustion_confirmed, dry_run, effective_target, outdoor_temp, floor_sensor_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["cycleId"],
@@ -290,6 +315,11 @@ class ScadaDatabase:
                     payload.get("floorTemp"),
                     payload.get("targetTemp"),
                     json.dumps(payload, ensure_ascii=False),
+                    None if comb is None else (1 if comb else 0),
+                    None if payload.get("dryRun") is None else (1 if payload.get("dryRun") else 0),
+                    payload.get("effectiveTargetTemp"),
+                    payload.get("outdoorTemp"),
+                    payload.get("floorSensorSource"),
                 ),
             )
 
@@ -308,3 +338,97 @@ class ScadaDatabase:
                     (limit,),
                 ).fetchall()
         return [json.loads(r["payload_json"]) for r in rows]
+
+    def list_cycles_since(self, since_iso: str, room_name: str | None = None) -> list[dict[str, Any]]:
+        """since_iso 이후 전체 payload (오래된 순). 학습/피팅용."""
+        with self._connect() as conn:
+            if room_name:
+                rows = conn.execute(
+                    "SELECT payload_json FROM cycles WHERE room_name = ? AND execution_started_at >= ? "
+                    "ORDER BY execution_started_at ASC",
+                    (room_name, since_iso),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT payload_json FROM cycles WHERE execution_started_at >= ? "
+                    "ORDER BY execution_started_at ASC",
+                    (since_iso,),
+                ).fetchall()
+        return [json.loads(r["payload_json"]) for r in rows]
+
+    def stats_rows_since(self, since_iso: str) -> list[dict[str, Any]]:
+        """KPI/보일러 통계용 경량 행 (JSON 파싱 없음, 오래된 순)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT room_name, execution_started_at, saved_at, command_action, safety_reason,
+                       room_temp, target_temp, effective_target, combustion_confirmed, dry_run
+                FROM cycles WHERE execution_started_at >= ?
+                ORDER BY execution_started_at ASC
+                """,
+                (since_iso,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            comb = r["combustion_confirmed"]
+            dry = r["dry_run"]
+            out.append({
+                "roomName": r["room_name"],
+                "executionStartedAt": r["execution_started_at"],
+                "savedAt": r["saved_at"],
+                "commandAction": r["command_action"],
+                "safetyReason": r["safety_reason"],
+                "roomTemp": r["room_temp"],
+                "targetTemp": r["target_temp"],
+                "effectiveTargetTemp": r["effective_target"],
+                "combustionConfirmed": None if comb is None else bool(comb),
+                "dryRun": None if dry is None else bool(dry),
+            })
+        return out
+
+    def chart_rows_since(self, room_name: str, since_iso: str) -> list[dict[str, Any]]:
+        """차트용 경량 시계열 (오래된 순)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT execution_started_at, room_temp, floor_temp, target_temp, effective_target,
+                       command_action, combustion_confirmed
+                FROM cycles WHERE room_name = ? AND execution_started_at >= ?
+                ORDER BY execution_started_at ASC
+                """,
+                (room_name, since_iso),
+            ).fetchall()
+        return [
+            {
+                "t": r["execution_started_at"],
+                "room": r["room_temp"],
+                "floor": r["floor_temp"],
+                "target": r["effective_target"] if r["effective_target"] is not None else r["target_temp"],
+                "heat": (r["command_action"] == "HEAT") or (r["combustion_confirmed"] == 1),
+            }
+            for r in rows
+        ]
+
+    def latest_cycle_by_room(self, room_names: list[str]) -> dict[str, dict[str, Any]]:
+        """방별 최신 회차 1건 (인덱스 사용)."""
+        out: dict[str, dict[str, Any]] = {}
+        with self._connect() as conn:
+            for name in room_names:
+                row = conn.execute(
+                    "SELECT payload_json FROM cycles WHERE room_name = ? "
+                    "ORDER BY execution_started_at DESC LIMIT 1",
+                    (name,),
+                ).fetchone()
+                if row:
+                    out[name] = json.loads(row["payload_json"])
+        return out
+
+    def prune_cycles(self, before_iso: str) -> int:
+        """보존 기간이 지난 회차 이력 삭제. 삭제 건수 반환."""
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM cycles WHERE execution_started_at < ?", (before_iso,))
+            return int(cur.rowcount or 0)
+
+    def count_cycles(self) -> int:
+        with self._connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM cycles").fetchone()[0])

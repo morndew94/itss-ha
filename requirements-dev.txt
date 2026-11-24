@@ -1,0 +1,4 @@
+-r itss_scada/requirements.txt
+pytest==8.3.4
+PyYAML==6.0.2
+ruff==0.8.4

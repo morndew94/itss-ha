@@ -39,12 +39,14 @@ class StaticFakeHA:
 
 def test_residual_cooldown_survives_addon_restart(tmp_path: Path):
     db_file = str(tmp_path / "restart.db")
-    ha1 = StaticFakeHA(room_temp=21.2, floor_temp=26.7, heating=True)
+    ha1 = StaticFakeHA(room_temp=21.2, floor_temp=22.5, heating=True)
 
-    # Instance 1: floor hits 26.7C (>= 26.5C limit) -> forces OFF and enters 20m cooldown
+    # Instance 1: floor hits 22.5C (>= 22.0C configured limit, < 24.0C overheat) -> forces OFF and enters cooldown
     app1 = create_app(db_path=db_file, ha_client=ha1)
     with TestClient(app1) as c1:
-        c1.patch("/api/v1/settings", json={"masterFloorEntity": "sensor.floor_temp", "dryRun": False})
+        c1.patch("/api/v1/settings", json={
+            "masterFloorEntity": "sensor.floor_temp", "dryRun": False, "floorOffLimitC": 22.0,
+        })
         c1.post("/api/v1/rooms", json={
             "roomName": "방3",
             "roomTempEntity": "sensor.room_temp",
@@ -57,9 +59,9 @@ def test_residual_cooldown_survives_addon_restart(tmp_path: Path):
         assert r1["records"][0]["commandAction"] == "OFF"
 
     # Simulate add-on RESTART: create brand new app instance on same SQLite DB
-    # Floor has cooled slightly to 25.5C and room is still below target (21.2C < 22.5C),
+    # Floor has cooled slightly to 21.5C and room is still below target (21.2C < 22.5C),
     # yet cooldown MUST prevent turning the boiler back ON!
-    ha2 = StaticFakeHA(room_temp=21.2, floor_temp=25.5, heating=False)
+    ha2 = StaticFakeHA(room_temp=21.2, floor_temp=21.5, heating=False)
     app2 = create_app(db_path=db_file, ha_client=ha2)
     with TestClient(app2) as c2:
         r2 = c2.post("/api/v1/control/run-now").json()
@@ -130,7 +132,7 @@ def test_ventilation_5m_window_latch_and_contact_sensor(tmp_path: Path):
     from itss_scada.app.models.schema import SensorSnapshot
 
     sentinel = SentinelProtocol()
-    snap = SensorSnapshot("방3", room_temp=20.8, floor_temp=25.0)
+    snap = SensorSnapshot("방3", room_temp=20.8, floor_temp=19.0)
 
     # 5-min air-only drop (-0.6C room, 0.0C floor) triggers ventilation even if 1m slope is gentle
     v5 = sentinel.evaluate(snap, is_heating=False, v_room_per_min=-0.10, drop_5m_room_c=-0.6, drop_5m_floor_c=0.0)
@@ -148,7 +150,7 @@ def test_ventilation_5m_window_latch_and_contact_sensor(tmp_path: Path):
 
     # One-touch VENTILATION preset latches hold and survives restart
     db_file = str(tmp_path / "vent.db")
-    ha = StaticFakeHA(room_temp=20.5, floor_temp=25.0, heating=False)
+    ha = StaticFakeHA(room_temp=20.5, floor_temp=21.0, heating=False)
     app1 = create_app(db_path=db_file, ha_client=ha)
     with TestClient(app1) as c1:
         c1.patch("/api/v1/settings", json={"masterFloorEntity": "sensor.floor_temp", "ventilationHoldMin": 20})
