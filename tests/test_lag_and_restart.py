@@ -227,19 +227,16 @@ def test_double_run_floor_overshoot_prevention(tmp_path: Path):
     assert v_sev.force_off is True
     assert v_sev.reason_code == "P000_VENTILATION_PROTECT"
 
-    # 5. End-to-end engine scaling: cold floor (19.4C) gets full pulse; pre-warmed floor (22.4C) gets shortened pulse
+    # 5. v2.9.0 상승률 기반 펄스: 차가운 바닥(19.4C)은 외기 상한 그대로, 데워진 바닥(22.4C)은
+    #    (상한 25.0 - 여유 0.2 - 22.4) / 0.30C/min = 8.0분으로 단축, 23.5C 는 최소 펄스(5분) 미만 -> 시작 차단 대상
     ha = StaticFakeHA(room_temp=20.5, floor_temp=22.4, heating=False)
     app = create_app(db_path=str(tmp_path / "scale.db"), ha_client=ha)
     eng = app.state.engine
     eff_cap = eng._compute_effective_floor_limit(21.5, outdoor_temp=3.0)
     assert eff_cap == 25.0
-    cold_run = eng._compute_floor_scaled_max_run(
-        base_max_run_min=11.0, floor_temp=19.4, effective_floor_limit_c=eff_cap, expected_floor_surge_c=3.4
-    )
-    warm_run = eng._compute_floor_scaled_max_run(
-        base_max_run_min=11.0, floor_temp=22.4, effective_floor_limit_c=eff_cap, expected_floor_surge_c=3.4
-    )
-    assert cold_run == 11.0
-    assert warm_run <= 6.5
+    kw = {"base_max_run_min": 11.0, "floor_cap_c": eff_cap, "rise_rate_c_per_min": 0.30}
+    assert eng._compute_floor_limited_max_run(start_floor_c=19.4, **kw) == 11.0
+    assert eng._compute_floor_limited_max_run(start_floor_c=22.4, **kw) == 8.0
+    assert eng._compute_floor_limited_max_run(start_floor_c=23.5, **kw) < 5.0
 
 

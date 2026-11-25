@@ -18,6 +18,7 @@ trace/
 .env
 secrets.yaml
 *.json.bak
+*.jsonl
 
 # IDE & OS
 .vscode/

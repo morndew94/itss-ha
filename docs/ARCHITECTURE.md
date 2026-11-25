@@ -1,4 +1,4 @@
-# I.T.S.S. 아키텍처 및 데이터 규격서 (v2.7.0)
+# I.T.S.S. 아키텍처 및 데이터 규격서 (v2.9.0)
 
 이 문서는 Home Assistant **Add-on(HA Ingress 전용)** 구조를 기준으로 작성되었습니다. 이전 버전(v1.0)의 `custom_components/itss` 통합구성요소 구조는 더 이상 존재하지 않습니다.
 
@@ -36,8 +36,8 @@
 3. **P300 보정**: `atmos_offset = min(0.25, max(0, -outdoor x 0.015) + (풍속 >= 6.0 m/s 이면 0.05))` °C. 외기 미확인 시 시간대 프로파일. 외기 연동 최대 가동 시간(<= -5 °C: 15 min, <= 0 °C: 13 min, <= 5 °C: 11 min, <= 10 °C: 9 min, 그 외 7 min)을 `maxRunCapMin` 으로 제한합니다.
 4. **P400 + 프리셋 offset**: DB 스케줄 슬롯(`active_schedule_offset(hour)`) + 프리셋 offset(`AWAY` -2.0 °C, `SLEEP` -0.3 °C, `PREHEAT` +0.2 °C).
 5. **주기 작업**: 30 회차마다(또는 프로파일 없을 때) 잔열/지연 학습 갱신, 60 회차마다 이력/트레이스 보존 정리.
-6. **방별 telemetry 수집**: 실내 sensor 읽기 + `observe`, `climate` 상태, 보일러 가동 추정(`detect_boiler_running`), 바닥값(`MEASURED`/`ESTIMATED`/`ESTIMATE_OFF`/`MISSING`/`UNCONFIGURED`, `_room_floor()` 가 제어용 `effFloor` 와 안전 판정용 `guardFloor` 를 함께 결정 — 추정 OFF 방은 `effFloor=None`, `guardFloor=마스터 실측`, P200 생략, sentinel `floor_is_proxy=True` 로 4a 목표연동 상한·4b·5c·6d 생략), 창문 접점, 기울기/추세, `effTarget = targetTemp + atmos + schedule + preset`, P200 예측(실내/바닥값 모두 있을 때).
-7. **다중 방 계획(`MultiZoneController`)**: 마스터 바닥값이 있을 때만 `AUTO` 방에 대해 수립. 바닥 실측이 없으면 계획을 만들지 않습니다(가짜 바닥값 사용 금지).
+6. **방별 telemetry 수집**: 실내 sensor 읽기 + `observe`, `climate` 상태, 보일러 가동 추정(`detect_boiler_running`), 바닥값(`MEASURED`/`ESTIMATED`/`ESTIMATE_OFF`/`MISSING`/`UNCONFIGURED`, `_room_floor()` 가 제어용 `effFloor` 를 결정. **v2.9.0**: `ESTIMATE_OFF`(UI 표기 "독립 제어") 방은 `effFloor=None` 이며 바닥값도 안전 바닥도 없음 — v2.8 의 마스터 바닥 대리(proxy) 판정은 제거됨. 마스터 바닥 과열/센서 누락/미설정의 영향을 받지 않음), 창문 접점, 기울기/추세, `effTarget = targetTemp + atmos + schedule + preset`, P200 예측(실내/바닥값 모두 있을 때. 바닥 방은 trace 기록 및 그룹 수요의 `projected_coast` 용).
+7. **다중 방 계획(`MultiZoneController`)**: 마스터 바닥값이 있을 때만 `AUTO` 방에 대해 수립. 바닥 실측이 없으면 계획을 만들지 않습니다(가짜 바닥값 사용 금지). **v2.9.0**: 바닥 기준 그룹(3.3)은 별도 그룹 수요로 판단하고, 하이브리드 계획은 독립 제어 방끼리만 수립합니다.
 8. **방별 판단 `_decide_room`** (3장 우선순위) -> 명령 설정온도 계산 -> `_dispatch` -> 알림 -> 이력 저장 -> 로그/트레이스.
 9. **상태 저장**: `room_timers`, `sensor_tracks`(사용 중인 sensor 만 유지) 를 KV 에 저장. 방 하나가 실패해도 `INTERNAL_ERROR` 회차 기록을 남기고 나머지 방은 계속 처리하며, 모든 방이 실패하면 회차 실패로 집계합니다.
 
@@ -67,7 +67,7 @@
 | 2 | `MANUAL` | `manualAction` 수행, `P000_MANUAL_OVERRIDE` | `HEAT` 일 때만 최소 안전 조건 검사: `P000_FLOOR_UNCONFIGURED`, `P000_SENSOR_MISSING`, `P000_SENSOR_STALE`, `P000_FLOOR_LIMIT_OFF`(래치, 1.0 °C hysteresis) 이면 OFF |
 | 3 | `AUTO` + 마스터 바닥 미설정 | OFF, `P000_FLOOR_UNCONFIGURED` | |
 | 4 | `SentinelProtocol.evaluate()` | 아래 4.1 | `force_off` -> OFF, `hold` -> HOLD |
-| 5 | P200 / Multi-zone | `P200_PREDICTIVE_ON/OFF`, `HYBRID_*`, `SIMULTANEOUS_*` | 전략 `hybrid` + 예측 있음이면 P200 우선 |
+| 5 | 그룹 수요 / Multi-zone | `GROUP_*`(그룹 방), `HYBRID_*`, `SIMULTANEOUS_*`(독립 방) | v2.9.0: 방별 P200 단독 분기(`P200_PREDICTIVE_ON/OFF`)는 AUTO 판단에 더 이상 쓰이지 않음. P200 예측은 계산/trace 기록되고 그룹 수요에 반영 |
 | 6 | 재량 반전 채터링 방지 | HOLD, `P000_ANTI_CHATTER` | 안전 차단이 아닐 때만. HEAT -> OFF < 300 s, OFF -> HEAT < 600 s 이면 직전 명령 유지 |
 
 ### 3.1 P000 SENTINEL 내부 우선순위
@@ -79,7 +79,8 @@
 | 3 | sensor 경과 > sensor별 stale 임계 | `P000_SENSOR_STALE` |
 | 4 | 과열 차단 (1 단계와 동일 기준) | `P000_OVERHEAT_CUTOFF` |
 | 5 | 바닥 + (가열 중이면) 지연 보상 >= 상한 (`min(floorOffLimitC, 목표 연동 상한)`) | `P000_FLOOR_LIMIT_OFF` |
-| 6 | 가열 중 예상 바닥 peak(잔열 surge, 기울기 x 10 min) >= 상한, 또는 비가열 중 바닥이 상한 - 0.5 °C 이내 | `P000_FLOOR_PREDICTED_LIMIT` |
+| 6 | **(v2.9.0)** 가열 중 예상 peak(가열 시작 바닥 + `floorRiseRateCPerMin` x 가동 분) >= 바닥 cap - 0.2 °C (`FLOOR_PEAK_MARGIN_C`). rate 없는 레거시 surge 모드는 바닥 + surge >= cap | `P000_FLOOR_PREDICTED_LIMIT` |
+| 6e | **(v2.9.0)** 기동 전 가드(가동 중 가드와 통일): 바닥 + (최소 5 min 펄스 예상 상승) >= cap - margin 이면 시작 차단. 레거시 surge 모드는 바닥 + max(0.5, surge) >= cap. 기존 5c(cap - 0.5 °C) 규칙은 제거 | `P000_FLOOR_PREDICTED_LIMIT` |
 | 7 | 1회 연속 가동 >= 최대 가동 시간 | `P000_MAX_RUN_CUTOFF` |
 | 8 | 잔열 휴지 남음 | `P000_RESIDUAL_COOLDOWN` |
 | 9 | 창문 접점 열림 | `P000_WINDOW_OPEN` |
@@ -91,7 +92,29 @@
 
 - 목표 연동 바닥 상한: `min(floorOffLimitC, effTarget + margin)`. margin = 4.5 °C(외기 <= -5 °C), 3.0 °C(외기 > 5 °C), 그 외 3.5 °C.
 - `floorOffLimitC`(기본 26.5 °C)가 과열 바닥 기준(25.0 °C)보다 높으면 과열 차단이 먼저 작동합니다. `/health` 의 `warnings` 로 알립니다.
-- 1회 최대 가동 시간은 외기 연동 값에서 학습된 `recommendedRunTrimMin` 을 빼고, 바닥 여유가 적으면 축소(최소 5 min)합니다.
+- 1회 최대 가동 시간(v2.9.0): `min(외기 연동 최대 가동, (cap - 0.2 - 시작 바닥) / rate)`. 5 min 미만이면 펄스를 시작하지 않습니다. 가열 시작 바닥은 room timers 의 `heatingStartFloor` 에 저장합니다.
+- 바닥 cap = `min(floorOffLimitC, 목표 연동 동적 상한)`. 과열 상수(실내 24.0 °C / 바닥 25.0 °C)는 변경 없음.
+- 기존 `floorResidualRiseC` 는 계속 학습/표시되지만 rate 가 있으면 안전 판정에는 쓰지 않습니다.
+
+### 3.1.1 바닥 상승률 모델 (v2.9.0, `thermal_lag_learner`)
+
+- 배경(2026-11-25 00:01~08:12 trace): (A) 시작 게이트는 바닥 >= cap - 0.5 °C 만 차단했으나 가동 중 게이트는 바닥 + surge >= cap 에서 차단하여, [cap - surge, cap - 0.5) 구간에서 시작 후 1분 만에 차단됨(05:56, 06:40 방3, 각 1.1 min 펄스). (B) v2.8 추정 OFF 방이 마스터 바닥을 대리 안전값으로 썼으나 마스터 바닥은 타 방 난방에 반응하지 않음(01:56~04:22 거실/방2 4회 가열 동안 마스터 바닥 21.4 -> 20.3 °C 하락). 07:40 방3 바닥 25.7 °C 도달 시 4개 방 전체 과열 차단. (C) 잔열 상승을 펄스 길이와 무관한 단일 중앙값으로 학습하여 1분 펄스(+0.3~0.5 °C)가 1.2 °C 하한까지 끌어내렸고, 8분 펄스(실제 +2.2 °C, 07:46 peak 25.7 °C, OFF 후 약 20 min)를 과소 예측.
+- 학습값 `floorRiseRateCPerMin` = (OFF 후 바닥 peak - 가열 시작 바닥) / 가동 분. 가동 3 min 이상(`FLOOR_RATE_MIN_RUN_MIN`)이며 peak 가 확정(peak 이후 5 min 이상 관측)된 펄스만 사용. 샘플 수는 `floorRateSamples`.
+- 보수적 통계: 샘플 0 -> 기본 0.30 °C/min, 1~2 -> max(기본, 최대 샘플), 3 이상 -> 75 percentile. 0.05 ~ 0.80 °C/min 로 clamp.
+- 기본 0.30 °C/min 출처: 2026-11-25 trace, 방3 단독 8 min +2.1 °C (0.26/min), 13 min +3.9 °C (0.30/min) 중 보수값.
+
+### 3.3 바닥 기준 동시 제어 그룹 (v2.9.0)
+
+| 구분 | 내용 |
+| :--- | :--- |
+| 구성 | 바닥 sensor 방(`MEASURED`) + 센서 없고 "바닥 기준 공유" ON 인 방(`ESTIMATED`, 마스터 + offset) 중 `AUTO` 인 방. Leader = 바닥 sensor 방. 예: 방3(leader) + 방2(follower) |
+| 그룹 수요 | 방 weight 가중평균(투영 실내 - 실효 목표). 투영 실내 = P200 `projected_coast`(무가열 투영), 없으면 실내 + 학습 실내 잔열 |
+| 판정 | idle: 평균 <= -0.15 °C 면 HEAT (`GROUP_DEMAND_HEAT`). 가열 중: 평균 >= 0 면 OFF (`GROUP_TARGET_REACHED`), 아니면 `GROUP_CONTINUE`. 그 외 `GROUP_IDLE`. 데이터 부족 시 `GROUP_NO_ROOM_DATA` |
+| Leader | 공유 바닥에 대해 전체 바닥 안전(과열, 바닥 상한, rate 기반 예상 peak, 최대 가동, 휴지, 잔열 가드) 후 그룹 수요 적용. anti-chatter 는 leader 에 적용 |
+| Follower | 방 기준 안전(실내 과열, 창문, 환기, 실내 sensor 누락/stale)만 수행 후 leader 의 action/reason 복사. 타이머(`heatingStartedAt`, `heatingStartFloor`, `cooldownUntil`)는 leader 와 동기화. leader 가 가열하지 않으면 follower 도 가열하지 않음 |
+| 예외 | leader 판정 없음 또는 leader HEAT 전송 FAILED -> follower OFF (`GROUP_LEADER_UNAVAILABLE`). 그룹 가열 중 follower 실내 >= 실효 목표 + 0.15 °C 면 해당 방만 OFF (`GROUP_MEMBER_WARM_SKIP`) |
+| 주의 | 바닥 sensor 방을 MANUAL 로 두면 AUTO 추정 방들이 첫 추정 방을 leader 로 그룹을 구성하며, 바닥 sensor 는 그 난방을 보지 못함. 장시간 사용 금지 |
+| 독립 제어 | "바닥 기준 공유 OFF"(내부 `floorSrc=ESTIMATE_OFF`): 바닥값/안전 바닥 없음. 독립 방끼리만 하이브리드 multi-zone(`HYBRID_PRIMARY_HEAT`/`HYBRID_EARLY_CUTOFF`/`HYBRID_IDLE`/`HYBRID_COHEAT_BATCH`). 보호: 실내 과열 24 °C, 외기 연동 최대 가동, 잔열 휴지, 창문/환기. 마스터 바닥 과열/누락/미설정 무영향. 수동 HEAT 는 실내 sensor 만 필요. 예: 거실, 안방 |
 
 ### 3.2 예측 모델 (P200)
 
@@ -156,7 +179,7 @@
 | `controlIssuedAt`, `controlConfirmedAt`, `observedAt`, `savedAt` | 명령 전송, 수락 확인, 재조회 관측, 저장 |
 | `executionStatus` | `EXECUTED`, `SKIPPED_SAFETY`, `FAILED` (`DELAYED` 는 스키마 정의만 존재) |
 | `delaySec`, `opposingCommandIntervalSec` | 지연, 직전 반대 명령(HEAT<->OFF)과의 간격(s) |
-| `roomTemp`, `floorTemp`, `floorSensorSource` | 실내/바닥(실효값) 온도, `MEASURED`/`ESTIMATED`/`ESTIMATE_OFF`/`MISSING`/`UNCONFIGURED` (`ESTIMATE_OFF` 는 `floorTemp=null`, `diagnostics.guardFloor` 에 대리값) |
+| `roomTemp`, `floorTemp`, `floorSensorSource` | 실내/바닥(실효값) 온도, `MEASURED`/`ESTIMATED`/`ESTIMATE_OFF`/`MISSING`/`UNCONFIGURED` (`ESTIMATE_OFF` = 독립 제어, `floorTemp=null`. v2.9.0 부터 `guardFloor` 대리값 없음) |
 | `targetTemp` | 방 설정 목표 |
 | `effectiveTargetTemp` | **(v2.7.0)** 외기/스케줄/프리셋 보정 후 실효 목표 |
 | `outdoorTemp` | **(v2.7.0)** 회차 당시 외기 (RC 피팅 입력) |
@@ -165,7 +188,15 @@
 | `commandSetpoint`, `deviceModeEvent`, `combustionConfirmed` | 조절기 설정온도, 관측 모드, 가동 추정 |
 | `dryRun` | **(v2.7.0)** 시험 운전 회차 여부 (통계/학습에서 제외 판단에 사용) |
 | `dispatchResult` | **(v2.7.0)** `SENT`, `NO_CHANGE`, `DRY_RUN`, `FAILED`, `NONE` |
-| `diagnostics` | **(v2.7.0)** `floorReportIntervalSec`, `floorStaleThresholdSec`, `floorLatencyC`, `roomReportIntervalSec`, `roomStaleThresholdSec`, `vRoomRate`, `vRoomSmooth`, `vFloor`, `drop5mRoom`, `trend10mRoom`, `trend10mFloor`, `dispatchCalls`, `antiChatterBlocked`, 실패 시 `error` |
+| `diagnostics` | **(v2.7.0)** `floorReportIntervalSec`, `floorStaleThresholdSec`, `floorLatencyC`, `roomReportIntervalSec`, `roomStaleThresholdSec`, `vRoomRate`, `vRoomSmooth`, `vFloor`, `drop5mRoom`, `trend10mRoom`, `trend10mFloor`, `dispatchCalls`, `antiChatterBlocked`, **(v2.9.0)** `groupRole`, `groupLeader`, 실패 시 `error` |
+
+### API/알림 추가 사항 (v2.9.0)
+
+- `/api/v1/status` `liveByRoom`: `groupRole`(LEADER/FOLLOWER/INDEPENDENT/null), `groupLeader`, `floorRiseRateCPerMin` 추가. 독립 방은 `guardFloorTemp=null`. `effectiveMaxRunMin` 은 rate 모델 기준.
+- `/api/v1/status` `fittedRcParams`: UI "P200 RC 파라미터 보기" 가 사용. `null` 이면 `adaptive_rc` 는 코드 기본값(c_floor 1800, c_room 450 kJ/K, r_floor_room 2.2, r_room_ambient 12 K/kW, q_heat 1.8 kW) 사용.
+- 방 토글 API 필드는 기존 `floorEstimateEnabled` 그대로이며 UI 표기만 "동시 제어(바닥 공유)" / "독립 제어".
+- 신규 사유 코드: `GROUP_DEMAND_HEAT`, `GROUP_CONTINUE`, `GROUP_TARGET_REACHED`, `GROUP_IDLE`, `GROUP_NO_ROOM_DATA`, `GROUP_MEMBER_WARM_SKIP`, `GROUP_LEADER_UNAVAILABLE`.
+- 알림: 독립 방 "바닥: 미사용(독립 제어)", follower "<floor>°C(추정 · 방3 기준 동시 제어)", 목표 "21.5°C (실효 21.64°C)", 그룹 방 "동시 제어: 방3 · 방2 (그룹 평균 편차 -0.45°C)" 줄 추가, 그룹 방은 "30분 예측 실내" 줄 생략.
 
 ### 통계/학습 규칙
 
@@ -192,11 +223,12 @@
 | `cycle` | 회차 공통 컨텍스트: `seq`, `scheduledAt`, `dryRun`, `strategy`, `predictor`, `outdoorTemp`, `windSpeedMs`, `weatherSource`, `atmosOffsetC`, `schedule`, `preset`, `outdoorMaxRunMin`, `floorOffLimitC`, `floor`(마스터 바닥 sensor 값/보고 시각/경과/주기/stale/기울기/추세/지연) |
 | `inputs` | `roomTemp`, `roomReportAt`, `roomAgeSec`, `roomTsSource`, `roomIntervalSec`, `roomMaxIntervalSec`, `roomStaleSec`, `floorTemp`, `floorSrc`, `floorOffsetC`, `floorAgeSec`, `floorStaleSec`, `targetTemp`, `effTarget`, `climate`, `isHeating`, `combustion`, `windowOpen` |
 | `dynamics` | `vRoomSmooth`, `vRoomRate`, `vFloor`, `drop5mRoom`, `drop5mFloor`, `trend10mRoom`, `trend10mFloor`, `floorLatencyC` |
-| `limits` | `overheatRoomC`, `overheatFloorC`, `effFloorLimitC`, `learnedFloorSurgeC`, `baseMaxRunMin`, `roomMaxRunMin`, `cooldownMin`, `pollIntervalMin` |
-| `lagProfile` | `status`, `sampleCount`, `floorResidualRiseC`, `roomResidualRiseC`, `recommendedCooldownMin`, `recommendedHorizonMin`, `recommendedRunTrimMin` |
+| `limits` | `overheatRoomC`, `overheatFloorC`, `effFloorLimitC`, `learnedFloorSurgeC`, **(v2.9.0)** `floorCapC`, `floorRiseRateCPerMin`, `heatingStartFloorC`, `baseMaxRunMin`, `roomMaxRunMin`, `cooldownMin`, `pollIntervalMin` |
+| `lagProfile` | `status`, `sampleCount`, `floorResidualRiseC`, `roomResidualRiseC`, **(v2.9.0)** `floorRiseRateCPerMin`, `floorRateSamples`, `recommendedCooldownMin`, `recommendedHorizonMin`, `recommendedRunTrimMin` |
 | `timersBefore` / `timersAfter` | 판단 전: `runMin`, `cooldownRemainMin`, `ventilationRemainMin`, `lastCommand`, `secsSinceSwitch` / 판단 후: `heatingStartedAt`, `cooldownUntil`, `ventilationUntil`, `lastSwitchAt`, `underheatSince` |
 | `p200` | `model`, `action`, `predRoom`, `predFloor`, `effTarget`, `learning`, `residualRiseC`, `diag` (없으면 `null`) |
 | `multiZone` | `action`, `reason` (없으면 `null`) |
+| `group` | **(v2.9.0)** `role`, `leader`, `members`, `demand`, `demandReason`, `weightedDevC`, `leaderResult` |
 | `sentinel` | `reason`, `forceOff`, `hold`, `message` (Sentinel 미실행이면 `null`) |
 | `decision` | `action`, `reason`, `executionStatus`, `antiChatterBlocked` |
 | `command` | `setpoint`, `dispatch`, `calls`, `issuedAt`, `confirmedAt`, `observedAt`, `deviceModeAfter`, `runningAfter`, `opposingIntervalSec` |

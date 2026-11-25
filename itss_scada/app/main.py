@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from .const import (
     DEFAULT_ALLOWED_CLIENT_IPS,
     DEFAULT_CONTROL_BAND_HALF,
+    DEFAULT_FLOOR_RISE_RATE_C_PER_MIN,
     DEFAULT_MAX_SENSOR_AGE_SEC,
     DEFAULT_MIN_OFF_SEC,
     DEFAULT_MIN_ON_SEC,
@@ -27,6 +28,7 @@ from .const import (
     DEFAULT_OVERHEAT_ROOM_C,
     DEFAULT_RECHECK_DELAY_SEC,
     DISPATCH_RESEND_MIN,
+    FLOOR_PEAK_MARGIN_C,
     HEAT_SETPOINT_MAX_BOOST_C,
     KST,
     LOOP_FAILURE_ALERT_COUNT,
@@ -46,7 +48,7 @@ from .integrations.google_weather import FallbackWeatherProvider
 from .integrations.notifications import PushNotifier
 from .models.schema import CycleRecord, SensorSnapshot, ThermalInput, now_kst_iso
 from .protocols import sensor_tracker as st
-from .protocols.multi_zone import MultiZoneController, ZoneReading
+from .protocols.multi_zone import GroupMember, MultiZoneController, ZoneReading, evaluate_floor_group
 from .protocols.p000_sentinel import SentinelConfig, SentinelProtocol
 from .protocols.p100_core import compute_opposing_interval, round_thermostat_setpoint
 from .protocols.p200_therm import (
@@ -113,6 +115,13 @@ REASON_KO = {
     "SIMULTANEOUS_WEIGHTED_TARGET_REACHED": "전체 방 가중평균 상한 도달(동시 차단)",
     "SIMULTANEOUS_CONTINUE": "전체 방 가중평균 가열 지속",
     "SIMULTANEOUS_IDLE": "전체 방 목표 범위 내 대기",
+    "GROUP_DEMAND_HEAT": "동시 제어 그룹 가중평균 예측이 목표 하한 이하(그룹 동시 기동)",
+    "GROUP_CONTINUE": "동시 제어 그룹 가열 지속",
+    "GROUP_TARGET_REACHED": "동시 제어 그룹 가중평균 예측이 목표 도달(그룹 동시 정지)",
+    "GROUP_IDLE": "동시 제어 그룹 목표 범위 내 대기",
+    "GROUP_NO_ROOM_DATA": "동시 제어 그룹 실내 온도 없음(대기)",
+    "GROUP_MEMBER_WARM_SKIP": "그룹 가열 중이나 이 방은 목표 상한 이상(이 방만 개별 정지)",
+    "GROUP_LEADER_UNAVAILABLE": "바닥 기준 방 판정 실패(동시 제어 안전 정지)",
     "INTERNAL_ERROR": "내부 처리 오류(로그 확인 필요)",
 }
 
@@ -136,6 +145,7 @@ COOLDOWN_REASONS = (
     "P000_OVERHEAT_CUTOFF",
     "P200_PREDICTIVE_OFF",
     "HYBRID_EARLY_CUTOFF",
+    "GROUP_TARGET_REACHED",
 )
 
 # 애드온 옵션 키 -> 내부 설정 키
@@ -848,25 +858,29 @@ class ItssEngine:
             margin = 3.5
         return round(min(configured, eff_target + margin), 1)
 
-    def _compute_floor_scaled_max_run(
-        self,
+    def floor_cap_c(self, eff_floor_limit: float) -> float:
+        """바닥 상한 = min(설정 바닥 OFF 상한, 목표 연동 동적 상한) — sentinel 4a/4b 와 동일 기준."""
+        return min(float(self.settings["floorOffLimitC"]), eff_floor_limit)
+
+    @staticmethod
+    def _compute_floor_limited_max_run(
         *,
         base_max_run_min: float,
-        floor_temp: float | None,
-        effective_floor_limit_c: float,
-        expected_floor_surge_c: float,
+        start_floor_c: float | None,
+        floor_cap_c: float,
+        rise_rate_c_per_min: float,
     ) -> float:
-        """Shorten single-run pulse when floor is pre-warmed (최소 펄스 MIN_PULSE_MIN 보장)."""
-        if floor_temp is None:
+        """바닥 상승률 기반 1회 최대 가동 (v2.9.0).
+
+        OFF 후 예측 피크 = 가동 시작 바닥 + rate x 가동시간 이 (상한 - 여유) 에 닿는 시점까지.
+        sentinel 4b(가동 중 예측 차단)·시작 전 가드와 같은 식이므로, 결과가 MIN_PULSE_MIN 미만이면
+        시작 자체가 차단된다 (1분 펄스 방지).
+        """
+        if start_floor_c is None or rise_rate_c_per_min <= 0:
             return base_max_run_min
-        headroom = effective_floor_limit_c - floor_temp
-        full_surge = max(2.0, expected_floor_surge_c)
-        if headroom >= full_surge:
-            return base_max_run_min
-        if headroom <= 0.5:
-            return MIN_PULSE_MIN
-        ratio = max(0.25, (headroom / full_surge) * 0.75)
-        return round(max(MIN_PULSE_MIN, min(base_max_run_min, base_max_run_min * ratio)), 1)
+        headroom = floor_cap_c - FLOOR_PEAK_MARGIN_C - start_floor_c
+        limit = max(0.0, headroom / rise_rate_c_per_min)
+        return round(min(base_max_run_min, limit), 1)
 
     @staticmethod
     def _room_floor(
@@ -876,12 +890,16 @@ class ItssEngine:
     ) -> tuple[float | None, str, float | None]:
         """방 바닥값 결정 -> (제어/표시용 바닥, 출처, 안전 판정용 바닥).
 
-        - MEASURED     : 바닥 센서 방 = 마스터 실측
-        - ESTIMATED    : 바닥 센서 없는 방 + 추정 ON = 마스터 실측 + offset
-        - ESTIMATE_OFF : 바닥 센서 없는 방 + 추정 OFF = 방 바닥값 없음(P200 생략, 실내 기준 제어),
-                         안전 판정(과열/일반 상한)만 마스터 실측을 대리값으로 사용
+        - MEASURED     : 바닥 센서 방 = 마스터 실측 (동시 제어 그룹의 기준 방)
+        - ESTIMATED    : 바닥 센서 없는 방 + 바닥 기준 공유 ON = 마스터 실측 + offset
+                         (v2.9.0: 바닥 센서 방과 동시 제어 그룹으로 묶여 같은 시점에 ON/OFF)
+        - ESTIMATE_OFF : 바닥 센서 없는 방 + 바닥 기준 공유 OFF = 독립 제어 방.
+                         바닥값·안전 판정용 바닥 모두 없음 (v2.8 의 마스터 대리 판정 폐기).
+                         실내 과열·최대 가동·잔열 휴지·창문/환기로 보호. 마스터 센서 미설정/누락과 무관.
         - MISSING / UNCONFIGURED : 마스터 바닥 미수신 / 미설정
         """
+        if not rm["hasFloorSensor"] and not bool(rm.get("floorEstimateEnabled", True)):
+            return None, "ESTIMATE_OFF", None
         if not floor_configured:
             return None, "UNCONFIGURED", None
         if master_floor is None:
@@ -889,10 +907,29 @@ class ItssEngine:
         if rm["hasFloorSensor"]:
             v = round(master_floor, 1)
             return v, "MEASURED", v
-        if bool(rm.get("floorEstimateEnabled", True)):
-            v = round(master_floor + float(rm["floorOffsetC"]), 1)
-            return v, "ESTIMATED", v
-        return None, "ESTIMATE_OFF", round(master_floor, 1)
+        v = round(master_floor + float(rm["floorOffsetC"]), 1)
+        return v, "ESTIMATED", v
+
+    @staticmethod
+    def _floor_group_plan(rooms: list[dict[str, Any]], telemetry: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        """바닥 기준을 공유하는 AUTO 방(실측 + 추정)을 동시 제어 그룹으로 묶는다.
+
+        기준 방(leader) = 바닥 센서 방(없으면 첫 추정 방). 기준 방이 먼저 판정하고
+        추종 방(follower)은 같은 명령을 따른다. 추종 방은 기준 방이 가열할 때만 가열할 수 있다
+        (바닥 센서가 보지 못하는 가열 금지).
+        """
+        members = [
+            rm for rm in rooms
+            if rm["controlMode"] == "AUTO" and telemetry[rm["roomName"]]["floorSrc"] in ("MEASURED", "ESTIMATED")
+        ]
+        if not members:
+            return None
+        leader = next((rm for rm in members if rm["hasFloorSensor"]), members[0])
+        return {
+            "leader": leader["roomName"],
+            "members": [rm["roomName"] for rm in members],
+            "result": None,
+        }
 
     def _build_predictor(self) -> ThermalPredictor:
         """Instantiate the configured P200 predictor (Linear v1.2 or Adaptive RC)."""
@@ -1093,12 +1130,25 @@ class ItssEngine:
         max_run_min: float,
         dispatch_result: str | None,
         now: datetime,
+        eff_target: float | None = None,
+        floor_label: str | None = None,
+        extra_lines: list[str] | None = None,
     ) -> None:
-        """보일러 ON/OFF 결정 변화·치명 사유·명령 실패 시 Telegram/HA 푸시."""
+        """보일러 ON/OFF 결정 변화·치명 사유·명령 실패 시 Telegram/HA 푸시.
+
+        v2.9.0: 바닥 없는 독립 방은 'None°C' 대신 '미사용(독립 제어)' 표기, 실효 목표 병기,
+        동시 제어 그룹은 기준 방/그룹 평균 편차를 extra_lines 로 표기.
+        """
         if not self.settings.get("notifyEvents", True):
             return
         tm = self.room_timers.setdefault(room_name, {})
         dry_tag = " [시험운전]" if self.settings.get("dryRun") else ""
+        floor_str = floor_label if floor_label is not None else (
+            f"{floor_temp}°C" if floor_temp is not None else "--"
+        )
+        target_str = f"{target_temp}°C" + (
+            f" (실효 {eff_target}°C)" if eff_target is not None and abs(eff_target - target_temp) >= 0.01 else ""
+        )
 
         if dispatch_result == "FAILED":
             # 명령 실패는 '켜짐/꺼짐' 대신 실패 경보 (30분 내 중복 억제), 성공 시 정상 알림이 다시 나가도록 상태 미갱신
@@ -1108,7 +1158,7 @@ class ItssEngine:
                 await self._safe_notify(
                     f"⚠ I.T.S.S. 조절기 명령 실패 ({room_name}){dry_tag}",
                     f"명령: {action} ({setpoint}°C)\n오류: {getattr(self.ha, 'last_error', None)}\n"
-                    f"실내: {room_temp}°C / 바닥: {floor_temp}°C",
+                    f"실내: {room_temp}°C / 바닥: {floor_str}",
                 )
             return
 
@@ -1126,8 +1176,9 @@ class ItssEngine:
             title = f"🔥 I.T.S.S. 보일러 켜짐 ({room_name}){dry_tag}"
             lines = [
                 f"이유: {reason_ko}",
-                f"실내: {room_temp}°C / 바닥: {floor_temp}°C / 목표: {target_temp}°C",
+                f"실내: {room_temp}°C / 바닥: {floor_str} / 목표: {target_str}",
             ]
+            lines.extend(extra_lines or [])
             if pred_room is not None:
                 lines.append(f"30분 예측 실내: {pred_room}°C")
             lines.append(f"조절기 설정: {setpoint}°C · 이번 최대 가동: {max_run_min}분")
@@ -1135,8 +1186,9 @@ class ItssEngine:
             title = f"❄️ I.T.S.S. 보일러 꺼짐 ({room_name}){dry_tag}"
             lines = [
                 f"이유: {reason_ko}",
-                f"실내: {room_temp}°C / 바닥: {floor_temp}°C / 목표: {target_temp}°C",
+                f"실내: {room_temp}°C / 바닥: {floor_str} / 목표: {target_str}",
             ]
+            lines.extend(extra_lines or [])
             if pred_room is not None:
                 lines.append(f"30분 예측 실내: {pred_room}°C")
             if run_min > 0:
@@ -1188,8 +1240,15 @@ class ItssEngine:
     ) -> str | None:
         """수동 ON 에도 적용되는 최소 안전 조건 (센서 누락/stale, 바닥 상한 + 1.0°C 히스테리시스).
 
-        바닥 추정 OFF 방은 마스터 실측(guardFloor)으로 판정한다.
+        v2.9.0: 독립 제어 방(ESTIMATE_OFF)은 바닥 기준이 없으므로 실내 센서 조건만 본다.
         """
+        if t["floorSrc"] == "ESTIMATE_OFF":
+            if t["roomTemp"] is None:
+                return "P000_SENSOR_MISSING"
+            if t["roomAge"] is not None and t["roomAge"] > t["roomStaleSec"]:
+                return "P000_SENSOR_STALE"
+            tm["manualFloorLatched"] = False
+            return None
         if t["floorSrc"] == "UNCONFIGURED":
             return "P000_FLOOR_UNCONFIGURED"
         if t["roomTemp"] is None or t["guardFloor"] is None:
@@ -1427,8 +1486,12 @@ class ItssEngine:
             if is_heating:
                 if not tm.get("heatingStartedAt"):
                     tm["heatingStartedAt"] = now.isoformat(timespec="seconds")
+                # 가동 시작 시 바닥 (상승률 모델 기준점, v2.9.0 이전 가동분은 현재값으로 보정)
+                if tm.get("heatingStartFloor") is None:
+                    tm["heatingStartFloor"] = guard_floor
             else:
                 tm["heatingStartedAt"] = None
+                tm.pop("heatingStartFloor", None)
             run_min, cd_min, vent_min = self._timer_metrics(r_name, now)
 
             eff_target = round(rm["targetTemp"] + atmos_offset + schedule_offset + preset_offset, 2)
@@ -1492,9 +1555,15 @@ class ItssEngine:
                 "drop5mFloor": floor_drop5_master if has_eff_floor else None,
                 "trend10mRoom": trend_room,
                 "trend10mFloor": floor_trend_master if has_eff_floor else None,
+                # 동시 제어 그룹 판정 입력 (P200 무가열 예측, 학습 실내 잔열)
+                "projectedCoast": (
+                    (p200_by_room[r_name].diagnostics or {}).get("projected_coast") if r_name in p200_by_room else None
+                ),
+                "roomResidualRise": float(lag_prof.get("roomResidualRiseC", 0.0) or 0.0),
             }
 
-            if rm["controlMode"] == "AUTO" and r_temp is not None:
+            # 다중 방(hybrid/simultaneous) 계획은 바닥 기준 없는 독립 방만 대상 (그룹 방은 그룹 판정)
+            if rm["controlMode"] == "AUTO" and r_temp is not None and floor_src == "ESTIMATE_OFF":
                 auto_zone_readings.append(
                     ZoneReading(
                         room_name=r_name,
@@ -1508,27 +1577,54 @@ class ItssEngine:
                     )
                 )
 
-        # 바닥 실측값이 없으면 다중 방 계획을 세우지 않음 (가짜 바닥값 사용 금지)
+        # 독립 방 다중 방 계획 (마스터 바닥과 무관 — 바닥 센서 누락/과열에도 독립 방은 실내 기준 제어)
         mz_by_room: dict[str, Any] = {}
-        if master_floor is not None:
+        if auto_zone_readings:
             mz_ctrl = MultiZoneController(
                 strategy=self.settings["zoneStrategy"],
                 general_off_floor_c=floor_off_limit,
             )
-            mz_plan = mz_ctrl.evaluate(auto_zone_readings, master_floor_temp=master_floor)
+            mz_plan = mz_ctrl.evaluate(auto_zone_readings, master_floor_temp=None)
             mz_by_room = {c.room_name: c for c in mz_plan.commands}
 
-        any_p200_heat = any(
-            (r_name in p200_by_room and p200_by_room[r_name].recommended_action == "HEAT")
-            for r_name in telemetry
-            if telemetry[r_name]["room"]["controlMode"] == "AUTO"
-        )
+        # 같은 바닥 기준(실측 방 + 추정 방) 동시 제어 그룹: 가중 평균 예측 편차로 그룹 수요 판정
+        group_plan = self._floor_group_plan(rooms, telemetry)
+        if group_plan is not None:
+            weights = {rm["roomName"]: float(rm.get("weight") or 1.0) for rm in rooms}
+            gd = evaluate_floor_group(
+                [
+                    GroupMember(
+                        room_name=n,
+                        room_temp=telemetry[n]["roomTemp"],
+                        target_temp=telemetry[n]["effTarget"],
+                        weight=weights.get(n, 1.0),
+                        projected_coast_c=telemetry[n]["projectedCoast"],
+                        residual_rise_c=telemetry[n]["roomResidualRise"],
+                    )
+                    for n in group_plan["members"]
+                ],
+                is_heating=bool(telemetry[group_plan["leader"]]["isHeating"]),
+            )
+            group_plan.update(
+                {"demand": gd.action, "demandReason": gd.reason, "weightedDevC": gd.weighted_dev_c,
+                 "membersUsed": gd.members_used}
+            )
 
-        results: list[dict[str, Any]] = []
+        # 기준 방을 먼저 판정해야 추종 방이 같은 명령을 따를 수 있음 (결과는 원래 방 순서로 반환)
+        order = list(range(len(rooms)))
+        if group_plan is not None:
+            lead_idx = next(i for i, rm in enumerate(rooms) if rm["roomName"] == group_plan["leader"])
+            order = [lead_idx] + [i for i in order if i != lead_idx]
+
+        results_by_idx: dict[int, dict[str, Any]] = {}
         room_errors = 0
         try:
-            for rm in rooms:
+            for idx in order:
+                rm = rooms[idx]
                 r_name = rm["roomName"]
+                role = None
+                if group_plan is not None and r_name in group_plan["members"]:
+                    role = "leader" if r_name == group_plan["leader"] else "follower"
                 try:
                     payload = await self._decide_room(
                         rm=rm,
@@ -1536,7 +1632,8 @@ class ItssEngine:
                         c_state=climate_states.get(r_name),
                         pred=p200_by_room.get(r_name),
                         mz_cmd=mz_by_room.get(r_name),
-                        any_p200_heat=any_p200_heat,
+                        group=group_plan if role else None,
+                        group_role=role,
                         sentinel=sentinel,
                         now=now,
                         seq=seq,
@@ -1570,7 +1667,7 @@ class ItssEngine:
                         self.db.insert_cycle(payload)
                     except Exception:  # noqa: BLE001
                         _LOGGER.exception("실패 회차 기록 저장 실패")
-                results.append(payload)
+                results_by_idx[idx] = payload
         finally:
             # 사용 중인 센서만 트랙 유지
             used = {rm["roomTempEntity"] for rm in rooms}
@@ -1580,6 +1677,7 @@ class ItssEngine:
             self.db.set_kv("room_timers", self.room_timers)
             self.db.set_kv("sensor_tracks", self.sensor_tracks)
 
+        results = [results_by_idx[i] for i in sorted(results_by_idx)]
         self.loop_state["lastRoomErrors"] = room_errors
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         self.loop_state["lastCycleElapsedMs"] = round(elapsed_ms, 1)
@@ -1609,7 +1707,6 @@ class ItssEngine:
         c_state: dict[str, Any] | None,
         pred: Any,
         mz_cmd: Any,
-        any_p200_heat: bool,
         sentinel: SentinelProtocol,
         now: datetime,
         seq: int,
@@ -1622,23 +1719,36 @@ class ItssEngine:
         floor_stale_sec: float,
         floor_interval: float | None,
         cycle_ctx: dict[str, Any] | None = None,
+        group: dict[str, Any] | None = None,
+        group_role: str | None = None,
     ) -> dict[str, Any]:
-        """한 방의 P000 -> (수동/다중방/P200) 판단, 명령 전송, 이력 저장 + 디버그 트레이스."""
+        """한 방의 P000 -> (수동/동시 제어 그룹/독립 다중방) 판단, 명령 전송, 이력 저장 + 디버그 트레이스.
+
+        group_role:
+          - "leader"   : 바닥 센서 방. 그룹 공통 바닥으로 안전 판정 + 그룹 수요(가중 평균)로 ON/OFF.
+          - "follower" : 같은 바닥 기준의 추정 방. 실내 기준 안전(과열/창문/환기/센서)만 자체 판정하고
+                         ON/OFF·타이머는 기준 방을 그대로 따른다 (기준 방 OFF 인데 혼자 가열 금지).
+          - None       : 독립 제어 방(바닥 없음) 또는 수동/미구성 방.
+        """
         t_room0 = time.perf_counter()
         r_name = rm["roomName"]
         exec_started = now_kst_iso()
         cycle_id = f"{now.strftime('%Y%m%d-%H%M%S')}-{seq:05d}-{r_name}"
         eff_floor = t["effFloor"]
-        guard_floor = t["guardFloor"]  # 안전 판정용 (추정 OFF 방은 마스터 실측 대리값)
+        guard_floor = t["guardFloor"]  # 안전 판정용 바닥 (독립 방은 None)
         floor_src = t["floorSrc"]
-        floor_is_proxy = floor_src == "ESTIMATE_OFF"
         is_manual = rm["controlMode"] == "MANUAL"
+        is_leader = group is not None and group_role == "leader"
+        is_follower = group is not None and group_role == "follower"
+        # 독립 방은 바닥 없음, 추종 방은 바닥 판정을 기준 방에 위임
+        floor_optional = floor_src == "ESTIMATE_OFF" or is_follower
+        sentinel_floor = None if is_follower else guard_floor
         floor_age_eff = floor_age if guard_floor is not None else None
 
         snapshot = SensorSnapshot(
             room_name=r_name,
             room_temp=t["roomTemp"],
-            floor_temp=guard_floor,
+            floor_temp=sentinel_floor,
             outdoor_temp=outdoor_temp,
             thermostat_hvac_mode=t["hvacMode"],
             combustion_confirmed=t["combustion"],
@@ -1646,7 +1756,7 @@ class ItssEngine:
             sensor_measured_at_room=t["roomTs"],
             sensor_measured_at_floor=floor_ts,
             room_sensor_age_sec=t["roomAge"],
-            floor_sensor_age_sec=floor_age_eff,
+            floor_sensor_age_sec=floor_age_eff if sentinel_floor is not None else None,
         )
 
         record = CycleRecord(
@@ -1684,29 +1794,44 @@ class ItssEngine:
             "trend10mFloor": t["trend10mFloor"],
             "floorEstimateEnabled": t["floorEstimateEnabled"],
             "guardFloor": guard_floor,
+            "groupRole": group_role,
+            "groupLeader": group["leader"] if group is not None else None,
         }
 
-        # 과열 기준은 const.py 단일 출처 (수동 운전에도 항상 적용, 추정 OFF 방은 마스터 실측으로 판정)
+        # 과열 기준은 const.py 단일 출처 (수동 운전에도 항상 적용, 독립 방은 실내만 판정)
         overheat = (
             (t["roomTemp"] is not None and t["roomTemp"] >= DEFAULT_OVERHEAT_ROOM_C)
             or (guard_floor is not None and guard_floor >= DEFAULT_OVERHEAT_FLOOR_C)
         )
         lag_prof = self.lag_profiles.get(r_name) or {}
         eff_floor_limit = self._compute_effective_floor_limit(t["effTarget"], outdoor_temp)
+        floor_cap = self.floor_cap_c(eff_floor_limit)
+        # 레거시 표시용 (v2.8 이하 단일 잔열 상승폭) — v2.9.0 판정은 상승률(floor_rate) 사용
         learned_floor_surge = max(1.2, min(4.0, float(lag_prof.get("floorResidualRiseC", 1.2))))
+        floor_rate = float(lag_prof.get("floorRiseRateCPerMin") or DEFAULT_FLOOR_RISE_RATE_C_PER_MIN)
+        tm = self.room_timers.setdefault(r_name, {"heatingStartedAt": None, "cooldownUntil": None})
+        # 외기 연동 1회 최대 가동 (학습 단축 반영) — sentinel 5a 기준
         base_room_max_run = max(
             MIN_PULSE_MIN,
             min(15.0, max_run_min - float(lag_prof.get("recommendedRunTrimMin", 0.0))),
         )
-        room_max_run_min = self._compute_floor_scaled_max_run(
-            base_max_run_min=base_room_max_run,
-            floor_temp=eff_floor,
-            effective_floor_limit_c=eff_floor_limit,
-            expected_floor_surge_c=learned_floor_surge,
-        )
+        # 바닥 상승률로 계산한 실효 최대 가동 (표시/알림용, 바닥 차단 자체는 sentinel 4b/6e 가 같은 식으로 판정)
+        start_floor_ref = (tm.get("heatingStartFloor") if t["isHeating"] else None)
+        if start_floor_ref is None:
+            start_floor_ref = guard_floor
+        if guard_floor is not None and not is_follower:
+            room_max_run_min = self._compute_floor_limited_max_run(
+                base_max_run_min=base_room_max_run,
+                start_floor_c=start_floor_ref,
+                floor_cap_c=floor_cap,
+                rise_rate_c_per_min=floor_rate,
+            )
+        else:
+            room_max_run_min = base_room_max_run
+        if is_follower and (group or {}).get("result"):
+            room_max_run_min = group["result"].get("maxRunMin", room_max_run_min)
         room_cooldown_min = int(lag_prof.get("recommendedCooldownMin", self.settings["cooldownMin"]))
         poll_interval_min = max(0.5, float(self.settings["updateIntervalSec"]) / 60.0)
-        tm = self.room_timers.setdefault(r_name, {"heatingStartedAt": None, "cooldownUntil": None})
         decision_reason = "P000_OK"
 
         last_cmd = tm.get("lastCommandAction")
@@ -1751,27 +1876,31 @@ class ItssEngine:
             record.command_action = "OFF"
             record.execution_status = "SKIPPED_SAFETY"
         else:
+            # 추종 방: 바닥·가동시간·휴지는 기준 방이 판정 (여기서는 실내 기준 안전만)
             verdict = sentinel.evaluate(
                 snapshot,
                 is_heating=t["isHeating"],
                 v_room_per_min=t["vRoomRate"],
                 v_floor_per_min=t["vFloor"],
-                continuous_run_min=t["runMin"],
-                max_run_min=room_max_run_min,
+                continuous_run_min=None if is_follower else t["runMin"],
+                max_run_min=None if is_follower else base_room_max_run,
                 poll_interval_min=poll_interval_min,
-                cooldown_remaining_min=t["cdMin"],
+                cooldown_remaining_min=None if is_follower else t["cdMin"],
                 window_open=t["windowOpen"],
                 drop_5m_room_c=t["drop5mRoom"],
                 drop_5m_floor_c=t["drop5mFloor"],
                 ventilation_remaining_min=t["ventMin"],
-                effective_floor_limit_c=eff_floor_limit,
+                effective_floor_limit_c=None if sentinel_floor is None else eff_floor_limit,
                 expected_floor_surge_c=learned_floor_surge,
                 trend_10m_room_c=t["trend10mRoom"],
                 trend_10m_floor_c=t["trend10mFloor"],
                 room_stale_after_sec=t["roomStaleSec"],
                 floor_stale_after_sec=floor_stale_sec,
                 floor_latency_c=t["floorLatency"],
-                floor_is_proxy=floor_is_proxy,
+                floor_optional=floor_optional,
+                floor_rise_rate_c_per_min=floor_rate if sentinel_floor is not None else None,
+                heating_start_floor_c=tm.get("heatingStartFloor") if t["isHeating"] else None,
+                min_pulse_min=MIN_PULSE_MIN,
             )
             record.safety_reason = verdict.reason_code
             if verdict.force_off:
@@ -1793,25 +1922,34 @@ class ItssEngine:
                     tm["ventilationUntil"] = (
                         now + timedelta(minutes=int(self.settings["ventilationHoldMin"]))
                     ).isoformat(timespec="seconds")
-            elif verdict.hold_current_state or mz_cmd is None:
+            elif verdict.hold_current_state:
                 decision_reason = verdict.reason_code
                 record.command_action = "HOLD"
                 record.execution_status = "SKIPPED_SAFETY"
-            elif self.settings["zoneStrategy"] == STRATEGY_HYBRID and pred is not None:
-                # P200 Predictive Early-OFF prevents Ondol residual-heat overshoot
-                if pred.recommended_action == "OFF":
-                    record.command_action = "OFF"
-                    decision_reason = "P200_PREDICTIVE_OFF"
-                elif pred.recommended_action == "HEAT":
-                    record.command_action = "HEAT"
-                    decision_reason = "P200_PREDICTIVE_ON"
-                elif any_p200_heat and mz_cmd.action == "HEAT":
-                    record.command_action = "HEAT"
-                    decision_reason = "HYBRID_COHEAT_BATCH"
-                else:
-                    record.command_action = "OFF"
-                    decision_reason = mz_cmd.reason
+            elif is_leader:
+                # 동시 제어 그룹 기준 방: 그룹 가중 평균 예측 편차로 ON/OFF
+                record.command_action = group["demand"]
+                decision_reason = group["demandReason"]
                 record.safety_reason = decision_reason
+            elif is_follower:
+                lead = group.get("result")
+                upper = t["effTarget"] + DEFAULT_CONTROL_BAND_HALF
+                if lead is None or (lead["action"] == "HEAT" and lead.get("dispatch") == "FAILED"):
+                    # 기준 방 판정/명령 실패 시 추종 방 단독 가열 금지
+                    record.command_action = "OFF"
+                    decision_reason = "GROUP_LEADER_UNAVAILABLE"
+                elif lead["action"] == "HEAT" and t["roomTemp"] is not None and t["roomTemp"] >= upper:
+                    # 그룹 가열 중이라도 이 방만 상한 이상이면 개별 정지 (덜 가열 = 바닥 추정 보수 방향)
+                    record.command_action = "OFF"
+                    decision_reason = "GROUP_MEMBER_WARM_SKIP"
+                else:
+                    record.command_action = lead["action"]
+                    decision_reason = lead["reason"]
+                record.safety_reason = decision_reason
+            elif mz_cmd is None:
+                decision_reason = verdict.reason_code
+                record.command_action = "HOLD"
+                record.execution_status = "SKIPPED_SAFETY"
             else:
                 record.command_action = mz_cmd.action
                 decision_reason = mz_cmd.reason
@@ -1819,8 +1957,10 @@ class ItssEngine:
 
             # 채터링 방지: 안전 차단이 아닌 '재량' 명령이 직전 명령과 반대 방향으로 바뀔 때만
             # 최소 가동(HEAT->OFF 5분)/휴지(OFF->HEAT 10분) 시간을 보장
+            # (추종 방은 기준 방 명령을 즉시 따라야 하므로 제외)
             if (
                 not verdict.force_off
+                and not is_follower
                 and record.command_action in ("HEAT", "OFF")
                 and last_cmd in ("HEAT", "OFF")
                 and record.command_action != last_cmd
@@ -1836,13 +1976,25 @@ class ItssEngine:
 
         prev_run_min = t["runMin"]
         was_heating = t["isHeating"] or (tm.get("heatingStartedAt") is not None)
-        if record.command_action == "HEAT" and not tm.get("heatingStartedAt"):
+        if is_follower:
+            # 추종 방 타이머는 기준 방과 동기 (가동 시작 시각·시작 바닥·잔열 휴지)
+            lead_tm = self.room_timers.get(group["leader"], {})
+            tm["cooldownUntil"] = lead_tm.get("cooldownUntil")
+            if record.command_action == "HEAT":
+                tm["heatingStartedAt"] = lead_tm.get("heatingStartedAt") or now.isoformat(timespec="seconds")
+                tm["heatingStartFloor"] = lead_tm.get("heatingStartFloor")
+            elif record.command_action == "OFF":
+                tm["heatingStartedAt"] = None
+                tm.pop("heatingStartFloor", None)
+        elif record.command_action == "HEAT" and not tm.get("heatingStartedAt"):
             tm["heatingStartedAt"] = now.isoformat(timespec="seconds")
+            tm["heatingStartFloor"] = guard_floor
         elif record.command_action == "OFF":
             # Enter residual-heat soak cooldown on ANY HEAT -> OFF transition (survives restarts)
             if was_heating and not is_manual and t["cdMin"] <= 0:
                 tm["cooldownUntil"] = (now + timedelta(minutes=room_cooldown_min)).isoformat(timespec="seconds")
             tm["heatingStartedAt"] = None
+            tm.pop("heatingStartFloor", None)
 
         if record.command_action in ("HEAT", "OFF"):
             # 채터링 방지 기준점: 명령 방향(HEAT<->OFF)이 바뀐 시각
@@ -1855,6 +2007,34 @@ class ItssEngine:
 
             record.command_setpoint = self.compute_command_setpoint(record.command_action, c_state)
             await self._dispatch(rm["climateEntity"], record, c_state, tm, now)
+        else:
+            record.dispatch_result = "NONE"
+
+        # 기준 방 결과를 추종 방에 전달 (명령 실패 포함 — 실패 시 추종 방 단독 가열 금지)
+        if is_leader:
+            group["result"] = {
+                "action": record.command_action,
+                "reason": decision_reason,
+                "dispatch": record.dispatch_result,
+                "maxRunMin": room_max_run_min,
+            }
+
+        if record.command_action in ("HEAT", "OFF"):
+            if floor_src == "ESTIMATE_OFF":
+                floor_label = "미사용(독립 제어)"
+            elif is_follower:
+                floor_label = f"{eff_floor}°C(추정 · {group['leader']} 기준 동시 제어)"
+            elif eff_floor is not None:
+                floor_label = f"{eff_floor}°C"
+            else:
+                floor_label = "--"
+            extra: list[str] = []
+            if group is not None:
+                dev = group.get("weightedDevC")
+                extra.append(
+                    f"동시 제어: {' · '.join(group['members'])}"
+                    + (f" (그룹 평균 편차 {dev:+.2f}°C)" if dev is not None else "")
+                )
             await self._notify_state_change(
                 room_name=r_name,
                 action=record.command_action,
@@ -1862,15 +2042,17 @@ class ItssEngine:
                 room_temp=t["roomTemp"],
                 floor_temp=eff_floor,
                 target_temp=rm["targetTemp"],
-                pred_room=record.predicted_room_30m,
+                # 그룹 방은 가중 평균 편차로 판정하므로 개별 P200 예측값은 알림에서 생략 (트레이스에는 기록)
+                pred_room=None if group is not None else record.predicted_room_30m,
                 setpoint=record.command_setpoint,
                 run_min=prev_run_min,
                 max_run_min=room_max_run_min,
                 dispatch_result=record.dispatch_result,
                 now=now,
+                eff_target=t["effTarget"],
+                floor_label=floor_label,
+                extra_lines=extra,
             )
-        else:
-            record.dispatch_result = "NONE"
 
         top_reasons = self._update_underheat(
             tm,
@@ -1967,17 +2149,34 @@ class ItssEngine:
                     "overheatRoomC": DEFAULT_OVERHEAT_ROOM_C,
                     "overheatFloorC": DEFAULT_OVERHEAT_FLOOR_C,
                     "effFloorLimitC": eff_floor_limit,
+                    "floorCapC": floor_cap if guard_floor is not None else None,
+                    "floorRiseRateCPerMin": floor_rate if guard_floor is not None else None,
+                    "heatingStartFloorC": tm.get("heatingStartFloor"),
                     "learnedFloorSurgeC": learned_floor_surge,
                     "baseMaxRunMin": base_room_max_run,
                     "roomMaxRunMin": room_max_run_min,
                     "cooldownMin": room_cooldown_min,
                     "pollIntervalMin": poll_interval_min,
                 },
+                "group": (
+                    {
+                        "role": group_role,
+                        "leader": group["leader"],
+                        "members": group["members"],
+                        "demand": group.get("demand"),
+                        "demandReason": group.get("demandReason"),
+                        "weightedDevC": group.get("weightedDevC"),
+                        "leaderResult": group.get("result") if is_follower else None,
+                    }
+                    if group is not None
+                    else None
+                ),
                 "lagProfile": {
                     k: lag_prof.get(k)
                     for k in (
                         "status", "sampleCount", "floorResidualRiseC", "roomResidualRiseC",
                         "recommendedCooldownMin", "recommendedHorizonMin", "recommendedRunTrimMin",
+                        "floorRiseRateCPerMin", "floorRateSamples",
                     )
                 },
                 "timersBefore": timers_before,
@@ -2164,6 +2363,11 @@ def create_app(
             hard_cap_min=float(engine.settings["maxRunCapMin"]),
         )
         live_by_room: dict[str, dict[str, Any]] = {}
+        # 동시 제어 그룹 구성 (제어 루프와 같은 규칙: AUTO + 실측/추정 방, 기준 방 = 바닥 센서 방)
+        floor_srcs = {
+            rm["roomName"]: engine._room_floor(rm, master_floor, engine.floor_configured)[1] for rm in rooms
+        }
+        live_group = ItssEngine._floor_group_plan(rooms, {n: {"floorSrc": s} for n, s in floor_srcs.items()})
         for rm in rooms:
             r_name = rm["roomName"]
             r_temp, _, _, _ = await engine._read_numeric(rm["roomTempEntity"])
@@ -2182,16 +2386,27 @@ def create_app(
             )
             eff_floor_cap = engine._compute_effective_floor_limit(eff_target_live, outdoor_temp)
             lag_p = engine.lag_profiles.get(r_name) or {}
-            surge_est = max(1.2, min(4.0, float(lag_p.get("floorResidualRiseC", 1.2))))
-            eff_max_run = engine._compute_floor_scaled_max_run(
-                base_max_run_min=max(
-                    MIN_PULSE_MIN, min(15.0, active_max_run - float(lag_p.get("recommendedRunTrimMin", 0.0)))
-                ),
-                floor_temp=eff_floor,
-                effective_floor_limit_c=eff_floor_cap,
-                expected_floor_surge_c=surge_est,
-            )
             tm = engine.room_timers.get(r_name, {})
+            rate_live = float(lag_p.get("floorRiseRateCPerMin") or DEFAULT_FLOOR_RISE_RATE_C_PER_MIN)
+            base_live = max(
+                MIN_PULSE_MIN, min(15.0, active_max_run - float(lag_p.get("recommendedRunTrimMin", 0.0)))
+            )
+            start_live = tm.get("heatingStartFloor") if tm.get("heatingStartedAt") else None
+            eff_max_run = (
+                engine._compute_floor_limited_max_run(
+                    base_max_run_min=base_live,
+                    start_floor_c=start_live if start_live is not None else guard_floor,
+                    floor_cap_c=engine.floor_cap_c(eff_floor_cap),
+                    rise_rate_c_per_min=rate_live,
+                )
+                if guard_floor is not None
+                else base_live
+            )
+            g_role = None
+            if live_group and r_name in live_group["members"]:
+                g_role = "LEADER" if r_name == live_group["leader"] else "FOLLOWER"
+            elif floor_src == "ESTIMATE_OFF":
+                g_role = "INDEPENDENT"
             uh_since = _parse_ts(tm.get("underheatSince"))
             live_by_room[r_name] = {
                 "roomTemp": r_temp,
@@ -2206,6 +2421,9 @@ def create_app(
                 "runtimeMin": run_min,
                 "effectiveMaxRunMin": eff_max_run,
                 "effectiveFloorLimitC": eff_floor_cap,
+                "floorRiseRateCPerMin": rate_live if guard_floor is not None else None,
+                "groupRole": g_role,
+                "groupLeader": live_group["leader"] if g_role in ("LEADER", "FOLLOWER") else None,
                 "cooldownRemainMin": cd_min,
                 "ventilationRemainMin": vent_min,
                 "windowOpen": win_open,

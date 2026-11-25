@@ -3,7 +3,7 @@
 from datetime import timedelta, timezone
 
 DOMAIN = "itss"
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 
 # Korea Standard Time (UTC+9)
 KST = timezone(timedelta(hours=9))
@@ -61,6 +61,14 @@ SENSOR_LONG_GAP_SEC = 120.0        # 24시간 최대 공백 이력에 저장할 
 
 # 1회 최소 가동 펄스 (밸브 구동 시간 고려, 이보다 짧은 펄스는 만들지 않음)
 MIN_PULSE_MIN = 5.0
+
+# v2.9.0 바닥 상승률 모델: 가동 L분 -> OFF 후 바닥 피크 ≈ 가동 시작 시 바닥 + rate x L
+# 기본값 0.30°C/min: 2026-11-25 트레이스 방3 단독 8분 +2.1°C(0.26), 13분 +3.9°C(0.30) 중 보수값
+DEFAULT_FLOOR_RISE_RATE_C_PER_MIN = 0.30
+FLOOR_RISE_RATE_MIN_C_PER_MIN = 0.05   # 학습값 하한
+FLOOR_RISE_RATE_MAX_C_PER_MIN = 0.80   # 학습값 상한
+FLOOR_RATE_MIN_RUN_MIN = 3.0           # 이보다 짧은 펄스는 상승률 학습에서 제외 (공급수 잔열이 지배)
+FLOOR_PEAK_MARGIN_C = 0.2              # 예측 피크가 (바닥 상한 - 여유) 이상이면 시작 금지/차단
 
 # HA 서비스 재전송 (상태가 이미 목표와 같으면 생략, 단 이 주기마다 1회 재동기화)
 DISPATCH_RESEND_MIN = 30.0

@@ -57,44 +57,56 @@ def test_estimate_on_uses_master_plus_offset(tmp_path: Path):
     assert rec["diagnostics"]["guardFloor"] == 21.4
 
 
-def test_estimate_off_room_based_control_with_proxy_guard(tmp_path: Path):
+def test_estimate_off_is_independent_room_without_floor(tmp_path: Path):
+    # v2.9.0: 추정 OFF = 독립 제어 방. 바닥값·안전 판정용 바닥 모두 없음 (v2.8 마스터 대리 판정 폐기)
     eng, _ = _setup(tmp_path, estimate=False)
     rec = _slave(eng)
     assert rec["floorSensorSource"] == "ESTIMATE_OFF" and rec["floorTemp"] is None
     assert rec["predictedRoom30m"] is None  # P200 생략, 실내 기준 다중방 band 제어
     assert rec["safetyReason"] == "HYBRID_PRIMARY_HEAT" and rec["commandAction"] == "HEAT"
-    assert rec["diagnostics"]["guardFloor"] == 21.0 and rec["diagnostics"]["floorEstimateEnabled"] is False
+    assert rec["diagnostics"]["guardFloor"] is None and rec["diagnostics"]["floorEstimateEnabled"] is False
+    assert rec["diagnostics"]["groupRole"] is None
 
 
-def test_estimate_off_still_enforces_floor_safety_with_master(tmp_path: Path):
+def test_independent_room_not_blocked_by_master_floor(tmp_path: Path):
+    # 2026-11-25 07:40 재현: 마스터 바닥 과열이 바닥 기준 없는 방까지 차단하던 문제
     eng, ha = _setup(tmp_path, estimate=False)
-    ha.set_sensor("sensor.floor", DEFAULT_OVERHEAT_FLOOR_C + 0.2)  # 과열 기준(const) 이상
-    assert _slave(eng)["safetyReason"] == "P000_OVERHEAT_CUTOFF"
+    ha.set_sensor("sensor.floor", DEFAULT_OVERHEAT_FLOOR_C + 0.6)
+    recs = {r["roomName"]: r for r in asyncio.run(eng.run_control_cycle())}
+    assert recs[MASTER]["safetyReason"] == "P000_OVERHEAT_CUTOFF"
+    assert recs[SLAVE]["commandAction"] == "HEAT" and recs[SLAVE]["safetyReason"] == "HYBRID_PRIMARY_HEAT"
 
+    # 설정 바닥 상한 초과·마스터 바닥 센서 누락에도 독립 방은 실내 기준으로 계속 제어
     eng2, ha2 = _setup(tmp_path / "b", estimate=False)
     eng2.settings["floorOffLimitC"] = 22.5
-    ha2.set_sensor("sensor.floor", 22.8)  # 설정 바닥 상한 이상, 과열 미만
-    rec = _slave(eng2)
-    assert rec["safetyReason"] == "P000_FLOOR_LIMIT_OFF" and rec["commandAction"] == "OFF"
+    ha2.set_sensor("sensor.floor", 22.8)
+    assert _slave(eng2)["commandAction"] == "HEAT"
+    eng3, ha3 = _setup(tmp_path / "c", estimate=False)
+    ha3.set_sensor("sensor.floor", None)
+    assert _slave(eng3)["commandAction"] == "HEAT"
 
 
-def test_manual_heat_on_estimate_off_room_uses_proxy(tmp_path: Path):
+def test_manual_heat_on_independent_room_needs_only_room_sensor(tmp_path: Path):
     eng, ha = _setup(tmp_path, estimate=False, slave_mode="MANUAL", slave_manual="HEAT")
     assert _slave(eng)["commandAction"] == "HEAT"
-    ha.set_sensor("sensor.floor", None)
+    ha.set_sensor("sensor.floor", None)  # 마스터 바닥 누락과 무관
+    assert _slave(eng)["commandAction"] == "HEAT"
+    ha.set_sensor("sensor.slave_temp", None)
     rec = _slave(eng)
     assert rec["commandAction"] == "OFF" and rec["safetyReason"] == "P000_SENSOR_MISSING"
 
 
-def test_multizone_proxy_source():
+def test_multizone_independent_zone_has_no_floor():
     # main.py 와 동일하게 설정 바닥 상한(floorOffLimitC 기본 26.5°C)을 명시 전달
-    plan = MultiZoneController(strategy="hybrid", general_off_floor_c=26.5).evaluate(
-        [ZoneReading("s", room_temp=19.0, target_temp=21.0, is_heating=False,
-                     floor_offset_from_master_c=0.5, floor_estimate_enabled=False)],
-        master_floor_temp=20.0,
-    )
-    cmd = plan.commands[0]
-    assert cmd.floor_sensor_source == "PROXY" and cmd.effective_floor_temp == 20.0 and cmd.action == "HEAT"
+    ctrl = MultiZoneController(strategy="hybrid", general_off_floor_c=26.5)
+    indep = ZoneReading("s", room_temp=19.0, target_temp=21.0, is_heating=False,
+                        floor_offset_from_master_c=0.5, floor_estimate_enabled=False)
+    cmd = ctrl.evaluate([indep], master_floor_temp=20.0).commands[0]
+    assert cmd.floor_sensor_source == "NONE" and cmd.effective_floor_temp is None and cmd.action == "HEAT"
+    # 마스터 바닥 과열이어도 독립 방은 차단하지 않고, 바닥 기준 방만 차단
+    floor_zone = ZoneReading("m", room_temp=19.0, target_temp=21.0, is_heating=False, has_floor_sensor=True)
+    by = {c.room_name: c for c in ctrl.evaluate([indep, floor_zone], master_floor_temp=30.0).commands}
+    assert by["s"].action == "HEAT" and by["m"].reason == "P000_SAFETY_CUTOFF"
 
 
 def test_api_toggle_offset_validation_and_suggestions(tmp_path: Path):

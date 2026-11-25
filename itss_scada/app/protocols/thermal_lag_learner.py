@@ -8,6 +8,13 @@ historical KST cycle records:
   - floor_residual_rise_c   : floor temperature rise after boiler OFF
   - room_post_off_peak_min  : delay after boiler OFF until room air peaks
   - room_residual_rise_c    : room air temperature rise after boiler OFF
+
+v2.9.0:
+  - floor_rise_rate_c_per_min : 가동 1분당 바닥 피크 상승률 (OFF 후 피크 - 가동 시작 바닥) / 가동시간.
+    펄스 길이와 무관한 단일 잔열 상승폭(중앙값)은 1분 펄스(+0.3~0.5°C)에 끌려 내려가
+    8분 펄스(+2.2°C)를 과소 예측했으므로(2026-11-25 트레이스) 가동시간으로 정규화한다.
+    FLOOR_RATE_MIN_RUN_MIN 미만 펄스와 피크 미확정(휴지 중 재가동) 에피소드는 제외하고,
+    안전 판정용이므로 보수적 통계(표본 3개 미만: max(기본값, 최대), 이상: 75 백분위)를 쓴다.
 """
 
 from __future__ import annotations
@@ -16,6 +23,13 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from statistics import median
 from typing import Any
+
+from ..const import (
+    DEFAULT_FLOOR_RISE_RATE_C_PER_MIN,
+    FLOOR_RATE_MIN_RUN_MIN,
+    FLOOR_RISE_RATE_MAX_C_PER_MIN,
+    FLOOR_RISE_RATE_MIN_C_PER_MIN,
+)
 
 # Conservative Korean Ondol defaults used before enough episodes are observed
 DEFAULT_FLOOR_ON_DEADTIME_MIN = 5.0
@@ -42,6 +56,8 @@ class RoomLagProfile:
     recommended_cooldown_min: int
     recommended_horizon_min: int
     recommended_run_trim_min: float
+    floor_rise_rate_c_per_min: float = DEFAULT_FLOOR_RISE_RATE_C_PER_MIN
+    floor_rate_samples: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         raw = asdict(self)
@@ -58,7 +74,26 @@ class RoomLagProfile:
             "recommendedCooldownMin": raw["recommended_cooldown_min"],
             "recommendedHorizonMin": raw["recommended_horizon_min"],
             "recommendedRunTrimMin": raw["recommended_run_trim_min"],
+            "floorRiseRateCPerMin": raw["floor_rise_rate_c_per_min"],
+            "floorRateSamples": raw["floor_rate_samples"],
         }
+
+
+def conservative_floor_rate(samples: list[float]) -> float:
+    """안전 판정용 보수적 바닥 상승률 (°C/min).
+
+    - 표본 없음: 기본값
+    - 표본 1~2개: max(기본값, 최대 표본)  (낮은 표본 하나로 가드를 완화하지 않음)
+    - 표본 3개 이상: 75 백분위
+    """
+    if not samples:
+        return DEFAULT_FLOOR_RISE_RATE_C_PER_MIN
+    s = sorted(samples)
+    if len(s) < 3:
+        v = max(DEFAULT_FLOOR_RISE_RATE_C_PER_MIN, s[-1])
+    else:
+        v = s[min(len(s) - 1, int(round(0.75 * (len(s) - 1))))]
+    return round(max(FLOOR_RISE_RATE_MIN_C_PER_MIN, min(FLOOR_RISE_RATE_MAX_C_PER_MIN, v)), 3)
 
 
 def _parse_ts(raw: Any) -> datetime | None:
@@ -102,6 +137,7 @@ def learn_room_lag_profile(
     floor_off_rises: list[float] = []
     room_off_peaks: list[float] = []
     room_off_rises: list[float] = []
+    floor_rates: list[float] = []
 
     n = len(rows)
     i = 0
@@ -196,6 +232,19 @@ def learn_room_lag_profile(
                     if floor_rise >= 0.1:
                         floor_off_peaks.append(round(best_floor_min, 1))
 
+            # 가동 1분당 바닥 피크 상승률: 충분히 긴 펄스 + 피크 확정(피크 후 5분 이상 관측)만 사용
+            run_len_min = (t_off - t_start).total_seconds() / 60.0
+            peak_confirmed = soak_duration >= best_floor_min + 5.0
+            if (
+                start_floor is not None
+                and best_floor is not None
+                and run_len_min >= FLOOR_RATE_MIN_RUN_MIN
+                and peak_confirmed
+            ):
+                total_rise = max(0.0, best_floor - start_floor)
+                if total_rise <= 8.0:  # 비정상 점프 제외
+                    floor_rates.append(round(total_rise / run_len_min, 4))
+
         i = k
 
     sample_count = len(room_off_rises)
@@ -234,5 +283,7 @@ def learn_room_lag_profile(
         recommended_cooldown_min=rec_cooldown,
         recommended_horizon_min=rec_horizon,
         recommended_run_trim_min=rec_trim,
+        floor_rise_rate_c_per_min=conservative_floor_rate(floor_rates),
+        floor_rate_samples=len(floor_rates),
     )
 

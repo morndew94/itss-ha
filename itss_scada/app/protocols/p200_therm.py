@@ -104,6 +104,8 @@ class LinearExtrapolationV12(ThermalPredictor):
                 "v_room_per_min": data.v_room_per_min,
                 "v_floor_per_min": data.v_floor_per_min,
                 "horizon_min": data.horizon_min,
+                # v2.9.0 동시 제어 그룹 판정용 무가열 예측 실내 (선형 외삽 + 학습 잔열)
+                "projected_coast": round(r_pred + residual_rise, 2),
             },
         )
 
@@ -229,6 +231,8 @@ class AdaptiveRCModel(ThermalPredictor):
                 "r_coast_pred": round(r_coast, 2),
                 "r_heat_pred": round(r_heat, 2),
                 "t_ambient_used": t_ambient,
+                # v2.9.0 동시 제어 그룹 판정용 무가열 예측 실내 (물리 coast 와 학습 잔열 중 큰 값)
+                "projected_coast": round(projected_coast, 2),
             },
         )
 

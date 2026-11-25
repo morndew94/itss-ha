@@ -1,6 +1,6 @@
 # I.T.S.S. Thermal SCADA (Home Assistant Add-on)
 
-Home Assistant **전용 애드온(Add-on + Ingress 웹 UI)** 입니다. 온돌(바닥 난방) 방별 제어, 단일 마스터 바닥 sensor 기반 하이브리드 다중 방 제어, 센서 보고 주기 학습, KST 회차 이력 DB, 실운전 분석용 로그/트레이스를 제공합니다. 버전은 **2.8.0** 입니다.
+Home Assistant **전용 애드온(Add-on + Ingress 웹 UI)** 입니다. 온돌(바닥 난방) 방별 제어, 단일 마스터 바닥 sensor 기반 하이브리드 다중 방 제어, 센서 보고 주기 학습, KST 회차 이력 DB, 실운전 분석용 로그/트레이스를 제공합니다. 버전은 **2.9.0** 입니다.
 
 핵심 요약
 
@@ -21,8 +21,12 @@ Home Assistant **전용 애드온(Add-on + Ingress 웹 UI)** 입니다. 온돌(�
 - **운전 모드 `AUTO` / `MANUAL`(`HEAT`/`OFF`/`HOLD`)**: 수동 운전에도 최소 안전 조건이 적용됩니다(3장 참조).
 - **단일 마스터 바닥 sensor + 방별 밸브 하이브리드 제어**:
   - 동시 기동(Co-heating Batch)으로 보일러 단펄스를 줄이고, 목표 상한 도달 방은 개별 선차단합니다.
-  - 마스터 방은 `MEASURED`, 나머지 방은 `ESTIMATED`(마스터 바닥값 + `floorOffsetC`) 또는 `ESTIMATE_OFF`로 구분 기록합니다.
-  - **바닥 추정 ON/OFF (v2.8.0, 바닥 sensor 없는 방)**: 방 테이블의 `추정 ON/OFF` 토글과 offset `±0.1 °C` 버튼(범위 −5.0 ~ +5.0 °C), RC 피팅 제안 offset `제안 … 적용` 버튼으로 조절합니다. 추정 OFF(`ESTIMATE_OFF`) 방은 P200 예측 없이 실내 온도 band(목표 ±0.15 °C) 기준 multi-zone 제어를 하고, 과열(바닥 25.0 °C)·설정 바닥 상한(`floorOffLimitC`) 안전 판정만 마스터 실측 바닥을 대리값(proxy)으로 사용합니다. 목표연동 동적 상한·예측 상한·시작 전 여유·잔열 가드는 방 바닥값이 필요하므로 생략됩니다.
+  - 마스터 방은 `MEASURED`, 나머지 방은 `ESTIMATED`(마스터 바닥값 + `floorOffsetC`) 또는 `ESTIMATE_OFF`(독립 제어)로 구분 기록합니다.
+  - **바닥 기준 동시 제어 그룹 / 독립 제어 (v2.9.0)**: 방 테이블 토글은 `동시 제어(바닥 공유)` / `독립 제어` 입니다(API 필드 `floorEstimateEnabled` 동일). offset `±0.1 °C` 버튼(−5.0 ~ +5.0 °C)과 RC 피팅 제안 `제안 … 적용` 버튼은 그대로입니다.
+    - **동시 제어 그룹**: 바닥 sensor 방(leader, 예: 방3) + "바닥 기준 공유" ON 인 센서 없는 방(follower, 예: 방2) 중 `AUTO` 방이 그룹을 이룹니다. 그룹 수요(방 weight 가중평균 편차)로 함께 기동/차단하며, leader 가 공유 바닥에 대한 전체 안전(과열, 상한, 상승률 기반 예상 peak, 최대 가동, 휴지, 잔열)을 수행하고 follower 는 방 기준 안전만 수행한 뒤 leader 의 결정을 따릅니다.
+    - **독립 제어**(`ESTIMATE_OFF`, 예: 거실, 안방): 바닥값·안전 바닥이 없습니다(v2.8 마스터 대리 판정 제거). 독립 방끼리 기존 hybrid multi-zone 으로 제어하며, 실내 과열 24 °C·외기 연동 최대 가동·잔열 휴지·창문/환기 보호를 받습니다. 마스터 바닥 과열/누락의 영향을 받지 않습니다.
+    - 바닥 sensor 방을 MANUAL 로 두면 AUTO 추정 방은 첫 추정 방을 leader 로 그룹을 구성하지만 바닥 sensor 는 그 난방을 보지 못하므로 장시간 사용하지 마십시오.
+  - **바닥 상승률 모델 (v2.9.0)**: `floorRiseRateCPerMin` 을 학습하여 기동 전 가드와 가동 중 차단을 같은 예측(시작 바닥 + rate x 가동 분 >= 바닥 cap - 0.2 °C)으로 통일합니다.
   - 전략: `hybrid`(기본) / `simultaneous`(가중평균 일괄 기동).
 - **센서 보고 주기 감지 (v2.7.0)**: HA `last_reported`(없으면 `last_updated`) 기준으로 sensor별 보고 간격을 학습하여 stale 임계, 기울기, 바닥 지연 보상에 반영합니다. UI 패널 "센서 보고 주기 감지 현황"에서 확인합니다.
 - **예측 제어(P200)**: `linear_v12`(선형 외삽) 또는 `adaptive_rc`(2-node RC) 모델로 30분(학습값에 따라 가변) 후 온도를 예측하여 예측 기동/선차단을 판단합니다.
@@ -227,11 +231,28 @@ ITSS_ALLOWED_IPS="*" uvicorn --factory itss_scada.app.main:create_app --port 809
 
 ---
 
-## 8. v2.8.0 변경 사항
+## 8. v2.9.0 변경 사항
+
+2026-11-25 00:01~08:12 trace 분석 결과 3가지 문제를 수정했습니다. 바닥 sensor(DS18B20)는 방3에만 있고 방2은 인접, 거실/안방은 바닥 기준이 없습니다.
+
+| 구분 | 문제 | 수정 |
+| :--- | :--- | :--- |
+| A | 시작 게이트는 바닥 >= cap - 0.5 °C 만 차단, 가동 중에는 바닥 + surge >= cap 에서 차단 -> [cap - surge, cap - 0.5) 에서 시작 1분 만에 차단 (05:56, 06:40 방3, 각 1.1 min 펄스) | 기동 전 가드 `6e` 신설: 바닥 + 최소 5 min 펄스 예상 상승 >= cap - margin 이면 `P000_FLOOR_PREDICTED_LIMIT`. 기존 `cap - 0.5` 규칙(5c) 제거. 레거시 surge 모드는 바닥 + max(0.5, surge) >= cap |
+| B | v2.8 추정 OFF 방이 마스터 바닥을 대리 안전값으로 사용했으나 타 방 난방에 반응하지 않음 (01:56~04:22 거실/방2 4회 가열 동안 마스터 바닥 21.4 -> 20.3 °C 하락, 07:40 방3 25.7 °C 도달 시 4개 방 전체 과열 차단) | 바닥 기준 동시 제어 그룹(leader/follower) + 독립 제어(바닥 안전 없음, 방 기준 보호). 대리 판정 제거 |
+| C | 잔열 상승을 펄스 길이와 무관한 단일 중앙값으로 학습 -> 1분 펄스(+0.3~0.5 °C)가 1.2 °C 하한까지 끌어내려 8분 펄스(실제 +2.2 °C, 07:46 peak 25.7 °C)를 과소 예측 | 가동 1분당 바닥 상승률 `floorRiseRateCPerMin` 학습 (>= 3 min 펄스, peak 확정만). 0 샘플 기본 0.30 °C/min, 1~2 샘플 max(기본, 최대), 3 이상 75 percentile, clamp 0.05~0.80 °C/min. 예상 peak >= cap - 0.2 °C 에서 차단, 최대 가동 = min(외기 연동, (cap - 0.2 - 시작 바닥)/rate), 5 min 미만이면 시작 안 함 |
+
+- 그룹 수요: idle 에서 가중평균 편차 <= -0.15 °C 면 HEAT, 가열 중 >= 0 면 OFF. 사유 코드 `GROUP_DEMAND_HEAT`, `GROUP_CONTINUE`, `GROUP_TARGET_REACHED`, `GROUP_IDLE`, `GROUP_NO_ROOM_DATA`, `GROUP_MEMBER_WARM_SKIP`, `GROUP_LEADER_UNAVAILABLE`. 방별 P200 단독 판단(`P200_PREDICTIVE_ON/OFF`)은 AUTO 에서 더 이상 쓰이지 않고 예측은 기록/그룹 수요 입력으로만 사용합니다.
+- `/api/v1/status` `liveByRoom` 에 `groupRole`, `groupLeader`, `floorRiseRateCPerMin` 추가 (독립 방 `guardFloorTemp` = null).
+- 트레이스: `group`, `limits.floorCapC/floorRiseRateCPerMin/heatingStartFloorC`, `lagProfile.floorRiseRateCPerMin/floorRateSamples`, `diagnostics.groupRole/groupLeader`.
+- UI: "동시 제어(바닥 공유)"/"독립 제어" 토글, 등록 폼 "바닥 기준 공유 (센서 없는 방)", lag 표 "가동 1분당 상승률", 버튼 "P200 RC 파라미터 보기".
+- 알림: "바닥: None°C" 수정(독립 방 "미사용(독립 제어)"), 목표에 실효 목표 병기, 그룹 줄 추가.
+- 과열 상수 변경 없음 (실내 24.0 °C / 바닥 25.0 °C).
+
+## 8.1 v2.8.0 변경 사항 (이력)
 
 - 바닥 sensor 없는 방의 바닥 추정 ON/OFF (`floorEstimateEnabled`, 방 등록 폼·방 테이블 토글, `PATCH /api/v1/rooms/{name}`)
 - 방 테이블에서 floor offset `±0.1 °C` 조절, RC 피팅 제안 offset 원클릭 적용 (`/status` 의 `suggestedFloorOffsets`)
-- 추정 OFF 방: P200 생략·실내 기준 multi-zone 제어, 과열/설정 바닥 상한은 마스터 실측 대리 판정 (`ESTIMATE_OFF`, `guardFloor`)
+- 추정 OFF 방: P200 생략·실내 기준 multi-zone 제어, 과열/설정 바닥 상한은 마스터 실측 대리 판정 (`ESTIMATE_OFF`, `guardFloor`) — **v2.9.0 에서 대리 판정 제거**
 - 바닥 sensor 방에 추정/offset 설정 시 HTTP 409, offset 범위 −5.0 ~ +5.0 °C (HTTP 422)
 - DB `rooms.floor_estimate_enabled` 컬럼 자동 마이그레이션 (기존 방은 ON 유지)
 
