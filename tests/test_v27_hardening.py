@@ -205,12 +205,26 @@ def test_manual_heat_blocked_without_sensor_and_floor_latch(tmp_path: Path):
     assert rec["commandAction"] == "OFF" and rec["safetyReason"] == "P000_SENSOR_MISSING"
     assert not any(d.get("temperature", 0) >= 24.0 for _, s, d in ha.calls if s == "set_temperature")
 
-    # 바닥 상한 도달 -> 래치, 상한-1.0°C 이하로 내려가야 해제
+    # 바닥 상한 도달 -> 수동 HEAT 종료 + 자동 제어 복귀 (v2.9.1: 수동은 1회성 요청, 래치 대기 후 재가열 없음)
     ha.set_sensor(rm["roomTempEntity"], 21.0)
-    for floor, expected in ((22.6, "OFF"), (22.0, "OFF"), (21.4, "HEAT")):
-        ha.set_sensor("sensor.floor", floor)
-        assert _run(eng)[0]["commandAction"] == expected, floor
+    ha.set_sensor("sensor.floor", 22.6)
+    rec = _run(eng)[0]
+    assert rec["commandAction"] == "OFF" and rec["safetyReason"] == "P000_FLOOR_LIMIT_OFF"
+    assert eng.db.get_room(rm["roomName"])["controlMode"] == "AUTO"
     assert DEFAULT_OVERHEAT_FLOOR_C > 22.6
+
+    # 차가운 바닥에서 다시 수동 ON -> 가동 (시작 전 예측: 20.0 + 0.30 x 5 = 21.5 < 상한 22.5 - 0.2)
+    eng.db.update_room_control(rm["roomName"], control_mode="MANUAL", manual_action="HEAT")
+    ha.set_sensor("sensor.floor", 20.0)
+    assert _run(eng)[0]["commandAction"] == "HEAT"
+    # 시작 전 예측 피크가 상한 근처(21.0 + 1.5 = 22.5 >= 22.3)면 수동 ON 도 차단 후 자동 복귀
+    eng.db.update_room_control(rm["roomName"], control_mode="MANUAL", manual_action="HEAT")
+    eng.room_timers[rm["roomName"]].update({"heatingStartedAt": None, "manualHeatSince": None})
+    ha.climate[rm["climateEntity"]] = {"state": "heat", "attributes": {"temperature": 15.0, "current_temperature": 21.0}}
+    ha.set_sensor("sensor.floor", 21.0)
+    rec = _run(eng)[0]
+    assert rec["commandAction"] == "OFF" and rec["safetyReason"] == "P000_FLOOR_PREDICTED_LIMIT"
+    assert eng.db.get_room(rm["roomName"])["controlMode"] == "AUTO"
 
 
 def test_floor_unconfigured_blocks_auto_and_live(tmp_path: Path):

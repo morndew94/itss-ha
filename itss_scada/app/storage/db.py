@@ -59,6 +59,7 @@ class ScadaDatabase:
                     has_floor_sensor INTEGER NOT NULL DEFAULT 0,
                     floor_estimate_enabled INTEGER NOT NULL DEFAULT 1,
                     floor_offset_c REAL NOT NULL DEFAULT 0.0,
+                    room_temp_offset_c REAL NOT NULL DEFAULT 0.0,
                     target_temp REAL NOT NULL DEFAULT 23.0,
                     control_mode TEXT NOT NULL DEFAULT 'AUTO',
                     manual_action TEXT NOT NULL DEFAULT 'HOLD',
@@ -122,6 +123,9 @@ class ScadaDatabase:
             # v2.8.0: 바닥 센서 없는 방의 추정 바닥값 사용 여부 (기존 방은 사용=1 유지)
             if "floor_estimate_enabled" not in cols:
                 conn.execute("ALTER TABLE rooms ADD COLUMN floor_estimate_enabled INTEGER NOT NULL DEFAULT 1")
+            # v2.9.1: 실내 센서 보정값 (기존 방은 0 = 보정 없음)
+            if "room_temp_offset_c" not in cols:
+                conn.execute("ALTER TABLE rooms ADD COLUMN room_temp_offset_c REAL NOT NULL DEFAULT 0.0")
             cycle_cols = {r[1] for r in conn.execute("PRAGMA table_info(cycles)").fetchall()}
             for col, col_type in _CYCLE_EXTRA_COLUMNS.items():
                 if col not in cycle_cols:
@@ -203,9 +207,9 @@ class ScadaDatabase:
                 """
                 INSERT INTO rooms (
                     room_name, room_temp_entity, climate_entity, window_sensor_entity,
-                    has_floor_sensor, floor_estimate_enabled, floor_offset_c, target_temp,
+                    has_floor_sensor, floor_estimate_enabled, floor_offset_c, room_temp_offset_c, target_temp,
                     control_mode, manual_action, weight, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(room_name) DO UPDATE SET
                     room_temp_entity=excluded.room_temp_entity,
                     climate_entity=excluded.climate_entity,
@@ -213,6 +217,7 @@ class ScadaDatabase:
                     has_floor_sensor=excluded.has_floor_sensor,
                     floor_estimate_enabled=excluded.floor_estimate_enabled,
                     floor_offset_c=excluded.floor_offset_c,
+                    room_temp_offset_c=excluded.room_temp_offset_c,
                     target_temp=excluded.target_temp,
                     control_mode=excluded.control_mode,
                     manual_action=excluded.manual_action,
@@ -227,6 +232,7 @@ class ScadaDatabase:
                     1 if room.get("hasFloorSensor") else 0,
                     1 if room.get("floorEstimateEnabled", True) else 0,
                     float(room.get("floorOffsetC", 0.0)),
+                    round(float(room.get("roomTempOffsetC", 0.0) or 0.0), 2),
                     round(float(room.get("targetTemp", 23.0)), 1),
                     str(room.get("controlMode", "AUTO")).upper(),
                     str(room.get("manualAction", "HOLD")).upper(),
@@ -245,6 +251,7 @@ class ScadaDatabase:
         manual_action: str | None = None,
         floor_offset_c: float | None = None,
         floor_estimate_enabled: bool | None = None,
+        room_temp_offset_c: float | None = None,
     ) -> dict[str, Any] | None:
         existing = self.get_room(room_name)
         if not existing:
@@ -259,6 +266,8 @@ class ScadaDatabase:
             existing["floorOffsetC"] = round(float(floor_offset_c), 2)
         if floor_estimate_enabled is not None:
             existing["floorEstimateEnabled"] = bool(floor_estimate_enabled)
+        if room_temp_offset_c is not None:
+            existing["roomTempOffsetC"] = round(float(room_temp_offset_c), 2)
         return self.upsert_room(existing)
 
     def delete_room(self, room_name: str) -> bool:
@@ -288,6 +297,7 @@ class ScadaDatabase:
             "hasFloorSensor": bool(row["has_floor_sensor"]),
             "floorEstimateEnabled": bool(row["floor_estimate_enabled"]) if "floor_estimate_enabled" in row.keys() else True,
             "floorOffsetC": row["floor_offset_c"],
+            "roomTempOffsetC": row["room_temp_offset_c"] if "room_temp_offset_c" in row.keys() else 0.0,
             "targetTemp": row["target_temp"],
             "controlMode": row["control_mode"],
             "manualAction": row["manual_action"],
@@ -349,21 +359,20 @@ class ScadaDatabase:
                 ).fetchall()
         return [json.loads(r["payload_json"]) for r in rows]
 
-    def list_cycles_since(self, since_iso: str, room_name: str | None = None) -> list[dict[str, Any]]:
-        """since_iso 이후 전체 payload (오래된 순). 학습/피팅용."""
+    def list_cycles_since(
+        self, since_iso: str, room_name: str | None = None, until_iso: str | None = None
+    ) -> list[dict[str, Any]]:
+        """since_iso 이후 (until_iso 지정 시 그 시각까지) 전체 payload (오래된 순). 학습/피팅/보정용."""
+        sql = "SELECT payload_json FROM cycles WHERE execution_started_at >= ?"
+        args: list[Any] = [since_iso]
+        if until_iso:
+            sql += " AND execution_started_at <= ?"
+            args.append(until_iso)
+        if room_name:
+            sql += " AND room_name = ?"
+            args.append(room_name)
         with self._connect() as conn:
-            if room_name:
-                rows = conn.execute(
-                    "SELECT payload_json FROM cycles WHERE room_name = ? AND execution_started_at >= ? "
-                    "ORDER BY execution_started_at ASC",
-                    (room_name, since_iso),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT payload_json FROM cycles WHERE execution_started_at >= ? "
-                    "ORDER BY execution_started_at ASC",
-                    (since_iso,),
-                ).fetchall()
+            rows = conn.execute(sql + " ORDER BY execution_started_at ASC", args).fetchall()
         return [json.loads(r["payload_json"]) for r in rows]
 
     def stats_rows_since(self, since_iso: str) -> list[dict[str, Any]]:
@@ -372,7 +381,8 @@ class ScadaDatabase:
             rows = conn.execute(
                 """
                 SELECT room_name, execution_started_at, saved_at, command_action, safety_reason,
-                       room_temp, target_temp, effective_target, combustion_confirmed, dry_run
+                       room_temp, target_temp, effective_target, combustion_confirmed, dry_run,
+                       floor_temp, floor_sensor_source, outdoor_temp
                 FROM cycles WHERE execution_started_at >= ?
                 ORDER BY execution_started_at ASC
                 """,
@@ -393,6 +403,9 @@ class ScadaDatabase:
                 "effectiveTargetTemp": r["effective_target"],
                 "combustionConfirmed": None if comb is None else bool(comb),
                 "dryRun": None if dry is None else bool(dry),
+                "floorTemp": r["floor_temp"],
+                "floorSrc": r["floor_sensor_source"],
+                "outdoorTemp": r["outdoor_temp"],
             })
         return out
 

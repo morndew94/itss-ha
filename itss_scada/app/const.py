@@ -3,7 +3,7 @@
 from datetime import timedelta, timezone
 
 DOMAIN = "itss"
-VERSION = "2.9.0"
+VERSION = "2.9.1"
 
 # Korea Standard Time (UTC+9)
 KST = timezone(timedelta(hours=9))
@@ -69,6 +69,42 @@ FLOOR_RISE_RATE_MIN_C_PER_MIN = 0.05   # 학습값 하한
 FLOOR_RISE_RATE_MAX_C_PER_MIN = 0.80   # 학습값 상한
 FLOOR_RATE_MIN_RUN_MIN = 3.0           # 이보다 짧은 펄스는 상승률 학습에서 제외 (공급수 잔열이 지배)
 FLOOR_PEAK_MARGIN_C = 0.2              # 예측 피크가 (바닥 상한 - 여유) 이상이면 시작 금지/차단
+
+# v2.9.1 외부 조작(월패드/다른 HA 자동화)으로 켜진 난방: 이 시간 동안 유지 후 자동 중지 (분)
+# 0 이면 v2.9.0 이전처럼 다음 회차에 즉시 ITSS 판정으로 되돌림
+EXTERNAL_BOOST_DEFAULT_MIN = 15
+EXTERNAL_BOOST_MAX_MIN = 60
+
+# ITSS 수동 HEAT 1회 최대 가동 (분): 경과 / 바닥 예측 상한 / 외부에서 끔 / 과열 시 자동 제어(AUTO) 복귀
+MANUAL_HEAT_DEFAULT_MIN = 15
+MANUAL_HEAT_MAX_MIN = 60
+
+# 바닥 최저 온도(쾌적) 유지: 설정값 floorMinC (0 = 사용 안 함) 미만이면 바닥 기준 그룹(방3/방2) 보충 가동
+FLOOR_MIN_MAX_C = 23.0          # 설정 상한 (바닥 상한 - 여유와 겹치지 않도록)
+FLOOR_MIN_HYST_C = 1.0          # 보충 가동 목표 피크 = 바닥 최저 + 1.0°C (상승률 모델: 시작 바닥 + rate x 가동 분)
+FLOOR_MIN_AIR_MARGIN_C = 0.3    # 그룹 실내 편차가 +0.3°C 이상이면 바닥 보충 안 함 (공기 과열 방지)
+
+# 실내 센서 보정값 (°C): 제어에 쓰는 실내 온도 = 센서 원시값 + 보정값 (방별, 동시 비교 측정으로 결정)
+ROOM_TEMP_OFFSET_MAX_C = 3.0
+CALIBRATION_MIN_SPAN_H = 2.0      # 동시 비교 측정 최소 구간 (보고 주기 약 1시간 센서 고려)
+CALIBRATION_MIN_REPORTS = 3       # 센서별 최소 보고 횟수
+CALIBRATION_REF_SPREAD_WARN_C = 1.0  # 기준 온도 변동이 이보다 크면 보고 주기 차이로 오차 가능 경고
+
+# 쾌적 학습 (월패드 / ITSS 수동 ON = '추웠다' 신호) — 제안만, 자동 적용 안 함
+COMFORT_WINDOW_DAYS = 14          # 분석 구간
+COMFORT_KEEP_DAYS = 60            # 이벤트 보관 기간
+COMFORT_MAX_EVENTS = 500          # 이벤트 보관 최대 건수
+COMFORT_MIN_EVENTS = 3            # 제안에 필요한 최소 근거 건수
+COMFORT_AT_TARGET_DEV_C = -0.5    # 조작 시 (실내 - 실효 목표) 이 값 이상 = 목표 근처인데 추움 / 미만 = 난방 부족
+COMFORT_TARGET_MARGIN_C = 0.4     # 제안 목표 = 추위를 느낀 실내 온도 + 0.4 (제어 하한 -0.15 + 여유 0.25)
+COMFORT_TARGET_MAX_STEP_C = 1.0   # 1회 제안 최대 상향폭
+COMFORT_FLOOR_COLD_C = 21.5       # 조작 시 바닥이 이 값 미만이고 실내가 목표 근처면 '바닥이 차가움'
+COMFORT_FLOOR_MIN_LOW_C = 20.0    # 바닥 최저 온도 제안 하한
+
+# Gemini 일일 리포트 (자문 전용, 제어 미반영)
+DAILY_REPORT_DEFAULT_HOUR = 8     # KST 발송 시각
+DAILY_REPORT_SEND_WINDOW_H = 4    # 발송 시각부터 이 시간 안에만 자동 발송 (재시작 시 늦은 발송 방지)
+DAILY_REPORT_MAX_CHARS = 3500     # 텔레그램 4096자 제한 여유
 
 # HA 서비스 재전송 (상태가 이미 목표와 같으면 생략, 단 이 주기마다 1회 재동기화)
 DISPATCH_RESEND_MIN = 30.0

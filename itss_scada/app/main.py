@@ -17,7 +17,14 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
+from . import comfort
 from .const import (
+    CALIBRATION_MIN_REPORTS,
+    CALIBRATION_MIN_SPAN_H,
+    CALIBRATION_REF_SPREAD_WARN_C,
+    DAILY_REPORT_DEFAULT_HOUR,
+    DAILY_REPORT_MAX_CHARS,
+    DAILY_REPORT_SEND_WINDOW_H,
     DEFAULT_ALLOWED_CLIENT_IPS,
     DEFAULT_CONTROL_BAND_HALF,
     DEFAULT_FLOOR_RISE_RATE_C_PER_MIN,
@@ -28,13 +35,21 @@ from .const import (
     DEFAULT_OVERHEAT_ROOM_C,
     DEFAULT_RECHECK_DELAY_SEC,
     DISPATCH_RESEND_MIN,
+    EXTERNAL_BOOST_DEFAULT_MIN,
+    EXTERNAL_BOOST_MAX_MIN,
+    FLOOR_MIN_AIR_MARGIN_C,
+    FLOOR_MIN_HYST_C,
+    FLOOR_MIN_MAX_C,
     FLOOR_PEAK_MARGIN_C,
     HEAT_SETPOINT_MAX_BOOST_C,
     KST,
     LOOP_FAILURE_ALERT_COUNT,
+    MANUAL_HEAT_DEFAULT_MIN,
+    MANUAL_HEAT_MAX_MIN,
     MIN_PULSE_MIN,
     MODEL_ADAPTIVE_RC,
     MODEL_LINEAR_V12,
+    ROOM_TEMP_OFFSET_MAX_C,
     STRATEGY_HYBRID,
     THERMOSTAT_SETPOINT_STEP,
     UNDERHEAT_ALERT_MIN,
@@ -43,7 +58,12 @@ from .const import (
 )
 from .debug_trace import TraceWriter, configure_logging, tail_log
 from .ha_client import HomeAssistantClient
-from .integrations.google_gemini_advisor import GeminiThermalAdvisor, compute_daily_kpis
+from .integrations.google_gemini_advisor import (
+    GeminiThermalAdvisor,
+    compute_daily_kpis,
+    compute_room_daily_stats,
+    format_daily_report_text,
+)
 from .integrations.google_weather import FallbackWeatherProvider
 from .integrations.notifications import PushNotifier
 from .models.schema import CycleRecord, SensorSnapshot, ThermalInput, now_kst_iso
@@ -122,6 +142,14 @@ REASON_KO = {
     "GROUP_NO_ROOM_DATA": "동시 제어 그룹 실내 온도 없음(대기)",
     "GROUP_MEMBER_WARM_SKIP": "그룹 가열 중이나 이 방은 목표 상한 이상(이 방만 개별 정지)",
     "GROUP_LEADER_UNAVAILABLE": "바닥 기준 방 판정 실패(동시 제어 안전 정지)",
+    "MANUAL_HEAT_TIMEOUT": "수동 난방 설정 시간 경과(자동 중지 · 자동 제어 복귀)",
+    "MANUAL_HEAT_CANCELLED": "수동 난방 중 외부에서 끔(자동 제어 복귀)",
+    "GROUP_FLOOR_MIN_HEAT": "바닥 최저 온도 미만(바닥 기준 그룹 보충 가동)",
+    "GROUP_FLOOR_MIN_CONTINUE": "바닥 최저 온도 보충 가동 지속",
+    "GROUP_FLOOR_MIN_REACHED": "바닥 최저 온도 보충 목표 도달 예측(그룹 정지)",
+    "EXTERNAL_BOOST": "외부 조작(월패드/다른 자동화)으로 켜짐 감지(설정 시간 가동 후 자동 중지)",
+    "EXTERNAL_BOOST_END": "외부 조작 가동 시간 종료(자동 중지, 잔열 휴지 진입)",
+    "EXTERNAL_BOOST_CANCELLED": "외부 조작 가동 종료(외부에서 끔 또는 조절기 자체 설정온도 도달)",
     "INTERNAL_ERROR": "내부 처리 오류(로그 확인 필요)",
 }
 
@@ -146,6 +174,9 @@ COOLDOWN_REASONS = (
     "P200_PREDICTIVE_OFF",
     "HYBRID_EARLY_CUTOFF",
     "GROUP_TARGET_REACHED",
+    "EXTERNAL_BOOST_END",
+    "GROUP_FLOOR_MIN_REACHED",
+    "MANUAL_HEAT_TIMEOUT",
 )
 
 # 애드온 옵션 키 -> 내부 설정 키
@@ -181,6 +212,11 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
     "maxRunCapMin": 15,
     "cooldownMin": 20,
     "ventilationHoldMin": 20,
+    "externalBoostMin": EXTERNAL_BOOST_DEFAULT_MIN,
+    "manualHeatMaxMin": MANUAL_HEAT_DEFAULT_MIN,
+    "floorMinC": 0.0,
+    "dailyReportEnabled": True,
+    "dailyReportHour": DAILY_REPORT_DEFAULT_HOUR,
     "historyRetentionDays": 30,
     "gasKrwPerHour": 1200,
     "notifyEvents": True,
@@ -283,6 +319,9 @@ class RoomCreateRequest(BaseModel):
     hasFloorSensor: bool = False
     floorEstimateEnabled: bool = True  # 바닥 센서 없는 방: 마스터 실측 + offset 추정 사용 여부
     floorOffsetC: float = Field(default=0.0, ge=-5.0, le=5.0)
+    # 실내 센서 보정값 (°C): 제어용 실내 온도 = 센서 원시값 + 보정값
+    # 미지정(None)이면 같은 이름 재등록 시 기존 보정값 유지
+    roomTempOffsetC: float | None = Field(default=None, ge=-ROOM_TEMP_OFFSET_MAX_C, le=ROOM_TEMP_OFFSET_MAX_C)
     targetTemp: float = Field(default=23.0, ge=10.0, le=27.0)
     controlMode: str = Field(default="AUTO", pattern="^(AUTO|MANUAL)$")
     manualAction: str = Field(default="HOLD", pattern="^(HEAT|OFF|HOLD)$")
@@ -295,6 +334,7 @@ class RoomPatchRequest(BaseModel):
     manualAction: str | None = Field(default=None, pattern="^(HEAT|OFF|HOLD)$")
     floorOffsetC: float | None = Field(default=None, ge=-5.0, le=5.0)
     floorEstimateEnabled: bool | None = None
+    roomTempOffsetC: float | None = Field(default=None, ge=-ROOM_TEMP_OFFSET_MAX_C, le=ROOM_TEMP_OFFSET_MAX_C)
 
 
 class SettingsPatchRequest(BaseModel):
@@ -310,9 +350,29 @@ class SettingsPatchRequest(BaseModel):
     maxRunCapMin: int | None = Field(default=None, ge=3, le=15)
     cooldownMin: int | None = Field(default=None, ge=5, le=90)
     ventilationHoldMin: int | None = Field(default=None, ge=5, le=60)
+    # 외부 조작 가동 유지 시간 (0 = 즉시 되돌림)
+    externalBoostMin: int | None = Field(default=None, ge=0, le=EXTERNAL_BOOST_MAX_MIN)
+    # ITSS 수동 HEAT 1회 최대 가동 (분)
+    manualHeatMaxMin: int | None = Field(default=None, ge=5, le=MANUAL_HEAT_MAX_MIN)
+    # 바닥 최저 온도 (°C, 0 = 사용 안 함)
+    floorMinC: float | None = Field(default=None, ge=0.0, le=FLOOR_MIN_MAX_C)
+    # Gemini 일일 리포트 자동 발송 (KST 시각)
+    dailyReportEnabled: bool | None = None
+    dailyReportHour: int | None = Field(default=None, ge=0, le=23)
     historyRetentionDays: int | None = Field(default=None, ge=1, le=365)
     gasKrwPerHour: int | None = Field(default=None, ge=100, le=10000)
     notifyEvents: bool | None = None
+
+
+class SensorCalibrationRequest(BaseModel):
+    """동시 비교 측정 구간 (센서를 한곳에 모아 둔 시간)."""
+
+    start: str = Field(..., min_length=10, max_length=40)
+    end: str = Field(..., min_length=10, max_length=40)
+    # 비우면 전체 센서 중앙값(합의) 기준, 방 이름이면 그 방 센서(현재 보정 포함) 기준
+    reference: str = Field(default="", max_length=40)
+    # 기준 온도계 판독값 (°C, 선택) — 주면 이 값이 기준
+    referenceTempC: float | None = Field(default=None, ge=0.0, le=40.0)
 
 
 class PresetRequest(BaseModel):
@@ -509,6 +569,9 @@ class ItssEngine:
         self.room_timers: dict[str, dict[str, Any]] = self.db.get_kv("room_timers", {}) or {}
         self.sensor_tracks: dict[str, dict[str, Any]] = self.db.get_kv("sensor_tracks", {}) or {}
         self.lag_profiles: dict[str, dict[str, Any]] = {}
+        # v2.9.1 쾌적 학습 이벤트 (월패드/ITSS 수동 ON = '추웠다' 신호)
+        self.comfort_events: list[dict[str, Any]] = self.db.get_kv("comfort_events", []) or []
+        self._report_task: asyncio.Task | None = None
         self._cycle_seq: int = 0
         self.cycle_lock = asyncio.Lock()
         self.loop_state: dict[str, Any] = {
@@ -540,6 +603,216 @@ class ItssEngine:
         self.refresh_lag_profiles()
         self._restore_cooldowns_from_history()
         self.prune_history()
+
+    # ------------------------------------------------------------------ 쾌적 학습 (v2.9.1)
+    def _record_comfort_event(
+        self,
+        *,
+        now: datetime,
+        room: dict[str, Any],
+        source: str,
+        t: dict[str, Any],
+        outdoor_temp: float | None,
+    ) -> None:
+        """월패드/ITSS 수동 ON 1건을 '추웠다' 신호로 저장 (제안 학습용, 제어 미반영)."""
+        ev = comfort.make_event(
+            now=now,
+            room=room["roomName"],
+            source=source,
+            room_temp_raw=t.get("roomTempRaw"),
+            room_offset_c=float(t.get("roomTempOffsetC") or 0.0),
+            target_temp=float(room["targetTemp"]),
+            eff_target=float(t["effTarget"]),
+            floor_temp=t.get("guardFloor") if t.get("guardFloor") is not None else t.get("effFloor"),
+            floor_src=t.get("floorSrc"),
+            outdoor_temp=outdoor_temp,
+        )
+        self.comfort_events = comfort.append_event(self.comfort_events, ev, now=now)
+        self.db.set_kv("comfort_events", self.comfort_events)
+        _LOGGER.info(
+            "[%s] 쾌적 학습 신호(%s): 실내 %s°C (원시 %s + 보정 %+.1f) 실효 목표 %.2f°C 바닥 %s°C(%s)",
+            room["roomName"], comfort.SOURCE_LABEL.get(source, source), ev["roomTemp"], ev["roomTempRaw"],
+            float(ev["roomOffsetC"] or 0.0), ev["effTarget"], ev["floorTemp"], ev["floorSrc"],
+        )
+
+    def comfort_analysis(self, now: datetime | None = None) -> dict[str, Any]:
+        now = now or datetime.now(tz=KST)
+        rooms = {rm["roomName"]: rm for rm in self.db.list_rooms()}
+        return comfort.analyze(
+            self.comfort_events, rooms, now=now, floor_min_c=float(self.settings.get("floorMinC") or 0.0)
+        )
+
+    # ------------------------------------------------------------------ 실내 센서 보정 (v2.9.1)
+    def compute_sensor_offsets(
+        self, start: datetime, end: datetime, *, reference: str = "", reference_temp_c: float | None = None
+    ) -> dict[str, Any]:
+        """센서를 한곳에 모아 둔 구간의 원시값 중앙값으로 방별 보정값을 계산 (적용은 사용자가)."""
+        rooms = {rm["roomName"]: rm for rm in self.db.list_rooms()}
+        rows = self.db.list_cycles_since(
+            start.isoformat(timespec="seconds"), until_iso=end.isoformat(timespec="seconds")
+        )
+        per: dict[str, dict[str, Any]] = {}
+        for c in rows:
+            name = c.get("roomName")
+            if name not in rooms or c.get("roomTemp") is None:
+                continue
+            off = float(((c.get("diagnostics") or {}).get("roomTempOffsetC")) or 0.0)
+            d = per.setdefault(name, {"raw": [], "reports": set()})
+            d["raw"].append(float(c["roomTemp"]) - off)
+            if c.get("sensorMeasuredAtRoom"):
+                d["reports"].add(str(c["sensorMeasuredAtRoom"]))
+        out_rooms: list[dict[str, Any]] = []
+        medians: dict[str, float] = {}
+        for name in rooms:
+            d = per.get(name)
+            if not d or not d["raw"]:
+                out_rooms.append({"room": name, "status": "NO_DATA", "samples": 0, "reports": 0,
+                                  "currentOffsetC": rooms[name].get("roomTempOffsetC", 0.0)})
+                continue
+            vals = sorted(d["raw"])
+            med = vals[len(vals) // 2] if len(vals) % 2 else (vals[len(vals) // 2 - 1] + vals[len(vals) // 2]) / 2.0
+            p10 = vals[int(0.1 * (len(vals) - 1))]
+            p90 = vals[int(round(0.9 * (len(vals) - 1)))]
+            ok = len(d["reports"]) >= CALIBRATION_MIN_REPORTS
+            if ok:
+                medians[name] = med
+            out_rooms.append({
+                "room": name,
+                "status": "OK" if ok else "FEW_REPORTS",
+                "samples": len(vals),
+                "reports": len(d["reports"]),
+                "rawMedianC": round(med, 2),
+                "spreadC": round(p90 - p10, 2),
+                "currentOffsetC": rooms[name].get("roomTempOffsetC", 0.0),
+            })
+        warnings: list[str] = []
+        ref_label: str
+        if reference_temp_c is not None:
+            ref_val: float | None = float(reference_temp_c)
+            ref_label = f"기준 온도계 {reference_temp_c:.1f}°C"
+        elif reference:
+            if reference not in medians:
+                ref_val = None
+                warnings.append(f"기준 방 '{reference}' 센서 데이터 부족")
+            else:
+                ref_val = medians[reference] + float(rooms[reference].get("roomTempOffsetC") or 0.0)
+            ref_label = f"{reference} 센서(현재 보정 포함)"
+        else:
+            ms = sorted(medians.values())
+            ref_val = (ms[len(ms) // 2] if len(ms) % 2 else (ms[len(ms) // 2 - 1] + ms[len(ms) // 2]) / 2.0) if ms else None
+            ref_label = "전체 센서 중앙값(합의 기준 — 센서 평균이 정확하다는 가정)"
+            if len(ms) < 3:
+                warnings.append("합의 기준은 센서 3개 이상일 때 의미가 있습니다 (기준 온도계 또는 기준 방 지정 권장)")
+        for r in out_rooms:
+            if ref_val is not None and r["room"] in medians:
+                r["suggestedOffsetC"] = round(max(-ROOM_TEMP_OFFSET_MAX_C, min(ROOM_TEMP_OFFSET_MAX_C, ref_val - medians[r["room"]])), 1)
+            else:
+                r["suggestedOffsetC"] = None
+            if r.get("spreadC") is not None and r["spreadC"] > CALIBRATION_REF_SPREAD_WARN_C:
+                warnings.append(
+                    f"{r['room']}: 구간 중 변동 {r['spreadC']:.1f}°C — 온도가 안정된 구간(난방 정지, 밤)으로 다시 측정 권장"
+                )
+            if r["status"] == "FEW_REPORTS":
+                warnings.append(f"{r['room']}: 보고 {r['reports']}회 — 최소 {CALIBRATION_MIN_REPORTS}회 필요 (구간 연장)")
+        return {
+            "start": start.isoformat(timespec="seconds"),
+            "end": end.isoformat(timespec="seconds"),
+            "reference": {"label": ref_label, "valueC": None if ref_val is None else round(ref_val, 2)},
+            "rooms": out_rooms,
+            "warnings": warnings,
+        }
+
+    # ------------------------------------------------------------------ Gemini 일일 리포트 (v2.9.1)
+    def build_daily_report_context(self, now: datetime | None = None) -> dict[str, Any]:
+        """지난 24시간 기록 요약 (결정론적 계산, Gemini 입력 겸 리포트 본문)."""
+        now = now or datetime.now(tz=KST)
+        since_dt = now - timedelta(hours=24)
+        rows = self.db.stats_rows_since(since_dt.isoformat(timespec="seconds"))
+        rooms = self.db.list_rooms()
+        first = _parse_ts(rows[0]["executionStartedAt"]) if rows else None
+        floors = [r["floorTemp"] for r in rows if r.get("floorTemp") is not None and r.get("floorSrc") == "MEASURED"]
+        outs = [r["outdoorTemp"] for r in rows if r.get("outdoorTemp") is not None]
+        recent = comfort.recent_events(self.comfort_events, since=since_dt)
+        analysis = self.comfort_analysis(now)
+        return {
+            "periodStart": since_dt.isoformat(timespec="minutes"),
+            "periodEnd": now.isoformat(timespec="minutes"),
+            "coverageHours": round((now - first).total_seconds() / 3600.0, 1) if first else 0.0,
+            "kpis": compute_daily_kpis(rows),
+            "boiler": compute_boiler_stats(
+                rows, interval_sec=self.settings["updateIntervalSec"], gas_krw_per_hour=self.settings["gasKrwPerHour"]
+            ),
+            "rooms": compute_room_daily_stats(rows, interval_sec=self.settings["updateIntervalSec"]),
+            "floorRangeC": [round(min(floors), 1), round(max(floors), 1)] if floors else None,
+            "outdoorRangeC": [round(min(outs), 1), round(max(outs), 1)] if outs else None,
+            "userHeatRequests": [
+                {
+                    "at": str(e.get("at"))[11:16],
+                    "room": e.get("room"),
+                    "source": comfort.SOURCE_LABEL.get(str(e.get("source")), e.get("source")),
+                    "roomTemp": e.get("roomTemp"),
+                    "effTarget": e.get("effTarget"),
+                    "floorTemp": e.get("floorTemp"),
+                }
+                for e in recent
+            ],
+            "comfortSuggestions": analysis["suggestions"],
+            "roomConfig": {
+                rm["roomName"]: {
+                    "targetTemp": rm["targetTemp"],
+                    "mode": rm["controlMode"],
+                    "sensorOffsetC": rm.get("roomTempOffsetC", 0.0),
+                }
+                for rm in rooms
+            },
+            "settings": {
+                k: self.settings.get(k)
+                for k in ("floorMinC", "floorOffLimitC", "externalBoostMin", "manualHeatMaxMin", "maxRunCapMin",
+                          "cooldownMin", "dryRun")
+            },
+        }
+
+    def daily_report_due(self, now: datetime) -> bool:
+        if not self.settings.get("dailyReportEnabled", True):
+            return False
+        hour = int(self.settings.get("dailyReportHour", DAILY_REPORT_DEFAULT_HOUR))
+        if (now.hour - hour) % 24 >= DAILY_REPORT_SEND_WINDOW_H:
+            return False
+        last = self.db.get_kv("daily_report_last") or {}
+        return last.get("date") != now.strftime("%Y-%m-%d")
+
+    async def create_daily_report(self, now: datetime | None = None, *, send: bool = False) -> dict[str, Any]:
+        """24시간 요약 + Gemini 분석(키 있을 때) 생성, send=True 면 알림 발송."""
+        now = now or datetime.now(tz=KST)
+        ctx = self.build_daily_report_context(now)
+        ai = await asyncio.to_thread(self.advisor.generate_daily_report, ctx)
+        text = format_daily_report_text(ctx, ai.get("report"))[:DAILY_REPORT_MAX_CHARS]
+        result = {"kpis": ctx["kpis"], "report": ai.get("report"), "status": ai.get("status"), "text": text,
+                  "context": ctx}
+        if send:
+            await self._safe_notify(f"📊 I.T.S.S. 일일 리포트 ({now.strftime('%m/%d')})", text)
+            result["sent"] = True
+        _LOGGER.info("일일 리포트 생성 (Gemini=%s, 발송=%s, %d자)", ai.get("status"), send, len(text))
+        return result
+
+    def maybe_start_daily_report(self, now: datetime | None = None) -> bool:
+        """발송 시각이면 백그라운드로 리포트 발송 (제어 루프를 막지 않음, 하루 1회)."""
+        now = now or datetime.now(tz=KST)
+        if self._report_task is not None and not self._report_task.done():
+            return False
+        if not self.daily_report_due(now):
+            return False
+        # 실패해도 같은 날 반복 발송하지 않도록 먼저 기록
+        self.db.set_kv("daily_report_last", {"date": now.strftime("%Y-%m-%d"), "startedAt": now.isoformat(timespec="seconds")})
+
+        async def _run() -> None:
+            try:
+                await self.create_daily_report(now, send=True)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("일일 리포트 생성/발송 실패")
+
+        self._report_task = asyncio.create_task(_run())
+        return True
 
     # ------------------------------------------------------------------ 공통 유틸
     @property
@@ -920,7 +1193,13 @@ class ItssEngine:
         """
         members = [
             rm for rm in rooms
-            if rm["controlMode"] == "AUTO" and telemetry[rm["roomName"]]["floorSrc"] in ("MEASURED", "ESTIMATED")
+            if rm["controlMode"] == "AUTO"
+            and telemetry[rm["roomName"]]["floorSrc"] in ("MEASURED", "ESTIMATED")
+            # 단독 외부 조작 가동 방은 그룹에서 제외 (바닥 공유 방 연동 외부 조작은 그룹으로 함께 가동)
+            and not (
+                telemetry[rm["roomName"]].get("externalBoost")
+                and not telemetry[rm["roomName"]].get("externalBoostGroup")
+            )
         ]
         if not members:
             return None
@@ -1230,6 +1509,104 @@ class ItssEngine:
                 tm.pop(k, None)
         return None
 
+    @staticmethod
+    def _clear_external_boost(tm: dict[str, Any]) -> None:
+        tm.pop("externalBoostUntil", None)
+        tm.pop("externalBoostStartedAt", None)
+        tm.pop("externalBoostGroup", None)
+
+    def _update_external_boost(
+        self, rm: dict[str, Any], tm: dict[str, Any], *, is_heating: bool, now: datetime
+    ) -> str | None:
+        """v2.9.1 외부 조작(월패드/다른 HA 자동화)으로 켜진 난방 감지와 유지 상태.
+
+        감지 (AUTO 방): 직전 회차 관측 비가동 -> 이번 관측 가동 이면서 ITSS 마지막 명령이 HEAT 가 아님.
+        ITSS 의 OFF 명령이 조절기에 반영되지 않은 경우는 직전 관측도 '가동' 이므로 외부 조작으로 오인하지 않는다.
+        반환: START(감지) / ACTIVE(유지 중) / END(시간 종료) / CANCELLED(외부에서 끔) / None
+        """
+        boost_min = int(self.settings.get("externalBoostMin", EXTERNAL_BOOST_DEFAULT_MIN) or 0)
+        until = _parse_ts(tm.get("externalBoostUntil"))
+        if rm["controlMode"] != "AUTO" or boost_min <= 0:
+            if until is not None:
+                self._clear_external_boost(tm)
+            return None
+        if until is not None:
+            if now >= until:
+                return "END"
+            # 가동이 한 번이라도 관측된 뒤 꺼진 경우만 '외부에서 끔' (연동 방의 ITSS HEAT 미반영은 재전송)
+            if not is_heating and tm.get("lastObservedHeating") is True:
+                return "CANCELLED"
+            return "ACTIVE"
+        if is_heating and tm.get("lastObservedHeating") is False and tm.get("lastCommandAction") != "HEAT":
+            tm["externalBoostStartedAt"] = now.isoformat(timespec="seconds")
+            tm["externalBoostUntil"] = (now + timedelta(minutes=boost_min)).isoformat(timespec="seconds")
+            return "START"
+        return None
+
+    def _link_floor_group_boost(self, rooms: list[dict[str, Any]], telemetry: dict[str, dict[str, Any]]) -> None:
+        names = [
+            rm["roomName"] for rm in rooms
+            if rm["controlMode"] == "AUTO" and telemetry[rm["roomName"]]["floorSrc"] in ("MEASURED", "ESTIMATED")
+        ]
+        events = {n: telemetry[n].get("externalBoost") for n in names if telemetry[n].get("externalBoost")}
+        if not events:
+            return
+        vals = set(events.values())
+        if "CANCELLED" in vals:
+            g_event = "CANCELLED"
+        elif "END" in vals:
+            g_event = "END"
+        elif "ACTIVE" in vals:
+            g_event = "ACTIVE"  # 진행 중 연동에 새로 들어온 방은 같은 종료 시각으로 합류
+        else:
+            g_event = "START"
+        # 시작/진행 중이면 종료 시각 기준 방 (START 방 또는 이미 진행 중인 방)
+        src = next((n for n in names if events.get(n) == g_event), None)
+        src_tm = self.room_timers.get(src, {}) if src else {}
+        for n in names:
+            tm_n = self.room_timers.setdefault(n, {"heatingStartedAt": None, "cooldownUntil": None})
+            if g_event in ("START", "ACTIVE"):
+                tm_n["externalBoostUntil"] = src_tm.get("externalBoostUntil")
+                tm_n["externalBoostStartedAt"] = src_tm.get("externalBoostStartedAt")
+            tm_n["externalBoostGroup"] = True
+            telemetry[n]["externalBoost"] = g_event
+            telemetry[n]["externalBoostGroup"] = True
+
+    @staticmethod
+    def _apply_floor_min(
+        action: str,
+        reason: str,
+        *,
+        floor_min_c: float,
+        floor_c: float | None,
+        dev_c: float | None,
+        is_heating: bool,
+        start_floor_c: float | None,
+        run_min: float,
+        rise_rate_c_per_min: float,
+    ) -> tuple[str, str]:
+        """바닥 최저 온도 유지 (그룹 수요 보정).
+
+        - 비가열: 바닥 < floorMinC 이고 그룹 실내 편차 < +0.3°C 이면 보충 가동 시작
+        - 가열 중: 상승률 모델 예측 피크(시작 바닥 + rate x 가동 분)가 floorMinC + 1.0°C 에 닿을 때까지 유지
+        바닥 상한/과열/잔열 휴지 등 안전 판정은 기준 방 sentinel 이 그대로 적용한다.
+        """
+        if floor_min_c <= 0 or floor_c is None or dev_c is None or action == "HEAT":
+            return action, reason
+        if dev_c >= FLOOR_MIN_AIR_MARGIN_C:
+            return action, reason
+        target_peak = floor_min_c + FLOOR_MIN_HYST_C
+        if not is_heating:
+            if floor_c < floor_min_c:
+                return "HEAT", "GROUP_FLOOR_MIN_HEAT"
+            return action, reason
+        start = start_floor_c if start_floor_c is not None else floor_c
+        if start >= target_peak:
+            return action, reason  # 바닥 최저와 무관한 가동 -> 실내 판정 그대로
+        if start + rise_rate_c_per_min * run_min < target_peak:
+            return "HEAT", "GROUP_FLOOR_MIN_CONTINUE"
+        return "OFF", "GROUP_FLOOR_MIN_REACHED"
+
     def _manual_heat_block_reason(
         self,
         t: dict[str, Any],
@@ -1237,8 +1614,13 @@ class ItssEngine:
         *,
         floor_age: float | None,
         floor_stale_sec: float,
+        floor_cap: float | None = None,
+        floor_rate: float | None = None,
+        poll_interval_min: float = 1.0,
     ) -> str | None:
         """수동 ON 에도 적용되는 최소 안전 조건 (센서 누락/stale, 바닥 상한 + 1.0°C 히스테리시스).
+
+        v2.9.1: 자동과 같은 바닥 상승률 예측 상한(시작 전/가동 중) 적용, 추정 방은 실측보다 낮게 보지 않음.
 
         v2.9.0: 독립 제어 방(ESTIMATE_OFF)은 바닥 기준이 없으므로 실내 센서 조건만 본다.
         """
@@ -1257,14 +1639,31 @@ class ItssEngine:
             floor_age is not None and floor_age > floor_stale_sec
         ):
             return "P000_SENSOR_STALE"
+        # 같은 바닥 공유 추정 방: 음수 offset 으로 실측보다 낮게 추정되어 혼자 재가열하던 문제 방지
+        adj = 0.0
+        if t["floorSrc"] == "ESTIMATED":
+            adj = max(0.0, -float((t.get("room") or {}).get("floorOffsetC") or 0.0))
+        g = float(t["guardFloor"]) + adj
         limit = float(self.settings["floorOffLimitC"])
         latched = bool(tm.get("manualFloorLatched"))
-        if t["guardFloor"] + t["floorLatency"] >= limit:
+        if g + t["floorLatency"] >= limit:
             latched = True
-        elif t["guardFloor"] <= limit - 1.0:
+        elif g <= limit - 1.0:
             latched = False
         tm["manualFloorLatched"] = latched
-        return "P000_FLOOR_LIMIT_OFF" if latched else None
+        if latched:
+            return "P000_FLOOR_LIMIT_OFF"
+        if floor_cap is not None and floor_rate is not None:
+            pred_limit = floor_cap - FLOOR_PEAK_MARGIN_C
+            if t["isHeating"]:
+                start = tm.get("heatingStartFloor")
+                start_c = (float(start) + adj) if start is not None else g
+                peak = max(g, start_c + floor_rate * (float(t["runMin"] or 0.0) + poll_interval_min))
+            else:
+                peak = g + floor_rate * MIN_PULSE_MIN
+            if peak >= pred_limit:
+                return "P000_FLOOR_PREDICTED_LIMIT"
+        return None
 
     # ------------------------------------------------------------------ 제어 루프
     async def run_control_cycle(self) -> list[dict[str, Any]]:
@@ -1441,7 +1840,12 @@ class ItssEngine:
         for rm in rooms:
             r_name = rm["roomName"]
             r_temp, r_ts, r_age, r_ts_src = await self._read_numeric(rm["roomTempEntity"])
+            # 센서 트랙(보고 주기/기울기)은 원시값으로 유지 — 보정값 변경 시 가짜 계단 변화 방지
             r_track = self._observe_sensor(rm["roomTempEntity"], f"실내[{r_name}]", r_temp, r_ts, r_ts_src, now)
+            r_raw = r_temp
+            r_off = float(rm.get("roomTempOffsetC") or 0.0)
+            if r_temp is not None and r_off:
+                r_temp = round(r_temp + r_off, 2)
             c_state = await self.ha.get_state(rm["climateEntity"])
             climate_states[r_name] = c_state
             hvac_mode = c_state.get("state") if c_state else None
@@ -1481,6 +1885,9 @@ class ItssEngine:
                 if cur_v is None or cur_v < rec_until:
                     tm["ventilationUntil"] = rec_until.isoformat(timespec="seconds")
             tm["wasWindowOpen"] = window_open
+
+            # v2.9.1 외부 조작 가동 감지 (가동 시작 시각/시작 바닥은 아래 공통 추적이 기록)
+            boost_event = self._update_external_boost(rm, tm, is_heating=bool(is_heating), now=now)
 
             # Track continuous heating duration per room based on real boiler state
             if is_heating:
@@ -1523,6 +1930,8 @@ class ItssEngine:
             telemetry[r_name] = {
                 "room": rm,
                 "roomTemp": r_temp,
+                "roomTempRaw": r_raw,
+                "roomTempOffsetC": r_off,
                 "roomTs": r_ts,
                 "roomAge": r_age,
                 "roomTsSource": r_track.get("tsSource"),
@@ -1560,10 +1969,19 @@ class ItssEngine:
                     (p200_by_room[r_name].diagnostics or {}).get("projected_coast") if r_name in p200_by_room else None
                 ),
                 "roomResidualRise": float(lag_prof.get("roomResidualRiseC", 0.0) or 0.0),
+                "externalBoost": boost_event,
             }
+            if boost_event == "START":
+                # 월패드/외부 자동화로 켬 = '추웠다' 신호 (감지한 방만, 연동 방 제외)
+                self._record_comfort_event(
+                    now=now, room=rm, source="WALLPAD", t=telemetry[r_name], outdoor_temp=outdoor_temp
+                )
 
             # 다중 방(hybrid/simultaneous) 계획은 바닥 기준 없는 독립 방만 대상 (그룹 방은 그룹 판정)
-            if rm["controlMode"] == "AUTO" and r_temp is not None and floor_src == "ESTIMATE_OFF":
+            if (
+                rm["controlMode"] == "AUTO" and r_temp is not None and floor_src == "ESTIMATE_OFF"
+                and boost_event is None  # 외부 조작 가동 방은 다중 방 계획(동시 합류 등)에서 제외
+            ):
                 auto_zone_readings.append(
                     ZoneReading(
                         room_name=r_name,
@@ -1576,6 +1994,10 @@ class ItssEngine:
                         floor_estimate_enabled=estimate_on,
                     )
                 )
+
+        # 바닥 공유 방(실측 + 추정, AUTO) 외부 조작 연동: 한 방이 월패드/자동화로 켜지면 같은 바닥 방 전체를
+        # 같은 종료 시각으로 함께 가동 (그룹 판정 경로 사용 -> 기준 방 바닥 안전/타이머 동기 그대로)
+        self._link_floor_group_boost(rooms, telemetry)
 
         # 독립 방 다중 방 계획 (마스터 바닥과 무관 — 바닥 센서 누락/과열에도 독립 방은 실내 기준 제어)
         mz_by_room: dict[str, Any] = {}
@@ -1605,9 +2027,32 @@ class ItssEngine:
                 ],
                 is_heating=bool(telemetry[group_plan["leader"]]["isHeating"]),
             )
+            demand, demand_reason = gd.action, gd.reason
+            lead_name = group_plan["leader"]
+            lead_t = telemetry[lead_name]
+            lead_tm = self.room_timers.get(lead_name, {})
+            lead_lag = self.lag_profiles.get(lead_name) or {}
+            demand, demand_reason = self._apply_floor_min(
+                demand,
+                demand_reason,
+                floor_min_c=float(self.settings.get("floorMinC") or 0.0),
+                floor_c=lead_t["guardFloor"],
+                dev_c=gd.weighted_dev_c,
+                is_heating=bool(lead_t["isHeating"]),
+                start_floor_c=lead_tm.get("heatingStartFloor"),
+                run_min=float(lead_t["runMin"] or 0.0),
+                rise_rate_c_per_min=float(lead_lag.get("floorRiseRateCPerMin") or DEFAULT_FLOOR_RISE_RATE_C_PER_MIN),
+            )
+            g_boost = lead_t.get("externalBoost") if lead_t.get("externalBoostGroup") else None
+            if g_boost in ("START", "ACTIVE"):
+                demand, demand_reason = "HEAT", "EXTERNAL_BOOST"
+            elif g_boost == "END":
+                demand, demand_reason = "OFF", "EXTERNAL_BOOST_END"
+            elif g_boost == "CANCELLED":
+                demand, demand_reason = "OFF", "EXTERNAL_BOOST_CANCELLED"
             group_plan.update(
-                {"demand": gd.action, "demandReason": gd.reason, "weightedDevC": gd.weighted_dev_c,
-                 "membersUsed": gd.members_used}
+                {"demand": demand, "demandReason": demand_reason, "weightedDevC": gd.weighted_dev_c,
+                 "membersUsed": gd.members_used, "externalBoost": g_boost}
             )
 
         # 기준 방을 먼저 판정해야 추종 방이 같은 명령을 따를 수 있음 (결과는 원래 방 순서로 반환)
@@ -1833,6 +2278,18 @@ class ItssEngine:
         room_cooldown_min = int(lag_prof.get("recommendedCooldownMin", self.settings["cooldownMin"]))
         poll_interval_min = max(0.5, float(self.settings["updateIntervalSec"]) / 60.0)
         decision_reason = "P000_OK"
+        boost_event = t.get("externalBoost")
+        boost_grouped = bool(t.get("externalBoostGroup"))  # 바닥 공유 방 연동 외부 조작 (그룹 경로로 판정)
+        group_boost_any = boost_grouped and bool(boost_event)  # 연동 외부 조작 회차: 최대 가동/휴지 우회
+        boost_hold = False  # True: 외부 조작 설정값 유지 (ITSS 미전송)
+        if boost_event:
+            record.diagnostics["externalBoost"] = boost_event
+            if boost_grouped:
+                record.diagnostics["externalBoostGroup"] = True
+        manual_heat = is_manual and rm["manualAction"] == "HEAT"
+        manual_end: str | None = None  # 수동 HEAT 종료 사유 (자동 제어 복귀)
+        if not manual_heat:
+            tm.pop("manualHeatSince", None)
 
         last_cmd = tm.get("lastCommandAction")
         last_switch = _parse_ts(tm.get("lastSwitchAt"))
@@ -1853,14 +2310,82 @@ class ItssEngine:
             record.execution_status = "SKIPPED_SAFETY"
             tm["heatingStartedAt"] = None
             tm["cooldownUntil"] = (now + timedelta(minutes=room_cooldown_min)).isoformat(timespec="seconds")
+            if manual_heat:
+                manual_end = decision_reason
+        elif boost_event in ("START", "ACTIVE") and not boost_grouped:
+            # v2.9.1 외부 조작 가동 유지: 잔열 휴지·1회 최대 가동·그룹/다중 방 수요 대신 설정 시간 유지.
+            # 실내 과열/창문/환기/센서 + 바닥 상승률 예측 상한(바닥 기준 방)은 그대로 적용.
+            verdict = sentinel.evaluate(
+                snapshot,
+                is_heating=True,
+                v_room_per_min=t["vRoomRate"],
+                v_floor_per_min=t["vFloor"],
+                continuous_run_min=t["runMin"],
+                max_run_min=None,
+                poll_interval_min=poll_interval_min,
+                cooldown_remaining_min=None,
+                window_open=t["windowOpen"],
+                drop_5m_room_c=t["drop5mRoom"],
+                drop_5m_floor_c=t["drop5mFloor"],
+                ventilation_remaining_min=t["ventMin"],
+                effective_floor_limit_c=None if sentinel_floor is None else eff_floor_limit,
+                expected_floor_surge_c=learned_floor_surge,
+                trend_10m_room_c=t["trend10mRoom"],
+                trend_10m_floor_c=t["trend10mFloor"],
+                room_stale_after_sec=t["roomStaleSec"],
+                floor_stale_after_sec=floor_stale_sec,
+                floor_latency_c=t["floorLatency"],
+                floor_optional=floor_optional,
+                floor_rise_rate_c_per_min=floor_rate if sentinel_floor is not None else None,
+                heating_start_floor_c=tm.get("heatingStartFloor"),
+                min_pulse_min=MIN_PULSE_MIN,
+            )
+            record.safety_reason = verdict.reason_code
+            if verdict.force_off:
+                decision_reason = verdict.reason_code
+                record.command_action = "OFF"
+                record.execution_status = "SKIPPED_SAFETY"
+                if verdict.reason_code == "P000_VENTILATION_PROTECT":
+                    tm["ventilationUntil"] = (
+                        now + timedelta(minutes=int(self.settings["ventilationHoldMin"]))
+                    ).isoformat(timespec="seconds")
+            else:
+                decision_reason = "EXTERNAL_BOOST"
+                record.command_action = "HEAT"
+                record.execution_status = "EXECUTED"
+                record.safety_reason = decision_reason
+                boost_hold = True
+        elif boost_event in ("END", "CANCELLED") and not boost_grouped:
+            decision_reason = "EXTERNAL_BOOST_END" if boost_event == "END" else "EXTERNAL_BOOST_CANCELLED"
+            record.command_action = "OFF"
+            record.execution_status = "EXECUTED"
+            record.safety_reason = decision_reason
         elif is_manual:
             manual_action = rm["manualAction"]
-            block = (
-                self._manual_heat_block_reason(t, tm, floor_age=floor_age_eff, floor_stale_sec=floor_stale_sec)
-                if manual_action == "HEAT"
-                else None
-            )
-            if block:
+            block = None
+            if manual_heat:
+                block = self._manual_heat_block_reason(
+                    t, tm, floor_age=floor_age_eff, floor_stale_sec=floor_stale_sec,
+                    floor_cap=floor_cap if guard_floor is not None else None,
+                    floor_rate=floor_rate if guard_floor is not None else None,
+                    poll_interval_min=poll_interval_min,
+                )
+                since = _parse_ts(tm.get("manualHeatSince"))
+                limit_min = int(self.settings.get("manualHeatMaxMin", MANUAL_HEAT_DEFAULT_MIN))
+                if (
+                    since is not None and last_cmd == "HEAT" and tm.get("lastObservedHeating") is True
+                    and not t["isHeating"]
+                ):
+                    manual_end = "MANUAL_HEAT_CANCELLED"  # 월패드/자동화로 끔 -> 되살리지 않음
+                elif since is not None and (now - since) >= timedelta(minutes=limit_min):
+                    manual_end = "MANUAL_HEAT_TIMEOUT"
+                elif block in ("P000_FLOOR_LIMIT_OFF", "P000_FLOOR_PREDICTED_LIMIT"):
+                    manual_end = block
+            if manual_end:
+                decision_reason = manual_end
+                record.command_action = "OFF"
+                record.execution_status = "EXECUTED"
+            elif block:
                 decision_reason = block
                 record.command_action = "OFF"
                 record.execution_status = "SKIPPED_SAFETY"
@@ -1868,6 +2393,11 @@ class ItssEngine:
                 decision_reason = "P000_MANUAL_OVERRIDE"
                 record.command_action = manual_action
                 record.execution_status = "EXECUTED"
+                if manual_heat and not tm.get("manualHeatSince"):
+                    tm["manualHeatSince"] = now.isoformat(timespec="seconds")
+                    self._record_comfort_event(
+                        now=now, room=rm, source="ITSS_MANUAL", t=t, outdoor_temp=outdoor_temp
+                    )
             record.safety_reason = decision_reason
         elif floor_src == "UNCONFIGURED":
             # 바닥 센서 없이 자동 난방하면 바닥 상한/과열 보호가 불가능 -> 차단
@@ -1883,9 +2413,9 @@ class ItssEngine:
                 v_room_per_min=t["vRoomRate"],
                 v_floor_per_min=t["vFloor"],
                 continuous_run_min=None if is_follower else t["runMin"],
-                max_run_min=None if is_follower else base_room_max_run,
+                max_run_min=None if (is_follower or group_boost_any) else base_room_max_run,
                 poll_interval_min=poll_interval_min,
-                cooldown_remaining_min=None if is_follower else t["cdMin"],
+                cooldown_remaining_min=None if (is_follower or group_boost_any) else t["cdMin"],
                 window_open=t["windowOpen"],
                 drop_5m_room_c=t["drop5mRoom"],
                 drop_5m_floor_c=t["drop5mFloor"],
@@ -1938,7 +2468,10 @@ class ItssEngine:
                     # 기준 방 판정/명령 실패 시 추종 방 단독 가열 금지
                     record.command_action = "OFF"
                     decision_reason = "GROUP_LEADER_UNAVAILABLE"
-                elif lead["action"] == "HEAT" and t["roomTemp"] is not None and t["roomTemp"] >= upper:
+                elif (
+                    lead["action"] == "HEAT" and lead.get("reason") != "EXTERNAL_BOOST"
+                    and t["roomTemp"] is not None and t["roomTemp"] >= upper
+                ):
                     # 그룹 가열 중이라도 이 방만 상한 이상이면 개별 정지 (덜 가열 = 바닥 추정 보수 방향)
                     record.command_action = "OFF"
                     decision_reason = "GROUP_MEMBER_WARM_SKIP"
@@ -1961,6 +2494,7 @@ class ItssEngine:
             if (
                 not verdict.force_off
                 and not is_follower
+                and not (boost_grouped and boost_event)  # 외부 조작 연동 시작/종료는 사용자 의도 우선
                 and record.command_action in ("HEAT", "OFF")
                 and last_cmd in ("HEAT", "OFF")
                 and record.command_action != last_cmd
@@ -1974,7 +2508,30 @@ class ItssEngine:
                     record.command_action = "HOLD"
                     record.execution_status = "SKIPPED_SAFETY"
 
+        if t.get("roomTempOffsetC"):
+            # 동시 비교 측정 보정값 계산 시 원시값 복원용
+            record.diagnostics["roomTempOffsetC"] = t["roomTempOffsetC"]
         prev_run_min = t["runMin"]
+        if manual_end:
+            m_since = _parse_ts(tm.pop("manualHeatSince", None))
+            m_ran = (now - m_since).total_seconds() / 60.0 if m_since is not None else 0.0
+            if m_ran >= MIN_PULSE_MIN:
+                tm["cooldownUntil"] = (now + timedelta(minutes=room_cooldown_min)).isoformat(timespec="seconds")
+            tm["manualFloorLatched"] = False
+            self.db.update_room_control(r_name, control_mode="AUTO", manual_action="HOLD")
+            record.diagnostics["manualEnded"] = manual_end
+            _LOG_CYCLE.info("[%s] 수동 HEAT 종료(%s, %.1f분) -> 자동 제어 복귀", r_name, manual_end, m_ran)
+        boost_total_min = None
+        if boost_event:
+            b_start = _parse_ts(tm.get("externalBoostStartedAt"))
+            b_until = _parse_ts(tm.get("externalBoostUntil"))
+            if b_start is not None and b_until is not None:
+                boost_total_min = round((b_until - b_start).total_seconds() / 60.0, 1)
+            if record.command_action == "OFF":
+                ran_min = (now - b_start).total_seconds() / 60.0 if b_start is not None else 0.0
+                self._clear_external_boost(tm)
+                if ran_min >= MIN_PULSE_MIN:
+                    tm["cooldownUntil"] = (now + timedelta(minutes=room_cooldown_min)).isoformat(timespec="seconds")
         was_heating = t["isHeating"] or (tm.get("heatingStartedAt") is not None)
         if is_follower:
             # 추종 방 타이머는 기준 방과 동기 (가동 시작 시각·시작 바닥·잔열 휴지)
@@ -2005,10 +2562,19 @@ class ItssEngine:
                 tm["lastSwitchAt"] = now.isoformat(timespec="seconds")
             tm["lastCommandAction"] = record.command_action
 
-            record.command_setpoint = self.compute_command_setpoint(record.command_action, c_state)
-            await self._dispatch(rm["climateEntity"], record, c_state, tm, now)
+            if boost_hold:
+                # 외부 조작(월패드/자동화) 설정값 유지 — ITSS 는 전송하지 않음
+                record.command_setpoint = _to_float((t.get("climate") or {}).get("setpoint"))
+                record.dispatch_result = "NO_CHANGE"
+            else:
+                record.command_setpoint = self.compute_command_setpoint(record.command_action, c_state)
+                await self._dispatch(rm["climateEntity"], record, c_state, tm, now)
         else:
             record.dispatch_result = "NONE"
+
+        # 다음 회차 외부 조작 감지 기준: 이번 회차 최종 관측 가동 여부 (명령 후 재조회값 우선)
+        observed = record.combustion_confirmed
+        tm["lastObservedHeating"] = bool(observed) if observed is not None else bool(t["isHeating"])
 
         # 기준 방 결과를 추종 방에 전달 (명령 실패 포함 — 실패 시 추종 방 단독 가열 금지)
         if is_leader:
@@ -2029,6 +2595,20 @@ class ItssEngine:
             else:
                 floor_label = "--"
             extra: list[str] = []
+            if (
+                record.command_action == "HEAT" and boost_event == "START"
+                and tm.get("externalBoostUntil") and boost_total_min is not None
+            ):
+                linked = f"({' · '.join(group['members'])} 연동)" if boost_grouped and group is not None else ""
+                extra.append(
+                    f"외부 조작 감지{linked}: {tm['externalBoostUntil'][11:16]}까지 {boost_total_min:g}분 유지 후 자동 중지"
+                )
+            if manual_heat and record.command_action == "HEAT" and tm.get("manualHeatSince"):
+                m_lim = int(self.settings.get("manualHeatMaxMin", MANUAL_HEAT_DEFAULT_MIN))
+                m_end = (_parse_ts(tm["manualHeatSince"]) or now) + timedelta(minutes=m_lim)
+                extra.append(f"수동 난방: {m_end.strftime('%H:%M')}까지 최대 {m_lim}분 후 자동 제어 복귀")
+            if manual_end:
+                extra.append("수동 난방 종료 → 자동 제어(AUTO) 복귀")
             if group is not None:
                 dev = group.get("weightedDevC")
                 extra.append(
@@ -2046,7 +2626,12 @@ class ItssEngine:
                 pred_room=None if group is not None else record.predicted_room_30m,
                 setpoint=record.command_setpoint,
                 run_min=prev_run_min,
-                max_run_min=room_max_run_min,
+                max_run_min=(
+                    boost_total_min
+                    if record.command_action == "HEAT" and boost_event in ("START", "ACTIVE") and boost_total_min is not None
+                    else int(self.settings.get("manualHeatMaxMin", MANUAL_HEAT_DEFAULT_MIN)) if manual_heat
+                    else room_max_run_min
+                ),
                 dispatch_result=record.dispatch_result,
                 now=now,
                 eff_target=t["effTarget"],
@@ -2115,6 +2700,8 @@ class ItssEngine:
                 "cycle": cycle_ctx,
                 "inputs": {
                     "roomTemp": t["roomTemp"],
+                    "roomTempRaw": t.get("roomTempRaw"),
+                    "roomTempOffsetC": t.get("roomTempOffsetC"),
                     "roomReportAt": t["roomTs"],
                     "roomAgeSec": t["roomAge"],
                     "roomTsSource": t.get("roomTsSource"),
@@ -2180,6 +2767,9 @@ class ItssEngine:
                     )
                 },
                 "timersBefore": timers_before,
+                "externalBoost": (
+                    {"event": boost_event, "until": tm.get("externalBoostUntil")} if boost_event else None
+                ),
                 "p200": (
                     {
                         "model": pred.model_name,
@@ -2289,6 +2879,10 @@ def create_app(
                     except Exception:  # noqa: BLE001
                         # run_control_cycle 내부에서 로깅·연속 실패 집계·경보 처리 완료
                         pass
+                    try:
+                        engine.maybe_start_daily_report()
+                    except Exception:  # noqa: BLE001
+                        _LOGGER.exception("일일 리포트 예약 확인 실패")
 
         task = asyncio.create_task(_loop())
         try:
@@ -2296,6 +2890,8 @@ def create_app(
         finally:
             stop_event.set()
             task.cancel()
+            if engine._report_task is not None and not engine._report_task.done():
+                engine._report_task.cancel()
 
     app = FastAPI(title="I.T.S.S. Thermal SCADA", version=VERSION, lifespan=lifespan)
     app.state.engine = engine
@@ -2367,10 +2963,22 @@ def create_app(
         floor_srcs = {
             rm["roomName"]: engine._room_floor(rm, master_floor, engine.floor_configured)[1] for rm in rooms
         }
-        live_group = ItssEngine._floor_group_plan(rooms, {n: {"floorSrc": s} for n, s in floor_srcs.items()})
+        live_group = ItssEngine._floor_group_plan(
+            rooms,
+            {
+                n: {
+                    "floorSrc": s,
+                    "externalBoost": (engine.room_timers.get(n) or {}).get("externalBoostUntil"),
+                    "externalBoostGroup": (engine.room_timers.get(n) or {}).get("externalBoostGroup"),
+                }
+                for n, s in floor_srcs.items()
+            },
+        )
         for rm in rooms:
             r_name = rm["roomName"]
-            r_temp, _, _, _ = await engine._read_numeric(rm["roomTempEntity"])
+            r_raw, _, _, _ = await engine._read_numeric(rm["roomTempEntity"])
+            r_off = float(rm.get("roomTempOffsetC") or 0.0)
+            r_temp = round(r_raw + r_off, 2) if r_raw is not None else None
             c_state = await engine.ha.get_state(rm["climateEntity"])
             eff_floor, floor_src, guard_floor = engine._room_floor(rm, master_floor, engine.floor_configured)
             c_attrs = (c_state.get("attributes") or {}) if c_state else {}
@@ -2410,6 +3018,8 @@ def create_app(
             uh_since = _parse_ts(tm.get("underheatSince"))
             live_by_room[r_name] = {
                 "roomTemp": r_temp,
+                "roomTempRaw": r_raw,
+                "roomTempOffsetC": r_off,
                 "floorTemp": eff_floor,
                 "floorSrc": floor_src,
                 "guardFloorTemp": guard_floor,
@@ -2428,6 +3038,14 @@ def create_app(
                 "ventilationRemainMin": vent_min,
                 "windowOpen": win_open,
                 "underheatMin": round((now_kst - uh_since).total_seconds() / 60.0, 1) if uh_since else 0.0,
+                "externalBoostUntil": tm.get("externalBoostUntil"),
+                "manualHeatUntil": (
+                    (_parse_ts(tm.get("manualHeatSince")) + timedelta(
+                        minutes=int(engine.settings.get("manualHeatMaxMin", MANUAL_HEAT_DEFAULT_MIN))
+                    )).isoformat(timespec="seconds")
+                    if tm.get("manualHeatSince") and _parse_ts(tm.get("manualHeatSince")) is not None
+                    else None
+                ),
             }
 
         first_ts = _parse_ts(stats_rows[0]["executionStartedAt"]) if stats_rows else None
@@ -2462,6 +3080,8 @@ def create_app(
             "fittedRcParams": engine.db.get_kv("fitted_rc_params"),
             "suggestedFloorOffsets": engine.db.get_kv("suggested_floor_offsets"),
             "thermalLagProfiles": engine.lag_profiles,
+            "comfort": engine.comfort_analysis(now_kst),
+            "dailyReportLast": engine.db.get_kv("daily_report_last"),
         }
 
     @app.get("/api/v1/ha/entities")
@@ -2560,7 +3180,11 @@ def create_app(
 
     @app.post("/api/v1/rooms")
     def create_or_update_room(req: RoomCreateRequest) -> dict[str, Any]:
-        return engine.db.upsert_room(req.model_dump())
+        data = req.model_dump()
+        if data.get("roomTempOffsetC") is None:
+            prev = engine.db.get_room(req.roomName)
+            data["roomTempOffsetC"] = float((prev or {}).get("roomTempOffsetC") or 0.0)
+        return engine.db.upsert_room(data)
 
     @app.patch("/api/v1/rooms/{room_name}")
     async def patch_room(room_name: str, req: RoomPatchRequest) -> dict[str, Any]:
@@ -2579,9 +3203,15 @@ def create_app(
             manual_action=req.manualAction,
             floor_offset_c=req.floorOffsetC,
             floor_estimate_enabled=req.floorEstimateEnabled,
+            room_temp_offset_c=req.roomTempOffsetC,
         )
         if not updated:
             raise HTTPException(status_code=404, detail="Room not found")
+        if float(updated.get("roomTempOffsetC") or 0.0) != float(before.get("roomTempOffsetC") or 0.0):
+            _LOGGER.info(
+                "[%s] 실내 센서 보정값 변경 %+.2f -> %+.2f°C", room_name,
+                float(before.get("roomTempOffsetC") or 0.0), float(updated["roomTempOffsetC"]),
+            )
         if updated["floorEstimateEnabled"] != before["floorEstimateEnabled"]:
             _LOGGER.info(
                 "[%s] 바닥 추정 %s (offset %+.2f°C)",
@@ -2690,10 +3320,42 @@ def create_app(
         }
 
     @app.post("/api/v1/report/daily")
-    async def daily_report() -> dict[str, Any]:
-        since = (datetime.now(tz=KST) - timedelta(hours=24)).isoformat(timespec="seconds")
-        rows = engine.db.stats_rows_since(since)
-        return await asyncio.to_thread(engine.advisor.generate_report, rows)
+    async def daily_report(send: bool = Query(default=False)) -> dict[str, Any]:
+        """지난 24시간 리포트 (Gemini 키 없으면 KPI 요약만). send=true 면 알림으로도 발송."""
+        return await engine.create_daily_report(send=send)
+
+    # ---------------- 쾌적 학습 (제안 전용)
+    @app.get("/api/v1/comfort")
+    def get_comfort(limit: int = Query(default=30, ge=1, le=500)) -> dict[str, Any]:
+        res = engine.comfort_analysis()
+        res["events"] = engine.comfort_events[-limit:][::-1]
+        return res
+
+    @app.post("/api/v1/comfort/reset")
+    def reset_comfort() -> dict[str, Any]:
+        n = len(engine.comfort_events)
+        engine.comfort_events = []
+        engine.db.set_kv("comfort_events", [])
+        _LOGGER.info("쾌적 학습 이벤트 초기화 (%d건 삭제)", n)
+        return {"deleted": n}
+
+    # ---------------- 실내 센서 동시 비교 측정 -> 보정값 계산 (적용은 방 PATCH)
+    @app.post("/api/v1/calibration/room-sensors")
+    def calibrate_room_sensors(req: SensorCalibrationRequest) -> dict[str, Any]:
+        start, end = _parse_ts(req.start), _parse_ts(req.end)
+        if start is None or end is None:
+            raise HTTPException(status_code=422, detail="start/end 는 ISO 시각이어야 합니다")
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=KST)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=KST)
+        if (end - start) < timedelta(hours=CALIBRATION_MIN_SPAN_H):
+            raise HTTPException(status_code=422, detail=f"측정 구간은 {CALIBRATION_MIN_SPAN_H:g}시간 이상이어야 합니다")
+        if req.reference and engine.db.get_room(req.reference) is None:
+            raise HTTPException(status_code=404, detail=f"기준 방 없음: {req.reference}")
+        return engine.compute_sensor_offsets(
+            start, end, reference=req.reference, reference_temp_c=req.referenceTempC
+        )
 
     # ---------------- 실운전 분석용 디버그 엔드포인트 (Ingress 전용)
     @app.get("/api/v1/debug/logs")

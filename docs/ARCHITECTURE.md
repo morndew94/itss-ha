@@ -1,4 +1,4 @@
-# I.T.S.S. 아키텍처 및 데이터 규격서 (v2.9.0)
+# I.T.S.S. 아키텍처 및 데이터 규격서 (v2.9.1)
 
 이 문서는 Home Assistant **Add-on(HA Ingress 전용)** 구조를 기준으로 작성되었습니다. 이전 버전(v1.0)의 `custom_components/itss` 통합구성요소 구조는 더 이상 존재하지 않습니다.
 
@@ -18,6 +18,7 @@
 | 명령 | `protocols/p100_core.py` | 조절기 0.5 °C 반올림, 반대 명령 간격 |
 | 저장 | `app/storage/db.py` | SQLite(WAL) |
 | 관측 | `app/debug_trace.py` | 회전 파일 로그, JSONL 트레이스 |
+| 쾌적 학습 | `app/comfort.py` | (v2.9.1) 추움 신호 기록/분석, 제안 전용 (3.0.4) |
 
 기동: `run.sh` -> `uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8099`. 제어 루프는 FastAPI `lifespan` 안의 백그라운드 task 로 `update_interval_sec`(기본 60 s) 마다 `run_control_cycle()` 을 호출합니다.
 
@@ -64,11 +65,81 @@
 | 순서 | 조건 | 결과 (`safetyReason`) | 비고 |
 | :--- | :--- | :--- | :--- |
 | 1 | 실내 >= 24.0 °C 또는 바닥 >= 25.0 °C | OFF, `P000_OVERHEAT_CUTOFF` | `const.py`. `AUTO`/`MANUAL` 공통. 잔열 휴지 시작 |
-| 2 | `MANUAL` | `manualAction` 수행, `P000_MANUAL_OVERRIDE` | `HEAT` 일 때만 최소 안전 조건 검사: `P000_FLOOR_UNCONFIGURED`, `P000_SENSOR_MISSING`, `P000_SENSOR_STALE`, `P000_FLOOR_LIMIT_OFF`(래치, 1.0 °C hysteresis) 이면 OFF |
+| 2 | `MANUAL` | `manualAction` 수행, `P000_MANUAL_OVERRIDE` | `HEAT` 일 때만 최소 안전 조건 검사: `P000_FLOOR_UNCONFIGURED`, `P000_SENSOR_MISSING`, `P000_SENSOR_STALE`, `P000_FLOOR_LIMIT_OFF`. **(v2.9.1)** 바닥 기준 방은 상승률 기반 예측(`P000_FLOOR_PREDICTED_LIMIT`) 적용, 추정 방은 마스터 이상 바닥으로 판정. 바닥 한계/예상 한계/과열, 외부 OFF(`MANUAL_HEAT_CANCELLED`), 1회 최대 경과(`MANUAL_HEAT_TIMEOUT`, `manualHeatMaxMin`)이면 수동 요청 종료 + AUTO 복귀 |
 | 3 | `AUTO` + 마스터 바닥 미설정 | OFF, `P000_FLOOR_UNCONFIGURED` | |
 | 4 | `SentinelProtocol.evaluate()` | 아래 4.1 | `force_off` -> OFF, `hold` -> HOLD |
+| 4b | **(v2.9.1)** `AUTO` + 외부 조작 가동 유지(external boost) 중 | 유지 시 명령 없음(`EXTERNAL_BOOST`), 종료 시 OFF(`EXTERNAL_BOOST_END`), 외부 OFF 면 종료(`EXTERNAL_BOOST_CANCELLED`) | 감지: 직전 관측 비가열 + 현재 관측 가열 + ITSS 마지막 명령이 HEAT 아님(취소는 boost 중 가열 관측 후에만 인정). Sentinel 안전(과열/창문/환기/센서/바닥 예상 peak)은 유지, 잔열 휴지/최대 가동은 우회. 독립 방은 단독 boost + multi-zone 제외. 방3/방2 는 두 방 연동: 일반 그룹 경로(leader 바닥 안전, follower 복사, warm skip 우회, 동일 종료 시각/휴지) |
 | 5 | 그룹 수요 / Multi-zone | `GROUP_*`(그룹 방), `HYBRID_*`, `SIMULTANEOUS_*`(독립 방) | v2.9.0: 방별 P200 단독 분기(`P200_PREDICTIVE_ON/OFF`)는 AUTO 판단에 더 이상 쓰이지 않음. P200 예측은 계산/trace 기록되고 그룹 수요에 반영 |
+| 5b | **(v2.9.1)** 바닥 최저 온도 `floorMinC` > 0, 바닥 기준 그룹 | `GROUP_FLOOR_MIN_HEAT` / `GROUP_FLOOR_MIN_CONTINUE` / `GROUP_FLOOR_MIN_REACHED` | 그룹 비가열 + leader 바닥 < floorMinC + 가중 실내 편차 < +0.3 °C 이면 시작, 예상 peak < floorMinC + 1.0 °C 동안 유지. 독립 방 무관 |
 | 6 | 재량 반전 채터링 방지 | HOLD, `P000_ANTI_CHATTER` | 안전 차단이 아닐 때만. HEAT -> OFF < 300 s, OFF -> HEAT < 600 s 이면 직전 명령 유지 |
+
+### 3.0 외부 조작 가동 유지 (v2.9.1, external boost)
+
+- 배경(2026-11-25 field trace): 월패드/다른 HA 자동화로 설정온도를 24 °C 로 올리면 ITSS 가 약 1 분 안에 15 °C 로 되돌리고 0 min 가동 후 30 min 잔열 휴지를 시작했습니다.
+- 감지 조건: `AUTO` 방, 직전 회차 관측 비가열, 현재 회차 관측 가열, ITSS 마지막 명령이 HEAT 아님. 오탐 방지: ITSS 의 OFF 가 적용되지 않아 직전 관측도 가열이면 외부로 보지 않고 OFF 재전송. ITSS 자신의 HEAT, `MANUAL` 방은 감지 제외.
+- 동작: `externalBoostMin`(기본 15, 0 ~ 60, 0 = 기존 동작) 분 동안 명령 없이 가동 유지(외부 설정온도 유지) -> OFF 전송 + 잔열 휴지(가동 5 min 이상일 때만). boost 중 외부 OFF 면 재가열하지 않음.
+- 안전: 과열 차단(실내 24 °C / 바닥 25 °C), 창문, 환기 보호, 센서 누락/stale, 바닥 기준 방(센서 방, 추정 방)의 상승률 기반 예상 peak 차단(`P000_FLOOR_PREDICTED_LIMIT`)은 적용. 잔열 휴지, 1회 최대 가동, 그룹/multi-zone 수요는 우회.
+- 방3 · 방2 연동: 바닥을 공유하는 두 방(`AUTO`, 실측/추정 바닥) 중 한 방이라도 외부에서 켜면 **두 방이 같은 종료 시각**(`externalBoostMin`)으로 함께 가동합니다. 일반 그룹 경로를 사용하므로 leader(방3, 실측 바닥)가 바닥 안전(상승률 기반 예상 peak 차단, 과열 등)을 판단하고 follower 가 따라가며, 타이머/휴지는 동기화됩니다. boost 중 follower 의 warm skip 은 사용자 의도를 우선해 우회합니다. 켠 방은 외부 설정온도를 유지하고 ITSS 가 다른 방에 HEAT 를 보냅니다.
+- 한 방을 외부에서 끄면 연동 boost 가 두 방 모두 취소되고(`EXTERNAL_BOOST_CANCELLED`), 종료 시 두 방 모두 OFF(`EXTERNAL_BOOST_END`) + 같은 잔열 휴지에 들어갑니다. 연동 boost 회차에서 최대 가동/휴지는 우회하지만 바닥 안전은 우회하지 않습니다. 취소 판정은 boost 중 실제 가열이 관측된 뒤에만 인정하며, 연동 방의 ITSS HEAT 가 아직 적용 전이면 취소 대신 HEAT 를 재전송합니다. 독립 방(거실/안방)은 단독 boost 이며 multi-zone 계획에서 계속 제외됩니다.
+- 사유 코드: `EXTERNAL_BOOST`, `EXTERNAL_BOOST_END`, `EXTERNAL_BOOST_CANCELLED`.
+
+### 3.0.1 ITSS 수동 HEAT 1회 요청화 (v2.9.1)
+
+- 배경(2026-11-25 trace): 수동 HEAT 가 거실 약 154 min 연속 가동(독립 방이라 실내 과열 24 °C 만 정지 조건, 실내는 23.4 °C 까지만 상승), 방3 36.9 min 가동에 바닥 최고 27.1 °C(cap 25 °C).
+- 신규 설정 `manualHeatMaxMin`(기본 15, 범위 5 ~ 60 min, UI "ITSS 수동 ON 1회 최대 (분, 경과 시 자동 복귀)"). 경과 시 OFF 전송, 방을 AUTO(controlMode AUTO, manualAction HOLD)로 복귀시키고 5 min 이상 가동했으면 잔열 휴지를 시작합니다. 사유 `MANUAL_HEAT_TIMEOUT`("수동 난방 설정 시간 경과(자동 중지 · 자동 제어 복귀)").
+- 바닥 기준 방(방3 실측, 방2 추정)의 수동 HEAT 에도 AUTO 와 같은 상승률 기반 바닥 예측을 적용합니다. 시작 전 바닥 + 상승률 x 5 min >= 바닥 cap - 0.2 °C 이면 차단, 가동 중 가열 시작 바닥 + 상승률 x (가동 + poll) >= cap - 0.2 °C 이면 차단합니다.
+- 수동 HEAT 중 바닥 한계(`P000_FLOOR_LIMIT_OFF`), 예상 한계(`P000_FLOOR_PREDICTED_LIMIT`), 과열(`P000_OVERHEAT_CUTOFF`)이 발생하면 수동 요청을 **종료하고 AUTO 로 복귀**합니다(이전에는 MANUAL 로 남아 바닥이 한계보다 1 °C 식으면 스스로 재가열).
+- 추정 방(방2, floorOffsetC 음수)은 수동 모드에서도 실측 마스터 바닥보다 낮지 않은 바닥(공유 바닥)으로 판정합니다. 2026-11-25 22:27 방2 단독 재가열 사례를 수정합니다.
+- 수동 HEAT 중 월패드/자동화가 조절기를 외부에서 끄면 24 °C 를 다시 지시하지 않고 수동 요청을 종료하며 AUTO 로 복귀합니다. 사유 `MANUAL_HEAT_CANCELLED`("수동 난방 중 외부에서 끔(자동 제어 복귀)").
+- Telegram: ON 알림에 "수동 난방: HH:MM까지 최대 N분 후 자동 제어 복귀", 종료 알림에 "수동 난방 종료 → 자동 제어(AUTO) 복귀". `/api/v1/status` `liveByRoom.manualHeatUntil`, 방 카드 배지 "수동 가동 (HH:MM 자동 복귀)". 트레이스 diagnostics `manualEnded`.
+
+### 3.0.2 바닥 최저 온도 (v2.9.1, floor comfort minimum)
+
+- 설정 `floorMinC`(기본 0 = 사용 안 함, 범위 0 ~ 23 °C, UI "바닥 최저 온도 (°C, 0=사용 안 함 · 방3/방2 바닥 기준)"). 바닥 기준 그룹(방3/방2)에만 적용되며 독립 방(거실/안방)은 바닥이 없어 영향이 없습니다.
+- 시작: 그룹이 가열 중이 아니고 leader 바닥 < `floorMinC` 이며 그룹 가중 실내 편차 < +0.3 °C(`FLOOR_MIN_AIR_MARGIN_C`, 실내 과열 방지)이면 그룹 HEAT(`GROUP_FLOOR_MIN_HEAT`).
+- 유지: rate 모델 예상 peak(가열 시작 바닥 + 상승률 x 가동 min) < `floorMinC` + 1.0 °C(`FLOOR_MIN_HYST_C`)인 동안 `GROUP_FLOOR_MIN_CONTINUE`, 도달하면 두 방 OFF(`GROUP_FLOOR_MIN_REACHED`, 잔열 휴지 진입).
+- 기존 안전(바닥 cap/예상 차단, 과열, 휴지, 기동 전 차단, 채터링 방지)은 모두 그대로 적용됩니다.
+- 근거: 2026-11-25 09:48 ~ 19:56 약 10 h 동안 실내가 목표 이상이라 AUTO 난방이 없었고 바닥은 23.1 -> 19.7 °C 로 식었습니다. 시작값 권장 21 °C(사용자 조정).
+
+### 3.0.3 (v2.9.1) 실내 센서 보정값 (`roomTempOffsetC`)
+
+- 방 필드 `roomTempOffsetC`(-3.0 ~ +3.0 °C, 기본 0). DB 컬럼 `room_temp_offset_c`(자동 마이그레이션, 기존 방은 0).
+- **제어용 실내 온도 = 센서 원시값 + 보정값.** 모든 제어/안전(실내 과열 24 °C 포함), 그룹 가중 평균, 기록/차트/KPI 에 적용됩니다. 센서 추적(보고 주기, 기울기, 환기 급락 감지)은 **원시값**을 유지하므로 보정값을 바꿔도 가짜 step 변화가 생기지 않습니다.
+- API: `POST /api/v1/rooms`(`roomTempOffsetC` 선택, 재등록 시 생략하면 기존 값 유지), `PATCH /api/v1/rooms/{room}` `{"roomTempOffsetC": x}`(|x| > 3 이면 422). `/api/v1/status` `liveByRoom` 에 `roomTemp`(보정값), `roomTempRaw`, `roomTempOffsetC`. 트레이스 inputs 에 `roomTempRaw`/`roomTempOffsetC`, 회차 diagnostics 에 0 이 아닐 때 `roomTempOffsetC` 저장.
+- UI: 방 카드 "센서 보정 -0.1/+0.1" 버튼과 "(원시 x)" 표시.
+- **동시 비교 측정 도우미**: `POST /api/v1/calibration/room-sensors` body `{start, end}`(ISO KST), `reference`(`""` = 전체 센서 중앙값(합의), 방 이름 = 그 센서(현재 보정값 포함)), `referenceTempC`(선택, 기준 온도계 값). 구간 2 h 미만이면 422, 모르는 reference 방이면 404.
+  - 방별 원시 median(원시 = 기록 roomTemp - 기록 보정값), 보고 수(서로 다른 보고 3개 미만이면 `FEW_REPORTS`), spread(p90 - p10, 1.0 °C 초과 시 경고), `suggestedOffsetC` = 기준 - 원시 median(±3.0 °C clip, 0.1 °C 단위). 적용은 UI [적용] 버튼(PATCH)으로 수동입니다.
+  - 절차: ① 측정 중 시험 운전(Dry-Run) 또는 전체 방 수동 OFF 로 전환(센서가 방에 없으므로 제어가 개입하면 안 됨) ② 모든 방 센서를 한 곳(외풍/햇빛/열원 없음)에 모음 ③ 난방 OFF 상태로 4 h 이상(가능하면 밤새) 유지 — 방3/방2 센서는 약 55~60 min 마다 보고 ④ UI "실내 센서 보정 — 동시 비교 측정" 패널에 구간 입력 후 [적용].
+  - 상수(`const.py`): `ROOM_TEMP_OFFSET_MAX_C`=3.0 °C, `CALIBRATION_MIN_SPAN_H`=2.0 h, `CALIBRATION_MIN_REPORTS`=3, `CALIBRATION_REF_SPREAD_WARN_C`=1.0 °C.
+
+### 3.0.4 (v2.9.1) 쾌적 학습 (`comfort.py`, 제안 전용)
+
+- 신호: (a) `WALLPAD` = `AUTO` 방에서 외부 조작 가동 유지(external boost) **시작** 감지(월패드/다른 HA 자동화). 실제로 조작한 방만 기록하며 연동된 방3/방2 상대 방은 기록하지 않음. (b) `ITSS_MANUAL` = ITSS 수동 ON(수동 세션당 1회).
+- 이벤트 저장값: 시각, 방, 출처, 당시 실내 원시 온도 + 보정값, 기본 목표, 실효 목표, 바닥(가드 바닥) + `floorSrc`, 외기. KV `comfort_events`(60 일 보존, 최대 500 개).
+- 분석: 최근 14 일. 실내 온도는 원시값 + **현재** 보정값으로 재계산(나중에 센서를 보정하면 과거 신호도 재해석). dev = 실내 - 이벤트 당시 실효 목표.
+  - dev >= -0.5 °C → "목표 근처인데 추움", dev < -0.5 °C → "난방 부족"(목표가 아닌 제어 문제). 바닥 차가움(floor-cold) = 바닥 방(MEASURED/ESTIMATED)이고 바닥 < 21.5 °C 이며 dev >= -0.3 °C.
+- 제안(자동 적용 없음, UI [적용] 시 confirm):
+
+| 제안 | 조건 | 제안값 |
+| :--- | :--- | :--- |
+| `TARGET_UP` (방별) | 목표 근처 추움 이벤트 3개 이상 | median(이벤트 실내 + 0.4 °C - 당시 스케줄/외기/프리셋 offset). 현재 + 1.0 °C 이하, 23.5 °C 이하(실내 과열 24.0 - 0.5), 현재 + 0.2 °C 이상일 때만. 절대값 방식이라 적용 후 같은 이벤트가 다시 올리지 않음 |
+| `FLOOR_MIN` (전역 `floorMinC`) | 방3/방2 바닥 차가움 이벤트를 합산(바닥 공유) 3개 이상 | median(이벤트 바닥) + 1.0 °C 를 0.5 °C 단위 올림, 20.0 ~ 23.0 °C clip, 현재 `floorMinC` + 0.25 °C 초과일 때만. 목표 근처 추움 이벤트의 2/3 이상이 바닥 차가움인 방은 `TARGET_UP` 대신 `FLOOR_MIN` |
+| `CONTROL_CHECK` (정보만, 적용 없음) | 난방 부족 이벤트 3개 이상이고 목표 근처 추움 이상 | 차단 사유/센서/가동 시간 점검 안내 |
+
+- 신뢰도: LOW(이벤트 6개 미만) / MEDIUM.
+- **한계**: "춥다" 방향 단방향 신호이므로 목표를 **낮추는** 제안은 하지 않습니다. 스케줄로 난방을 켜는 HA 자동화도 `WALLPAD` 신호로 집계됩니다.
+- API: `GET /api/v1/comfort`(분석 + 최근 이벤트, `?limit`), `POST /api/v1/comfort/reset`(신호 전체 삭제). `/api/v1/status` 에 `comfort` 분석 포함. UI 패널 "쾌적 학습".
+- 상수: `COMFORT_WINDOW_DAYS`=14 일, `COMFORT_KEEP_DAYS`=60 일, `COMFORT_MAX_EVENTS`=500, `COMFORT_MIN_EVENTS`=3, `COMFORT_AT_TARGET_DEV_C`=-0.5 °C, `COMFORT_TARGET_MARGIN_C`=0.4 °C, `COMFORT_TARGET_MAX_STEP_C`=1.0 °C, `COMFORT_FLOOR_COLD_C`=21.5 °C, `COMFORT_FLOOR_MIN_LOW_C`=20.0 °C.
+
+### 3.0.5 (v2.9.1) Gemini 일일 리포트 (자동 발송, 참고용)
+
+- 설정(UI, `PATCH /api/v1/settings`): `dailyReportEnabled`(bool, 기본 true), `dailyReportHour`(KST 0 ~ 23 시, 기본 8, 범위 밖 422). UI "자동 발송", "발송 시각".
+- 하루 1회, 현재 KST 시각이 `dailyReportHour` 이후 4 h 이내일 때 설정된 알림(HA notify / Telegram)으로 발송합니다(`DAILY_REPORT_SEND_WINDOW_H`=4 h, 재시작 후 늦은 발송 방지). 발송 전에 KV `daily_report_last` 에 날짜를 기록하므로 실패해도 반복 발송하지 않습니다. 백그라운드 task 로 실행되어 1 min 제어 루프를 막지 않습니다.
+- 내용(결정적, 항상 발송): 기간/커버 시간, 보일러 가동/duty/단펄스/가스비, KPI(목표 ±0.15 °C 대역 비율, 최대 overshoot, 안전 개입 횟수), 방별 평균 실내/실효 목표/목표 - 0.3 °C 미만 시간 비율/난방 시간(min), 바닥/외기 범위, 사용자 난방 요청(최근 24 h 쾌적 신호), 쾌적 제안. 이어서 "Gemini 분석": 모델 `gemini-3.8-flash`(`generateContent` v1beta, `x-goog-api-key` 헤더), 한국어 plain text 8줄 이하(한 줄 요약, 숫자 포함 이상 징후 1~3개, 설정 제안 1~2개 — 로컬 쾌적 제안 평가). thought 파트는 제외. API key 없음/실패 시 요약만 발송(status `NO_API_KEY`/`ERROR`). 본문은 3500 자로 자릅니다(Telegram 4096 자 한도, `DAILY_REPORT_MAX_CHARS`=3500).
+- 개인정보: Gemini 전송 전 방 이름을 `ROOM_A`, `ROOM_B`... 로 익명화하고 응답에서 원래 이름으로 되돌립니다.
+- API: `POST /api/v1/report/daily?send=false|true` → `{kpis, report(Gemini 텍스트), status, text(전체 조합), context, sent?}`. UI 버튼 "일일 리포트 미리보기 (Gemini)", "리포트 알림 발송".
+- 코드: `integrations/google_gemini_advisor.py` 에 `compute_room_daily_stats`, `format_daily_report_text`, `GeminiThermalAdvisor.generate_daily_report` 추가(기존 `generate_report` 유지). `stats_rows_since` 가 `floorTemp`/`floorSrc`/`outdoorTemp` 도 반환. 상수 `DAILY_REPORT_DEFAULT_HOUR`=8, `DAILY_REPORT_SEND_WINDOW_H`=4 h, `DAILY_REPORT_MAX_CHARS`=3500.
+- 제어 설정은 절대 변경하지 않습니다.
 
 ### 3.1 P000 SENTINEL 내부 우선순위
 
@@ -141,7 +212,7 @@
 
 | 테이블 | 주요 컬럼 |
 | :--- | :--- |
-| `rooms` | `room_name`(PK), `room_temp_entity`, `climate_entity`, `window_sensor_entity`, `has_floor_sensor`, `floor_estimate_enabled`(v2.8.0, 기본 1), `floor_offset_c`, `target_temp`, `control_mode`, `manual_action`, `weight`, `updated_at` |
+| `rooms` | **(v2.9.1)** `room_temp_offset_c`(기본 0, 자동 마이그레이션), `room_name`(PK), `room_temp_entity`, `climate_entity`, `window_sensor_entity`, `has_floor_sensor`, `floor_estimate_enabled`(v2.8.0, 기본 1), `floor_offset_c`, `target_temp`, `control_mode`, `manual_action`, `weight`, `updated_at` |
 | `schedules` | `slot_id`(PK), `label`, `start_hour`, `end_hour`, `offset_c`, `enabled` (기본 4개 슬롯) |
 | `kv_store` | `key`(PK), `value_json` |
 | `cycles` | `cycle_id`(PK), `room_name`, 시각 컬럼(`scheduled_at`, `execution_started_at`, `control_issued_at`, `control_confirmed_at`, `observed_at`, `saved_at`), `execution_status`, `command_action`, `safety_reason`, `room_temp`, `floor_temp`, `target_temp`, `payload_json`, v2.7.0 추가: `combustion_confirmed`, `dry_run`, `effective_target`, `outdoor_temp`, `floor_sensor_source` |
@@ -161,6 +232,8 @@
 | `sensor_tracks` | entity별 `lastReportAt`, `lastValue`, `tsSource`, `reportCount`, `intervals`, `samples`, `missingSince` |
 | `thermal_lag_profiles` | 방별 잔열/지연 학습 결과 |
 | `fitted_rc_params` | RC 피팅 결과(`status=READY` 일 때만 저장) |
+| `comfort_events` | **(v2.9.1)** 쾌적 학습 신호(60 일, 최대 500 개) |
+| `daily_report_last` | **(v2.9.1)** 일일 리포트 마지막 발송 일자(발송 전 기록) |
 
 **옵션 우선순위** (`resolve_settings`): 기본값 <- 애드온 옵션 <- UI 저장값. 단 `options_snapshot` 과 비교하여 지난 부팅 이후 옵션이 바뀐 항목은 옵션 값이 우선합니다(snapshot 이 없는 업그레이드 첫 부팅은 UI 저장값 유지). `update_interval_sec` 는 옵션 전용입니다.
 
@@ -189,6 +262,18 @@
 | `dryRun` | **(v2.7.0)** 시험 운전 회차 여부 (통계/학습에서 제외 판단에 사용) |
 | `dispatchResult` | **(v2.7.0)** `SENT`, `NO_CHANGE`, `DRY_RUN`, `FAILED`, `NONE` |
 | `diagnostics` | **(v2.7.0)** `floorReportIntervalSec`, `floorStaleThresholdSec`, `floorLatencyC`, `roomReportIntervalSec`, `roomStaleThresholdSec`, `vRoomRate`, `vRoomSmooth`, `vFloor`, `drop5mRoom`, `trend10mRoom`, `trend10mFloor`, `dispatchCalls`, `antiChatterBlocked`, **(v2.9.0)** `groupRole`, `groupLeader`, 실패 시 `error` |
+
+### API/알림 추가 사항 (v2.9.1)
+
+- 설정 `externalBoostMin`(`PATCH /api/v1/settings`, 기본 15, 0 ~ 60 min), `manualHeatMaxMin`(기본 15, 5 ~ 60 min), `floorMinC`(기본 0 = 사용 안 함, 0 ~ 23 °C), `dailyReportEnabled`(기본 true), `dailyReportHour`(기본 8, 0 ~ 23 KST 시).
+- 방: `roomTempOffsetC`(-3.0 ~ +3.0 °C, `POST/PATCH /api/v1/rooms`). `POST /api/v1/calibration/room-sensors`, `GET /api/v1/comfort`, `POST /api/v1/comfort/reset`, `POST /api/v1/report/daily?send=` (3.0.3 ~ 3.0.5).
+- `/api/v1/status`: `liveByRoom.roomTemp`(보정값)/`roomTempRaw`/`roomTempOffsetC`, `comfort`. 트레이스 `inputs.roomTempRaw`/`roomTempOffsetC`.
+- `/api/v1/status` `liveByRoom.manualHeatUntil`, 방 카드 배지 "수동 가동 (HH:MM 자동 복귀)".
+- 신규 사유 코드(수동/바닥 최저): `MANUAL_HEAT_TIMEOUT`, `MANUAL_HEAT_CANCELLED`, `GROUP_FLOOR_MIN_HEAT`, `GROUP_FLOOR_MIN_CONTINUE`, `GROUP_FLOOR_MIN_REACHED`.
+- Telegram: 수동 ON "수동 난방: HH:MM까지 최대 N분 후 자동 제어 복귀", 종료 "수동 난방 종료 → 자동 제어(AUTO) 복귀", 연동 boost 시작 "외부 조작 감지(방3 · 방2 연동): HH:MM까지 15분 유지 후 자동 중지".
+- `/api/v1/status` `liveByRoom.externalBoostUntil`(boost 자동 중지 시각). 방 카드 배지 "외부 조작 가동 (HH:MM 자동 중지)".
+- 신규 사유 코드: `EXTERNAL_BOOST`, `EXTERNAL_BOOST_END`, `EXTERNAL_BOOST_CANCELLED`.
+- Telegram 시작 알림: "외부 조작 감지: HH:MM까지 15분 유지 후 자동 중지".
 
 ### API/알림 추가 사항 (v2.9.0)
 
@@ -228,6 +313,7 @@
 | `timersBefore` / `timersAfter` | 판단 전: `runMin`, `cooldownRemainMin`, `ventilationRemainMin`, `lastCommand`, `secsSinceSwitch` / 판단 후: `heatingStartedAt`, `cooldownUntil`, `ventilationUntil`, `lastSwitchAt`, `underheatSince` |
 | `p200` | `model`, `action`, `predRoom`, `predFloor`, `effTarget`, `learning`, `residualRiseC`, `diag` (없으면 `null`) |
 | `multiZone` | `action`, `reason` (없으면 `null`) |
+| `externalBoost` | **(v2.9.1)** `event`(`START`/`ACTIVE`/`END`/`CANCELLED`), `until` (`diagnostics.externalBoostGroup`: 방3/방2 연동 정보, `diagnostics.manualEnded`: 수동 요청 종료) |
 | `group` | **(v2.9.0)** `role`, `leader`, `members`, `demand`, `demandReason`, `weightedDevC`, `leaderResult` |
 | `sentinel` | `reason`, `forceOff`, `hold`, `message` (Sentinel 미실행이면 `null`) |
 | `decision` | `action`, `reason`, `executionStatus`, `antiChatterBlocked` |
@@ -244,7 +330,7 @@
 | :--- | :--- |
 | Open-Meteo (기상/geocoding) | 활성. 외기 1순위 API |
 | Gemini Search Grounding | 활성(폴백, API key 필요). 실패 시 600 s backoff, key 는 `x-goog-api-key` 헤더 |
-| Gemini 일일 진단 리포트 | 활성(UI 버튼, `POST /api/v1/report/daily`) |
+| Gemini 일일 리포트 | 활성(v2.9.1: 매일 자동 발송 + UI 버튼 `POST /api/v1/report/daily`, 참고용, 3.0.5) |
 | HA `notify`, `telegram_bot`(`chat_id`, 구형 `target` 폴백) | 활성 |
 | `GoogleCalendarAdvisor`, `GeminiTTSAlert`, `format_cycle_for_sheets`, `CircadiaProtocol` | **라이브러리 전용. 제어 루프에 연결되지 않음** (P400 은 DB 스케줄 사용) |
 

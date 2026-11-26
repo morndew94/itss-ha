@@ -500,6 +500,49 @@
       </div>
     </section>
 
+    <!-- v2.9.1 쾌적 학습 (제안 전용) -->
+    <section class="panel">
+      <h2>
+        <span>쾌적 학습 — 월패드·수동 ON 을 '추웠다' 신호로 학습 (최근 <span id="comfortWindow">14</span>일 · 제안만, 승인 시 적용)</span>
+        <button class="off" onclick="resetComfort()">학습 신호 초기화</button>
+      </h2>
+      <div id="comfortSuggest" style="margin-bottom:10px;"></div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>방</th>
+              <th>신호(월패드/수동)</th>
+              <th>목표 근처 / 난방 부족 / 바닥 차가움</th>
+              <th>당시 실내 중앙 · 편차</th>
+              <th>당시 바닥 중앙</th>
+              <th>주 시간대</th>
+              <th>마지막</th>
+            </tr>
+          </thead>
+          <tbody id="comfortBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- v2.9.1 실내 센서 동시 비교 측정 -> 보정값 -->
+    <section class="panel">
+      <h2><span>실내 센서 보정 — 동시 비교 측정 (센서를 한곳에 모아 둔 구간으로 보정값 계산)</span></h2>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px;line-height:1.6;">
+        ① 측정 동안 <b>시험 운전(Dry-Run)</b> 또는 모든 방 <b>수동OFF</b> 로 전환 (센서가 제자리에 없으므로 제어 금지)
+        ② 실내 센서를 한 곳(바람·햇빛·발열 기기 없는 위치)에 4시간 이상, 가능하면 밤새 모아 두기 (보고 주기 약 1시간 센서 고려)
+        ③ 아래에 그 구간을 넣고 계산 → 방별 [적용]. 기준 온도계가 있으면 판독값을 입력하세요.
+      </div>
+      <div class="form-grid">
+        <div><label>시작 (KST)</label><input id="calStart" type="datetime-local" /></div>
+        <div><label>종료 (KST)</label><input id="calEnd" type="datetime-local" /></div>
+        <div><label>기준</label><select id="calRef"></select></div>
+        <div><label>기준 온도계 판독값 (°C, 선택)</label><input id="calRefTemp" type="number" step="0.1" placeholder="비우면 위 기준 사용" /></div>
+        <div><button class="primary" style="width:100%" onclick="runSensorCalibration()">보정값 계산</button></div>
+      </div>
+      <div id="calResult" style="margin-top:10px;"></div>
+    </section>
+
     <!-- 24h Time-Series Chart -->
     <section class="panel">
       <h2>
@@ -517,7 +560,10 @@
       <h2>
         <span>보일러 최근 24시간 가동 통계 · 가스비 추정 · 0.3°C 제어 KPI <span id="kpiCoverage"
             style="font-size:11px;color:var(--muted);font-weight:400;"></span></span>
-        <button onclick="requestReport()">Gemini 진단 리포트 생성</button>
+        <div style="display:flex;gap:8px;">
+          <button onclick="requestReport(false)">일일 리포트 미리보기 (Gemini)</button>
+          <button onclick="requestReport(true)">리포트 알림 발송</button>
+        </div>
       </h2>
       <div class="kpi-grid" id="kpiGrid"></div>
       <div id="reportBox" class="msg-box"></div>
@@ -605,6 +651,14 @@
         <div><label>1회 최대 가동 상한 (분, 5~15)</label><input id="maxRunCap" type="number" min="5" max="15" value="15" /></div>
         <div><label>차단 후 잔열 휴지 (분)</label><input id="cooldownMin" type="number" min="5" max="90" value="20" /></div>
         <div><label>환기 보호 유지 (분)</label><input id="ventHoldMin" type="number" min="5" max="60" value="20" /></div>
+        <div><label>월패드·외부 자동화로 켜면 유지 (분, 0=즉시 되돌림)</label><input id="extBoostMin" type="number" min="0" max="60" value="15" /></div>
+        <div><label>ITSS 수동 ON 1회 최대 (분, 경과 시 자동 복귀)</label><input id="manualHeatMax" type="number" min="5" max="60" value="15" /></div>
+        <div><label>바닥 최저 온도 (°C, 0=사용 안 함 · 방3/방2 바닥 기준)</label><input id="floorMinC" type="number" min="0" max="23" step="0.5" value="0" /></div>
+        <div><label>Gemini 일일 리포트 자동 발송</label><select id="dailyReportEnabled">
+            <option value="true">발송 (텔레그램/HA 알림)</option>
+            <option value="false">발송 안 함</option>
+          </select></div>
+        <div><label>일일 리포트 발송 시각 (KST 시, 0~23)</label><input id="dailyReportHour" type="number" min="0" max="23" value="8" /></div>
         <div><label>시간당 가스비 (원)</label><input id="gasRate" type="number" step="50" value="1200" /></div>
         <div><label>회차 이력 보존 (일)</label><input id="retentionDays" type="number" min="1" max="365" value="30" /></div>
         <div><label>마스터 바닥 온도 센서</label><select id="masterFloorSel"></select></div>
@@ -791,6 +845,11 @@
       setIfIdle("maxRunCap", currentSettings.maxRunCapMin);
       setIfIdle("cooldownMin", currentSettings.cooldownMin);
       setIfIdle("ventHoldMin", currentSettings.ventilationHoldMin ?? 20);
+      setIfIdle("extBoostMin", currentSettings.externalBoostMin ?? 15);
+      setIfIdle("manualHeatMax", currentSettings.manualHeatMaxMin ?? 15);
+      setIfIdle("floorMinC", currentSettings.floorMinC ?? 0);
+      setIfIdle("dailyReportEnabled", currentSettings.dailyReportEnabled === false ? "false" : "true");
+      setIfIdle("dailyReportHour", currentSettings.dailyReportHour ?? 8);
       setIfIdle("gasRate", currentSettings.gasKrwPerHour);
       setIfIdle("retentionDays", currentSettings.historyRetentionDays ?? 30);
       setIfIdle("weatherLoc", currentSettings.weatherLocation || "서울");
@@ -835,6 +894,14 @@
       renderRooms(status.rooms, status.liveByRoom || {}, status.latestByRoom || {},
         (status.suggestedFloorOffsets || {}).offsets || {});
       renderKpis(status.kpis || {}, status.boilerStats, status.statsCoverageHours);
+      renderComfort(status.comfort || {}, status.rooms);
+      const calRef = document.getElementById("calRef");
+      if (document.activeElement !== calRef) {
+        const prevRef = calRef.value;
+        calRef.innerHTML = optionHtml("", "전체 센서 중앙값 (합의)") +
+          status.rooms.map(r => optionHtml(r.roomName, `${r.roomName} 센서 기준`)).join("");
+        calRef.value = prevRef;
+      }
       renderLagProfiles(status.thermalLagProfiles || {});
       renderSensors(status.sensorHealth || []);
       if (!schedDirty) renderSchedules(schedules);
@@ -908,6 +975,8 @@
         let boilerBadge;
         if (live.windowOpen) boilerBadge = `<span class="badge danger">창문열림 (정지)</span>`;
         else if (live.ventilationRemainMin > 0) boilerBadge = `<span class="badge" style="background:rgba(56,189,248,.22);color:#38bdf8;">환기정지 (${fmtNum(live.ventilationRemainMin)}분 남음)</span>`;
+        else if (isRunning && live.manualHeatUntil) boilerBadge = `<span class="boiler-pill running"><span class="boiler-dot"></span>수동 가동 (${String(live.manualHeatUntil).slice(11, 16)} 자동 복귀)</span>`;
+        else if (isRunning && live.externalBoostUntil) boilerBadge = `<span class="boiler-pill running"><span class="boiler-dot"></span>외부 조작 가동 (${String(live.externalBoostUntil).slice(11, 16)} 자동 중지)</span>`;
         else if (isRunning) boilerBadge = `<span class="boiler-pill running"><span class="boiler-dot"></span>가동중 (${fmtNum(live.runtimeMin ?? 0)}/${fmtNum(roomCapMin)}분)</span>`;
         else if (live.cooldownRemainMin > 0) boilerBadge = `<span class="badge warn">잔열대기 (${fmtNum(live.cooldownRemainMin)}분 남음)</span>`;
         else if (reason === "P000_FLOOR_UNCONFIGURED") boilerBadge = `<span class="badge danger">바닥센서 미설정</span>`;
@@ -931,6 +1000,17 @@
         const effTarget = live.effectiveTargetTemp != null
           ? `<div style="font-size:11px;color:var(--muted);text-align:center;">실효 목표 ${fmtNum(live.effectiveTargetTemp, 2)}°C</div>` : "";
         const tTemp = Number(rm.targetTemp);
+        const rOff = Number(rm.roomTempOffsetC) || 0;
+        const rOffStr = `${rOff >= 0 ? "+" : ""}${fmtNum(rOff)}`;
+        const rawStr = live.roomTempRaw != null && rOff !== 0 ? ` (원시 ${fmtNum(live.roomTempRaw, 2)})` : "";
+        const roomOffCtl = `
+          <div class="inline-flex" style="margin-top:4px;flex-wrap:wrap;font-size:11px;color:var(--muted);">
+            센서 보정
+            <button class="btn-sm" data-act="roomoffset" data-room="${name}" data-val="${(rOff - 0.1).toFixed(1)}">-0.1</button>
+            <span style="min-width:36px;text-align:center;">${rOffStr}</span>
+            <button class="btn-sm" data-act="roomoffset" data-room="${name}" data-val="${(rOff + 0.1).toFixed(1)}">+0.1</button>
+            ${rawStr}
+          </div>`;
 
         return `
       <tr class="${isRunning ? "row-running" : ""}">
@@ -947,6 +1027,7 @@
           <div class="temp-big">${rt}</div>
           <div style="font-size:11px;color:var(--muted);">30분 예측: ${lat.predictedRoom30m != null ? `${fmtNum(lat.predictedRoom30m, 2)}°C` : "--"}</div>
           ${underheat}
+          ${roomOffCtl}
         </td>
         <td>
           <div class="temp-big">${fShown}</div>
@@ -1328,6 +1409,11 @@
             maxRunCapMin: Math.max(5, Math.min(15, Number(document.getElementById("maxRunCap").value))),
             cooldownMin: Number(document.getElementById("cooldownMin").value),
             ventilationHoldMin: Number(document.getElementById("ventHoldMin").value),
+            externalBoostMin: Number(document.getElementById("extBoostMin").value),
+            manualHeatMaxMin: Number(document.getElementById("manualHeatMax").value),
+            floorMinC: Number(document.getElementById("floorMinC").value),
+            dailyReportEnabled: document.getElementById("dailyReportEnabled").value === "true",
+            dailyReportHour: Math.max(0, Math.min(23, Number(document.getElementById("dailyReportHour").value))),
             gasKrwPerHour: Number(document.getElementById("gasRate").value),
             historyRetentionDays: Number(document.getElementById("retentionDays").value),
             masterFloorEntity: document.getElementById("masterFloorSel").value,
@@ -1384,15 +1470,135 @@
       });
     }
 
-    function requestReport() {
+    function requestReport(send = false) {
       return guarded(async () => {
         const box = document.getElementById("reportBox");
         box.style.display = "block";
-        box.textContent = "Gemini 진단 리포트 생성 중...";
-        const res = await api("/report/daily", { method: "POST" });
-        box.textContent = res.report || `상태: ${res.status} (Gemini API 키 미설정 또는 이력 부족)`;
+        box.style.whiteSpace = "pre-wrap";
+        box.textContent = send ? "일일 리포트 생성 후 알림 발송 중..." : "일일 리포트 생성 중 (Gemini 호출)...";
+        const res = await api(`/report/daily${send ? "?send=true" : ""}`, { method: "POST" });
+        box.textContent = (res.text || res.report || "") + `\n\n[Gemini 상태: ${res.status}${res.sent ? " · 알림 발송됨" : ""}]`;
       });
     }
+
+    function setRoomTempOffset(roomName, value) {
+      return guarded(async () => {
+        const v = Math.max(-3, Math.min(3, Math.round(Number(value) * 10) / 10));
+        await api(`/rooms/${encodeURIComponent(roomName)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ roomTempOffsetC: v }),
+        });
+        showMsg(`${roomName}: 실내 센서 보정 ${v >= 0 ? "+" : ""}${v.toFixed(1)}°C 적용 (제어용 실내 = 원시값 + 보정값)`);
+        await refresh();
+      });
+    }
+
+    function renderComfort(c, rooms) {
+      document.getElementById("comfortWindow").textContent = c.windowDays ?? 14;
+      const sugBox = document.getElementById("comfortSuggest");
+      const sugg = c.suggestions || [];
+      if (!sugg.length) {
+        sugBox.innerHTML = `<div style="font-size:12px;color:var(--muted);">제안 없음 (방별 근거 ${esc(c.minEvents ?? 3)}회 이상 필요 · 현재 신호 ${esc(c.eventCount ?? 0)}건)</div>`;
+      } else {
+        sugBox.innerHTML = sugg.map(sg => {
+          let title, btn = "";
+          if (sg.type === "TARGET_UP") {
+            title = `${esc(sg.room)} 목표 ${fmtNum(sg.current)} → ${fmtNum(sg.suggested)}°C`;
+            btn = `<button class="btn-sm primary" data-act="apply-target" data-room="${esc(sg.room)}" data-val="${esc(sg.suggested)}">적용</button>`;
+          } else if (sg.type === "FLOOR_MIN") {
+            title = `바닥 최저 온도 ${fmtNum(sg.current)} → ${fmtNum(sg.suggested)}°C`;
+            btn = `<button class="btn-sm primary" data-act="apply-floormin" data-val="${esc(sg.suggested)}">적용</button>`;
+          } else {
+            title = `${esc(sg.room)} 난방 부족 점검`;
+          }
+          return `<div class="inline-flex" style="gap:8px;margin:4px 0;flex-wrap:wrap;">
+            <span class="badge ${sg.type === "CONTROL_CHECK" ? "warn" : "ok"}">${sg.confidence === "MEDIUM" ? "신뢰 중" : "신뢰 낮음"}</span>
+            <b>${title}</b> ${btn}
+            <span style="font-size:12px;color:var(--muted);">${esc(sg.reason)}</span></div>`;
+        }).join("");
+      }
+      const by = c.byRoom || {};
+      const names = Object.keys(by);
+      document.getElementById("comfortBody").innerHTML = names.length ? names.map(n => {
+        const r = by[n];
+        return `<tr><td>${esc(n)}</td><td>${esc(r.count)} (${esc(r.wallpad)}/${esc(r.manual)})</td>
+          <td>${esc(r.atTarget)} / ${esc(r.underheat)} / ${esc(r.floorCold)}</td>
+          <td>${r.medianRoomC != null ? `${fmtNum(r.medianRoomC)}°C · ${r.medianDevC >= 0 ? "+" : ""}${fmtNum(r.medianDevC, 2)}` : "--"}</td>
+          <td>${r.medianFloorC != null ? `${fmtNum(r.medianFloorC)}°C` : "--"}</td>
+          <td>${esc(r.peakHours || "-")}</td><td>${esc(String(r.lastAt || "").slice(5, 16).replace("T", " "))}</td></tr>`;
+      }).join("") : `<tr><td colspan="7" style="text-align:center;color:var(--muted);">아직 신호 없음 (AUTO 방을 월패드로 켜거나 ITSS 수동ON 하면 기록)</td></tr>`;
+    }
+
+    function applyComfortTarget(roomName, value) {
+      return guarded(async () => {
+        if (!confirm(`'${roomName}' 목표 온도를 ${Number(value).toFixed(1)}°C 로 변경할까요?`)) return;
+        await api(`/rooms/${encodeURIComponent(roomName)}`, { method: "PATCH", body: JSON.stringify({ targetTemp: Number(value) }) });
+        showMsg(`${roomName}: 쾌적 학습 제안 적용 (목표 ${Number(value).toFixed(1)}°C)`);
+        await refresh();
+      });
+    }
+
+    function applyComfortFloorMin(value) {
+      return guarded(async () => {
+        if (!confirm(`바닥 최저 온도를 ${Number(value).toFixed(1)}°C 로 설정할까요? (방3/방2 바닥 기준 그룹 보충 가동)`)) return;
+        await api("/settings", { method: "PATCH", body: JSON.stringify({ floorMinC: Number(value) }) });
+        showMsg(`바닥 최저 온도 ${Number(value).toFixed(1)}°C 적용`);
+        await refresh();
+      });
+    }
+
+    function resetComfort() {
+      return guarded(async () => {
+        if (!confirm("쾌적 학습 신호(월패드/수동 ON 기록)를 모두 삭제할까요?")) return;
+        const res = await api("/comfort/reset", { method: "POST" });
+        showMsg(`쾌적 학습 신호 ${res.deleted}건 삭제`);
+        await refresh();
+      });
+    }
+
+    function runSensorCalibration() {
+      return guarded(async () => {
+        const st = document.getElementById("calStart").value;
+        const en = document.getElementById("calEnd").value;
+        if (!st || !en) { alert("측정 시작/종료 시각을 입력하세요."); return; }
+        const refTemp = document.getElementById("calRefTemp").value;
+        const body = {
+          start: `${st}:00+09:00`, end: `${en}:00+09:00`,
+          reference: document.getElementById("calRef").value || "",
+        };
+        if (refTemp !== "") body.referenceTempC = Number(refTemp);
+        const res = await api("/calibration/room-sensors", { method: "POST", body: JSON.stringify(body) });
+        const rows = (res.rooms || []).map(r => {
+          const sug = r.suggestedOffsetC;
+          const btn = sug != null
+            ? `<button class="btn-sm primary" data-cal-room="${esc(r.room)}" data-cal-val="${esc(sug)}">${sug >= 0 ? "+" : ""}${fmtNum(sug)} 적용</button>`
+            : "";
+          return `<tr><td>${esc(r.room)}</td><td>${esc(r.status)}</td><td>${esc(r.samples)} / ${esc(r.reports)}</td>
+            <td>${r.rawMedianC != null ? `${fmtNum(r.rawMedianC, 2)}°C` : "--"}</td>
+            <td>${r.spreadC != null ? `${fmtNum(r.spreadC, 2)}°C` : "--"}</td>
+            <td>${(Number(r.currentOffsetC) || 0) >= 0 ? "+" : ""}${fmtNum(Number(r.currentOffsetC) || 0)}</td><td>${btn}</td></tr>`;
+        }).join("");
+        const warn = (res.warnings || []).map(w => `<div style="color:var(--warn);font-size:12px;">⚠ ${esc(w)}</div>`).join("");
+        document.getElementById("calResult").innerHTML = `
+          <div style="font-size:12px;margin-bottom:6px;">기준: ${esc(res.reference?.label)} = ${res.reference?.valueC != null ? `${fmtNum(res.reference.valueC, 2)}°C` : "--"}</div>
+          ${warn}
+          <table><thead><tr><th>방</th><th>상태</th><th>표본/보고</th><th>원시 중앙값</th><th>변동(p90-p10)</th><th>현재 보정</th><th>제안</th></tr></thead>
+          <tbody>${rows}</tbody></table>`;
+      });
+    }
+
+    document.getElementById("calResult").addEventListener("click", ev => {
+      const btn = ev.target.closest("button[data-cal-room]");
+      if (!btn) return;
+      setRoomTempOffset(btn.dataset.calRoom, Number(btn.dataset.calVal));
+    });
+
+    document.getElementById("comfortSuggest").addEventListener("click", ev => {
+      const btn = ev.target.closest("button[data-act]");
+      if (!btn) return;
+      if (btn.dataset.act === "apply-target") applyComfortTarget(btn.dataset.room, Number(btn.dataset.val));
+      if (btn.dataset.act === "apply-floormin") applyComfortFloorMin(Number(btn.dataset.val));
+    });
 
     // 방 테이블 버튼: data-* 속성 기반 이벤트 위임 (인라인 onclick 문자열 조립 제거)
     document.getElementById("roomTableBody").addEventListener("click", ev => {
@@ -1406,6 +1612,7 @@
         case "delete": deleteRoom(room); break;
         case "estimate": setFloorEstimate(room, btn.dataset.val === "true"); break;
         case "offset": setFloorOffset(room, Number(btn.dataset.val)); break;
+        case "roomoffset": setRoomTempOffset(room, Number(btn.dataset.val)); break;
       }
     });
 
